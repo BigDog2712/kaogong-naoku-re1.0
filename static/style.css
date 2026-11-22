@@ -1125,3 +1125,22 @@ html[data-theme="dark"] .tq-full .material img[flag="tex"]{
 /* 触屏没有悬停：换成「点这一行」的说法 */
 .tip-touch{display:none}
 @media(hover:none){.tip-hover{display:none}.tip-touch{display:inline}}
+
+/* ---------- 陪伴者模块：推题 ---------- */
+.push-row{display:flex;gap:12px;align-items:flex-start;justify-content:space-between;padding:12px 0;border-top:1px solid var(--rule);flex-wrap:wrap}
+.push-row:first-child{border-top:0}
+.push-main{flex:1 1 220px;min-width:0}
+.push-stem{display:block;margin-top:4px;line-height:1.5;word-break:break-word}
+.push-note{margin-top:6px;padding:6px 10px;border-radius:8px;background:var(--panel2);font-size:13px;line-height:1.5;word-break:break-word}
+.push-new{display:inline-block;margin-left:6px;padding:0 6px;border-radius:6px;background:var(--warn);color:#fff;font-size:10px;font-weight:700;line-height:16px;vertical-align:middle}
+.push-pick{display:flex;flex-wrap:wrap;gap:8px;margin-top:6px}
+.push-mask .modal{max-height:86vh;overflow:auto}
+
+/* 轻提示 */
+#kg-toast{position:fixed;left:50%;bottom:36px;transform:translate(-50%,16px);max-width:82vw;padding:10px 18px;border-radius:10px;
+  background:rgba(20,22,26,.92);color:#fff;font-size:13px;line-height:1.5;opacity:0;pointer-events:none;
+  transition:opacity .2s,transform .2s;z-index:9999}
+#kg-toast.show{opacity:1;transform:translate(-50%,0)}
+
+/* 陪伴圈卡片上的角色标记 */
+.tstu-top{flex-wrap:wrap;gap:6px}

@@ -152,7 +152,7 @@ def need_uid(token):
 
 
 def user_role(uid):
-    """账号角色：student（默认）/ teacher（陪伴者，只读）。"""
+    """账号角色（历史遗留列）。陪伴者已融合为普通账号功能，不再据此限制任何写操作。"""
     if not uid:
         return "student"
     r = q_one("SELECT IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
@@ -160,14 +160,16 @@ def user_role(uid):
 
 
 def is_teacher_token(token):
-    """token 是否属于陪伴者账号。陪伴者的一切写操作都在 do_POST 里被拦掉。"""
+    """历史接口保留：陪伴者不再只读，此函数仅供旧调用点判断，不再用于拦截。"""
     uid = auth_uid(token)
     return bool(uid) and user_role(uid) == "teacher"
 
 
-def link_ok(teacher_uid, student_uid):
-    return bool(q_one("SELECT 1 FROM teacher_links WHERE teacher_uid=? AND student_uid=?",
-                      (teacher_uid, student_uid)))
+def link_ok(a, b):
+    """陪伴关系是双向的：任一方建立后，双方都能看对方情况、也能互相推题。"""
+    return bool(q_one("""SELECT 1 FROM teacher_links
+                         WHERE (teacher_uid=? AND student_uid=?)
+                            OR (teacher_uid=? AND student_uid=?)""", (a, b, b, a)))
 
 
 # ---------- 陪读"正在答题"的实时状态（进程内存，单进程够用；120 秒没心跳即视为离线） ----------
@@ -467,6 +469,29 @@ def ensure_tables():
         db().commit()
     except Exception:
         pass
+    # ---------- 陪伴者：不再是独立角色，而是普通账号的一个功能 ----------
+    # 每个账号可自设 2-8 位「链接码」；别人用「用户名 + 链接码」即可加我为陪伴对象。
+    # 保留 role 列兼容旧数据（旧 teacher 账号仍能登录，只是不再是只读角色）。
+    try:
+        db().execute("ALTER TABLE users ADD COLUMN link_code TEXT DEFAULT ''")
+        db().commit()
+    except Exception:
+        pass
+    # 推题：任意习题界面可把题目推给陪伴关系中的另一方（双向）。
+    # from_uid/to_uid 是「谁推给谁」，qid 是题库 qid，note 是推题留言，read_ts 为接收方已读时间。
+    db().executescript("""
+    CREATE TABLE IF NOT EXISTS pushed_questions(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_uid TEXT NOT NULL,
+        to_uid TEXT NOT NULL,
+        qid TEXT NOT NULL,
+        note TEXT DEFAULT '',
+        ts TEXT,
+        read_ts TEXT DEFAULT '');
+    """)
+    db().execute("CREATE INDEX IF NOT EXISTS idx_push_to ON pushed_questions(to_uid, id)")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_push_from ON pushed_questions(from_uid, id)")
+    db().commit()
     # ---------- 陪伴者账号（只读督导）：role=teacher 的账号只能看，不能改 ----------
     try:
         db().execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'student'")
@@ -1046,15 +1071,6 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             borrow()   # 本请求独占一条连接（多线程不再共用，杜绝 database is locked）
             try:
-                # 陪伴者账号只读：只放行陪伴者自己的看板接口与最基础的引导接口
-                # （寄语会话例外：陪伴者要能读陪读的回复、也要能回话，这属于沟通而非改记录）
-                if is_teacher_token(g("token")):
-                    allow = (path.startswith("/api/teacher/")
-                             or path in ("/api/auth/me", "/api/bootstrap", "/api/encourage/img",
-                                         "/api/encourage/unread", "/api/encourage/thread"))
-                    if not allow:
-                        return self._send(403, {"error": "陪伴者账号为只读模式：可以查看记录，不能修改任何数据",
-                                                "readonly": True})
                 return self.api(path, g)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
@@ -1102,6 +1118,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/teacher/detach": self.api_teacher_detach,
             "/api/teacher/encourage": self.api_teacher_encourage,
             "/api/teacher/encourage/delete": self.api_teacher_encourage_delete,
+            "/api/linkcode": self.api_linkcode,
+            "/api/push": self.api_push,
+            "/api/push/read": self.api_push_read,
             "/api/encourage/reply": self.api_encourage_reply,
             # 账号：注册 / 登录 / 退出 / 改密码 / 老账号补设密码
             "/api/auth/register": self.api_auth_register,
@@ -1116,14 +1135,6 @@ class Handler(BaseHTTPRequestHandler):
         if fn:
             borrow()   # 同上：注册/登录/游客等写操作各用各的连接
             try:
-                # 陪伴者账号只读：除登录/退出/改密码与陪伴者自己的发布、回复接口外，一律禁止写
-                if path.startswith("/api/") and is_teacher_token(payload.get("token")):
-                    allow = (path.startswith("/api/teacher/")
-                             or path in ("/api/auth/login", "/api/auth/logout", "/api/auth/password",
-                                         "/api/encourage/reply"))
-                    if not allow:
-                        return self._send(403, {"error": "陪伴者账号为只读模式：可以查看记录，不能修改任何数据",
-                                                "readonly": True})
                 return fn(payload)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
@@ -1319,15 +1330,17 @@ class Handler(BaseHTTPRequestHandler):
         # ---------- 陪伴者（只读督导）：陪读列表 / 陪读详情 / 实时看板 / 鼓励信息 ----------
         if path == "/api/teacher/students":
             uid = need_uid(g("token"))
-            if user_role(uid) != "teacher":
-                return self._send(403, {"error": "仅陪伴者账号可访问"})
-            rows = q_all("""SELECT u.id, u.name, u.username, l.created FROM teacher_links l
-                            JOIN users u ON u.id=l.student_uid
-                            WHERE l.teacher_uid=? ORDER BY l.created DESC""", (uid,))
+            # 双向：我作为「陪伴者」绑的人 + 我作为「被陪伴者」绑我的人，都算我陪伴圈里的人
+            rows = q_all("""SELECT u.id, u.name, u.username, MIN(l.created) linked,
+                                   MAX(CASE WHEN l.teacher_uid=? THEN 1 ELSE 0 END) is_mine
+                            FROM teacher_links l JOIN users u
+                              ON u.id = CASE WHEN l.teacher_uid=? THEN l.student_uid ELSE l.teacher_uid END
+                            WHERE l.teacher_uid=? OR l.student_uid=?
+                            GROUP BY u.id ORDER BY linked DESC""", (uid, uid, uid, uid))
             out = []
             for r in rows:
                 b = self._student_brief(r["id"])
-                b.update({"id": r["id"], "name": r["name"], "username": r["username"], "linked": r["created"]})
+                b.update({"id": r["id"], "name": r["name"], "username": r["username"], "linked": r["linked"]})
                 out.append(b)
             out.sort(key=lambda x: str(x.get("last_ts") or ""), reverse=True)
             out.sort(key=lambda x: 0 if x.get("online") else 1)   # 正在答题的排最前
@@ -1335,8 +1348,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/teacher/student":
             uid = need_uid(g("token"))
-            if user_role(uid) != "teacher":
-                return self._send(403, {"error": "仅陪伴者账号可访问"})
             sid = (g("uid") or "").strip()
             if not link_ok(uid, sid):
                 return self._send(403, {"error": "没有该陪读的查看权限"})
@@ -1365,8 +1376,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/teacher/question":
             # 陪伴者点开陪读做过的题：只读查看整道题（题干 / 材料 / 选项 / 答案 / 解析）
             uid = need_uid(g("token"))
-            if user_role(uid) != "teacher":
-                return self._send(403, {"error": "仅陪伴者账号可访问"})
             sid = (g("uid") or "").strip()
             if not link_ok(uid, sid):
                 return self._send(403, {"error": "没有该陪读的查看权限"})
@@ -1387,8 +1396,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/teacher/live":
             uid = need_uid(g("token"))
-            if user_role(uid) != "teacher":
-                return self._send(403, {"error": "仅陪伴者账号可访问"})
             sid = (g("uid") or "").strip()
             if not link_ok(uid, sid):
                 return self._send(403, {"error": "没有该陪读的查看权限"})
@@ -1397,8 +1404,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/teacher/encouragements":
             uid = need_uid(g("token"))
-            if user_role(uid) != "teacher":
-                return self._send(403, {"error": "仅陪伴者账号可访问"})
             rows = q_all("""SELECT e.id, e.text, e.ts, e.student_uid,
                                    CASE WHEN IFNULL(e.image,'')='' THEN 0 ELSE 1 END has_img,
                                    IFNULL(su.name,'全部陪读') target_name
@@ -1434,6 +1439,29 @@ class Handler(BaseHTTPRequestHandler):
                 e["last_text"] = th[0]["last_text"] if th else ""
                 e["last_name"] = th[0]["name"] if th else ""
             return self._send(200, {"ok": True, "items": rows})
+
+        if path == "/api/push/list":
+            return self.api_push_list({"token": g("token"), "box": g("box", "in")})
+
+        if path == "/api/coach/peers":
+            # 陪伴者模块首页：我陪伴的人 / 我的陪伴者（双向关系各取一侧）
+            uid = need_uid(g("token"))
+            rows = q_all("""SELECT u.id, u.name, u.username, MIN(l.created) linked,
+                                   MAX(CASE WHEN l.teacher_uid=? THEN 1 ELSE 0 END) is_mine
+                            FROM teacher_links l JOIN users u
+                              ON u.id = CASE WHEN l.teacher_uid=? THEN l.student_uid ELSE l.teacher_uid END
+                            WHERE l.teacher_uid=? OR l.student_uid=?
+                            GROUP BY u.id ORDER BY linked DESC""", (uid, uid, uid, uid))
+            out = []
+            for r in rows:
+                b = self._student_brief(r["id"])
+                b.update({"id": r["id"], "name": r["name"], "username": r["username"],
+                          "linked": r["linked"], "is_mine": bool(r["is_mine"])})
+                out.append(b)
+            out.sort(key=lambda x: (0 if x.get("online") else 1, str(x.get("last_ts") or "")), reverse=False)
+            return self._send(200, {"ok": True, "peers": out,
+                                    "code": (q_one("SELECT IFNULL(link_code,'') c FROM users WHERE id=?",
+                                                   (uid,)) or {}).get("c", "")})
 
         if path == "/api/teacher/mine":
             uid = need_uid(g("token"))
@@ -1862,7 +1890,8 @@ class Handler(BaseHTTPRequestHandler):
             uid = auth_uid(g("token"))
             if not uid:
                 return self._send(200, {"ok": False})
-            u = q_one("SELECT id,name,username,anon,IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
+            u = q_one("""SELECT id,name,username,anon,IFNULL(role,'student') role,
+                                IFNULL(link_code,'') link_code FROM users WHERE id=?""", (uid,))
             if u:
                 u["role"] = u["role"] or "student"
             return self._send(200, {"ok": True, "user": u})
@@ -2246,9 +2275,11 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             db().rollback()
             raise
-        r = q_one("SELECT id,name,username,anon,IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
+        r = q_one("""SELECT id,name,username,anon,IFNULL(role,'student') role,
+                            IFNULL(link_code,'') link_code FROM users WHERE id=?""", (uid,))
         return {"ok": True, "token": tok, "user": {"id": r["id"], "name": r["name"], "username": r["username"],
-                                                  "anon": bool(r["anon"]), "role": r["role"] or "student"}}
+                                                  "anon": bool(r["anon"]), "role": r["role"] or "student",
+                                                  "link_code": r["link_code"] or ""}}
 
     def api_auth_register(self, p):
         username = (p.get("username") or "").strip()
@@ -2598,91 +2629,63 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True})
 
     def api_teacher_register(self, p):
-        """陪读把自己的督导陪伴者加进来：陪伴者账号不存在就建一个，然后把两人绑定。"""
+        """添加陪伴者：用对方的「用户名 + 链接码」即可，不需要对方密码。
+
+        链接码由对方在自己的「设置 → 陪伴者」里设定（2-8 位），相当于一次性授权凭证：
+        知道用户名 + 链接码，就能把对方加进我的陪伴圈（双向：双方都能看对方、互相推题）。
+        """
         uid = need_uid(p.get("token"))
-        if user_role(uid) == "teacher":
-            return self._send(403, {"error": "陪伴者账号为只读模式"})
         username = (p.get("username") or "").strip()
-        pw = p.get("password") or ""
-        name = (p.get("name") or username).strip()[:12]
-        err = self._username_err(username)
-        if err:
-            return self._send(400, {"error": err})
-        if len(pw) < 6:
-            return self._send(400, {"error": "密码至少 6 位"})
-        r = q_one("SELECT * FROM users WHERE username=?", (username,))
-        if r:
-            if (r["role"] or "student") != "teacher":
-                return self._send(400, {"error": "该用户名已被其他账号占用，请换一个用户名"})
-            if not r["pw_hash"] or not pw_verify(pw, r["pw_hash"]):
-                return self._send(401, {"error": "该陪伴者账号已存在，密码不正确"})
-            tid, created = r["id"], False
-            if name and name != r["name"]:
-                name = r["name"]
-        else:
-            tid, created = self._new_uid(), True
-            with _LOCK:
-                try:
-                    db().execute("""INSERT INTO users(id,name,username,pw_hash,token,created,anon,role)
-                                    VALUES(?,?,?,?,?,?,0,'teacher')""",
-                                 (tid, name or username, username, pw_hash(pw), "", now()))
-                    db().commit()
-                except Exception:
-                    db().rollback()
-                    raise
+        code = (p.get("code") or "").strip()
+        if not username:
+            return self._send(400, {"error": "请填写对方的用户名"})
+        if not re.fullmatch(r"[0-9A-Za-z]{2,8}", code):
+            return self._send(400, {"error": "链接码为 2-8 位字母或数字"})
+        r = q_one("SELECT id,name,username,IFNULL(link_code,'') code FROM users WHERE username=?", (username,))
+        if not r:
+            return self._send(404, {"error": "没有这个用户名的账号"})
+        if r["id"] == uid:
+            return self._send(400, {"error": "不能添加自己为陪伴者"})
+        if not r["code"]:
+            return self._send(400, {"error": "对方还没有设置链接码，请他先在「设置 → 陪伴者」里设置"})
+        if r["code"] != code:
+            return self._send(401, {"error": "链接码不正确"})
         with _LOCK:
             db().execute("INSERT OR IGNORE INTO teacher_links(teacher_uid,student_uid,created) VALUES(?,?,?)",
-                         (tid, uid, now()))
+                         (r["id"], uid, now()))
             db().commit()
-        return self._send(200, {"ok": True, "created": created,
-                                "teacher": {"id": tid, "name": name or username, "username": username}})
+        return self._send(200, {"ok": True, "created": False,
+                                "peer": {"id": r["id"], "name": r["name"] or r["username"],
+                                         "username": r["username"]}})
 
     def api_teacher_link(self, p):
-        """陪伴者主动加陪读：需要陪读本人的用户名 + 密码（证明由陪读本人同意）。"""
-        tid = need_uid(p.get("token"))
-        if user_role(tid) != "teacher":
-            return self._send(403, {"error": "仅陪伴者账号可操作"})
-        username = (p.get("username") or "").strip()
-        pw = p.get("password") or ""
-        u = q_one("SELECT * FROM users WHERE username=?", (username,))
-        if not u or not u["pw_hash"] or not pw_verify(pw, u["pw_hash"]):
-            return self._send(401, {"error": "陪读账号或密码不正确"})
-        if (u["role"] or "student") == "teacher":
-            return self._send(400, {"error": "这个账号本身是陪伴者，不能再作为陪读添加"})
-        with _LOCK:
-            db().execute("INSERT OR IGNORE INTO teacher_links(teacher_uid,student_uid,created) VALUES(?,?,?)",
-                         (tid, u["id"], now()))
-            db().commit()
-        return self._send(200, {"ok": True, "student": {"id": u["id"], "name": u["name"], "username": u["username"]}})
+        """兼容旧接口：陪伴者加陪读。现在统一走链接码，不再需要密码。"""
+        return self.api_teacher_register(p)
 
     def api_teacher_unlink(self, p):
-        tid = need_uid(p.get("token"))
-        if user_role(tid) != "teacher":
-            return self._send(403, {"error": "仅陪伴者账号可操作"})
-        sid = (p.get("uid") or "").strip()
+        """解除陪伴关系（双向一起解除）。"""
+        uid = need_uid(p.get("token"))
+        peer = (p.get("uid") or "").strip()
         with _LOCK:
-            db().execute("DELETE FROM teacher_links WHERE teacher_uid=? AND student_uid=?", (tid, sid))
+            db().execute("""DELETE FROM teacher_links
+                            WHERE (teacher_uid=? AND student_uid=?) OR (teacher_uid=? AND student_uid=?)""",
+                         (uid, peer, peer, uid))
             db().commit()
         return self._send(200, {"ok": True})
 
     def api_teacher_detach(self, p):
-        """陪读解除某个陪伴者的查看权限。"""
-        uid = need_uid(p.get("token"))
+        """兼容旧接口：解除陪伴关系。"""
         tid = (p.get("teacher_uid") or "").strip()
-        with _LOCK:
-            db().execute("DELETE FROM teacher_links WHERE teacher_uid=? AND student_uid=?", (tid, uid))
-            db().commit()
-        return self._send(200, {"ok": True})
+        p2 = dict(p); p2["uid"] = tid
+        return self.api_teacher_unlink(p2)
 
     def api_teacher_encourage(self, p):
         tid = need_uid(p.get("token"))
-        if user_role(tid) != "teacher":
-            return self._send(403, {"error": "仅陪伴者账号可发布"})
         text = (p.get("text") or "").strip()[:300]
         image = p.get("image") or ""
         target = (p.get("student_uid") or "*").strip() or "*"
         if target != "*" and not link_ok(tid, target):
-            return self._send(403, {"error": "没有该陪读的权限"})
+            return self._send(403, {"error": "没有该陪伴对象的权限"})
         if not text and not image:
             return self._send(400, {"error": "写点文字或选一张照片吧"})
         if image and not image.startswith("data:image/"):
@@ -2700,13 +2703,92 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_teacher_encourage_delete(self, p):
         tid = need_uid(p.get("token"))
-        if user_role(tid) != "teacher":
-            return self._send(403, {"error": "仅陪伴者账号可操作"})
         eid = _int(p.get("id"), 0)
         with _LOCK:
             # 删的是整条线程：根留言和它下面的往来一起消失
             db().execute("DELETE FROM encouragements WHERE teacher_uid=? AND (id=? OR parent_id=?)",
                          (tid, eid, eid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_linkcode(self, p):
+        """设置 / 修改自己的链接码（2-8 位字母数字）。别人凭「用户名 + 链接码」加我为陪伴者。"""
+        uid = need_uid(p.get("token"))
+        code = (p.get("code") or "").strip()
+        if not code:
+            # 空值 = 清除链接码，别人就无法再用链接码加我
+            with _LOCK:
+                db().execute("UPDATE users SET link_code='' WHERE id=?", (uid,))
+                db().commit()
+            return self._send(200, {"ok": True, "code": ""})
+        if not re.fullmatch(r"[0-9A-Za-z]{2,8}", code):
+            return self._send(400, {"error": "链接码为 2-8 位字母或数字"})
+        with _LOCK:
+            db().execute("UPDATE users SET link_code=? WHERE id=?", (code, uid))
+            db().commit()
+        return self._send(200, {"ok": True, "code": code})
+
+    def api_push(self, p):
+        """推题：把任意题目推给陪伴关系中的某个人（双向）。接收方在「陪伴者」模块查看。"""
+        uid = need_uid(p.get("token"))
+        to = (p.get("to_uid") or "").strip()
+        note = (p.get("note") or "").strip()[:200]
+        qidn = _int(p.get("id"), 0)
+        qid_s = (p.get("qid") or "").strip()
+        row = (q_one("SELECT qid FROM qdb.questions WHERE id=?", (qidn,)) if qidn
+               else q_one("SELECT qid FROM qdb.questions WHERE qid=?", (qid_s,)))
+        if not row:
+            return self._send(404, {"error": "题目不存在"})
+        if not to:
+            return self._send(400, {"error": "请选择要推送给谁"})
+        if to == uid:
+            return self._send(400, {"error": "不能推给自己"})
+        if not link_ok(uid, to):
+            return self._send(403, {"error": "你们还不是陪伴关系，先在「陪伴者」模块互相添加"})
+        with _LOCK:
+            cur = db().execute("""INSERT INTO pushed_questions(from_uid,to_uid,qid,note,ts,read_ts)
+                                  VALUES(?,?,?,?,?,'')""", (uid, to, row["qid"], note, now()))
+            db().commit()
+            pid = cur.lastrowid
+        return self._send(200, {"ok": True, "id": pid})
+
+    def api_push_list(self, p):
+        """推题收发件箱。box=in（收到的）/ out（我推出去的）。"""
+        uid = need_uid(p.get("token"))
+        box = (p.get("box") or "in").strip()
+        if box == "out":
+            rows = q_all("""SELECT x.id, x.qid, x.note, x.ts, x.read_ts, x.from_uid, x.to_uid,
+                                   IFNULL(u.name,u.username) peer_name, u.username peer_username,
+                                   q.id qn, q.module, q.category, q.stem
+                            FROM pushed_questions x
+                            LEFT JOIN users u ON u.id=x.to_uid
+                            LEFT JOIN qdb.questions q ON q.qid=x.qid
+                            WHERE x.from_uid=? ORDER BY x.id DESC LIMIT 60""", (uid,))
+        else:
+            rows = q_all("""SELECT x.id, x.qid, x.note, x.ts, x.read_ts, x.from_uid, x.to_uid,
+                                   IFNULL(u.name,u.username) peer_name, u.username peer_username,
+                                   q.id qn, q.module, q.category, q.stem
+                            FROM pushed_questions x
+                            LEFT JOIN users u ON u.id=x.from_uid
+                            LEFT JOIN qdb.questions q ON q.qid=x.qid
+                            WHERE x.to_uid=? ORDER BY x.id DESC LIMIT 60""", (uid,))
+        for r in rows:
+            r["stem"] = plain_text(r["stem"], 120)
+        unread = q_one("SELECT COUNT(*) n FROM pushed_questions WHERE to_uid=? AND IFNULL(read_ts,'')=''",
+                       (uid,))["n"]
+        return self._send(200, {"ok": True, "items": rows, "unread": unread})
+
+    def api_push_read(self, p):
+        """把收到的推题标为已读（传 id 标一条，不传标全部）。"""
+        uid = need_uid(p.get("token"))
+        pid = _int(p.get("id"), 0)
+        with _LOCK:
+            if pid:
+                db().execute("UPDATE pushed_questions SET read_ts=? WHERE id=? AND to_uid=?",
+                             (now(), pid, uid))
+            else:
+                db().execute("UPDATE pushed_questions SET read_ts=? WHERE to_uid=? AND IFNULL(read_ts,'')=''",
+                             (now(), uid))
             db().commit()
         return self._send(200, {"ok": True})
 
@@ -2770,8 +2852,9 @@ class Handler(BaseHTTPRequestHandler):
             db().execute("DELETE FROM study_time WHERE uid=?", (uid,))
             db().execute("DELETE FROM user_settings WHERE uid=?", (uid,))
             db().execute("DELETE FROM sessions WHERE uid=?", (uid,))
-            # 陪伴者关联与陪伴者发布的鼓励：账号没了，关联也不该留着
+            # 陪伴者关联、陪伴者发布的鼓励、推题记录：账号没了，关联也不该留着
             db().execute("DELETE FROM teacher_links WHERE teacher_uid=? OR student_uid=?", (uid, uid))
+            db().execute("DELETE FROM pushed_questions WHERE from_uid=? OR to_uid=?", (uid, uid))
             db().execute("DELETE FROM encouragements WHERE teacher_uid=? OR student_uid=?", (uid, uid))
             db().execute("DELETE FROM users WHERE id=?", (uid,))
             db().commit()

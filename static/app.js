@@ -4,7 +4,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261121zf';
+const APP_VER = '20261122b';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -279,19 +279,20 @@ async function nav() {
 }
 function route() {
   if (state.tpoll) { clearInterval(state.tpoll); state.tpoll = null; }   // 离开陪伴者页：停掉轮询
-  const h = (location.hash || '#/').split('?')[0];
-  // 陪伴者账号只能待在只读看板；陪读也不能误入陪伴者页面
-  if (isTeacher() && !h.startsWith('#/teacher')) { location.hash = '#/teacher'; return; }
-  if (!isTeacher() && h.startsWith('#/teacher')) { location.hash = '#/'; return; }
+  let h = (location.hash || '#/').split('?')[0];
+  // 旧「老师/陪伴者」链接兼容：统一跳到新的陪伴者模块
+  if (h === '#/teacher') { location.hash = '#/coach'; return; }
+  if (h === '#/teacher/student') { location.hash = '#/coach/peer' + (location.hash.split('?')[1] ? '?' + location.hash.split('?')[1] : ''); return; }
+  if (h === '#/teacher/encourage') { location.hash = '#/coach/encourage'; return; }
   stSync();              // 学习时长：离开学习页立刻停表并把零头落库
   pauseClock();          // 离开练习页：结算并暂停计时，回来时从暂停处继续
   captureInk();          // 离开练习页：本题笔迹留在本次答题里，回来还能看到
   try { flushReportGrades(); } catch (e) { }   // 离开报告：没自评的题按默认强度补写
   state.gradeCtx = null;
   document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('active', a.getAttribute('href').split('?')[0] === h));
-  if (h === '#/teacher') return viewTeacher();
-  if (h === '#/teacher/student') return viewTeacherStudent(new URLSearchParams(location.hash.split('?')[1] || '').get('uid'));
-  if (h === '#/teacher/encourage') return viewTeacherEncourage();
+  if (h === '#/coach') return viewCoach();
+  if (h === '#/coach/peer') return viewTeacherStudent(new URLSearchParams(location.hash.split('?')[1] || '').get('uid'));
+  if (h === '#/coach/encourage') return viewTeacherEncourage();
   if (h === '#/') return viewDashboard();
   if (h === '#/study') return viewStudy();
   if (h === '#/review') return startSession({ mode: 'review' });
@@ -1501,6 +1502,7 @@ function renderAct() {
       <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
       <button class="qtool" id="t-note">📝 笔记</button>
       <button class="qtool" id="t-detail">🔍 完整标注</button>
+      <button class="qtool" id="t-push">📤 推题</button>
     </div>
     ${ansBlock}
     <div id="note-area"></div>
@@ -1526,6 +1528,7 @@ function renderAct() {
   };
   document.getElementById('t-note').onclick = () => toggleNote();
   document.getElementById('t-detail').onclick = () => { location.hash = '#/detail?id=' + c2id(); };
+  document.getElementById('t-push').onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
 }
 
 /* 复习模式：正确答案打码开关（V 键 / 点答案行共用），悬停由 CSS 临时揭开 */
@@ -2225,6 +2228,7 @@ function analysisPage(rows, filter, pos, ctx) {
       <div class="qtools" style="margin-top:14px">
         <button class="qtool ${c.fav ? 'on' : ''}" id="ra-fav">${c.fav ? '★ 已收藏' : '☆ 收藏'}</button>
         <a class="qtool" href="#/detail?id=${c.id}">🔍 完整标注</a>
+        <button class="qtool ra-push" data-qn="${c.id}" data-qid="${esc(c.qid || '')}">📤 推题</button>
       </div>
       ${ctx.grade === false ? '' : `<div class="rp-grade" id="ra-grade">
         <span>记忆强度</span>
@@ -2252,6 +2256,8 @@ function analysisPage(rows, filter, pos, ctx) {
     const b = document.getElementById('ra-fav'); b.classList.toggle('on', on); b.textContent = on ? '★ 已收藏' : '☆ 收藏';
     refreshSide();
   };
+  const rap = document.querySelector('.ra-push');
+  if (rap) rap.onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
   // 记忆强度自评：点按钮或按 1/2/3/4
   const gbox = document.getElementById('ra-grade');
   if (gbox) {
@@ -2576,6 +2582,7 @@ async function viewDetail(id, from) {
   <div class="qtools">
     <button class="qtool ${c.fav ? 'on' : ''}" id="d-fav">${c.fav ? '★ 已收藏' : '☆ 收藏'}</button>
     <button class="qtool ${c.doubt_status === 'resolved' ? 'on' : ''}" id="d-doubt">${c.doubt_status === 'resolved' ? '✓ 疑点已复核' : '⚑ 标记疑点已复核'}</button>
+    <button class="qtool" id="d-push">📤 推题</button>
   </div>
   ${c.ask_model ? `<div class="askmodel">💡 问法模型：${esc(c.ask_model)}</div>` : ''}
   ${c.material ? `<details open class="material-wrap"><summary style="cursor:pointer;color:var(--brand);margin-bottom:8px">📄 给定材料</summary><div class="material">${c.material}</div></details>` : ''}
@@ -2621,6 +2628,8 @@ async function viewDetail(id, from) {
     const b = document.getElementById('d-doubt'); b.classList.toggle('on', resolved);
     b.textContent = resolved ? '✓ 疑点已复核' : '⚑ 标记疑点已复核';
   };
+  const dpb = document.getElementById('d-push');
+  if (dpb) dpb.onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
   if (seq) {
     if (state.qdKey) { document.removeEventListener('keydown', state.qdKey); state.qdKey = null; }
     const onKey = (e) => {
@@ -3278,16 +3287,12 @@ async function viewSettings() {
     </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
-    <h2 style="margin-top:0">🤝 陪伴者督导（只读）</h2>
-    <p class="sub" style="margin:0 0 12px">给陪伴者开一个只读账号：陪伴者能查看你的学习记录、在你答题时实时看到进度，也能在总览面板给你留一句鼓励；<b>不能修改任何记录，也不能替你答题</b>。</p>
+    <h2 style="margin-top:0">🤝 陪伴者</h2>
+    <p class="sub" style="margin:0 0 12px">陪伴者已经是普通账号的一个功能（不再需要单独开账号）：把你的<b>用户名 + 链接码</b>给对方，或填对方的用户名 + 链接码，就能互相查看学习情况、互相推题。<b>查看始终只读，不能修改对方任何记录，也不能替对方答题</b>。</p>
     <div id="st-teacher-list" class="sub">加载中…</div>
-    <div class="row" style="gap:10px;flex-wrap:wrap;margin-top:12px">
-      <label class="fld">陪伴者用户名<input id="st-t-user" size="14" autocomplete="off"></label>
-      <label class="fld">密码（至少 6 位）<input id="st-t-pw" type="password" size="14" autocomplete="new-password"></label>
-      <label class="fld">称呼<input id="st-t-name" size="12" maxlength="12" placeholder="如 王姐"></label>
-      <button class="btn ok" id="st-t-add">添加陪伴者账号</button>
+    <div class="row" style="margin-top:12px">
+      <a class="btn ok" href="#/coach">前往「陪伴者」设置链接码 / 添加</a>
     </div>
-    <p class="sub" style="margin:10px 0 0">同一位陪伴者带多个陪读时，在这里用<b>同一个用户名 + 密码</b>再加一次即可绑定，不会重复建号。</p>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">👤 账号管理</h2>
@@ -3465,8 +3470,8 @@ function setFocus(on) {
 }
 
 /* ---------- 陪伴者模式（只读督导） ----------
-   陪伴者账号由陪读在「设置 → 陪伴者督导」里绑定生成（服务端 users.role='teacher'）。
-   前端只给陪伴者开放 #/teacher*，其余路由一律弹回；服务端还会把陪伴者的写接口统一 403，双保险。 */
+   陪伴者已融合为普通账号的功能：任何账号都能在「陪伴者」模块里互加（用户名 + 链接码）。
+   role=teacher 仅作旧数据兼容，不再限制任何路由或写操作。 */
 const STUDENT_NAV = `<a href="#/">总览面板</a>
       <a href="#/study">开始练习</a>
       <a href="#/review">复习到期</a>
@@ -3477,22 +3482,17 @@ const STUDENT_NAV = `<a href="#/">总览面板</a>
       <a href="#/kadian">考点导航</a>
       <a href="#/materials">材料组题</a>
       <a href="#/doubts">疑点复核</a>
+      <a href="#/coach">陪伴者<span class="nav-dot" id="nav-push-dot" style="display:none"></span></a>
       <a href="#/stats">数据统计</a>
       <a href="#/settings">设置</a>`;
 
-function isTeacher() { return !!(ME && ME.role === 'teacher'); }
+function isTeacher() { return false; }   // 陪伴者已融合为普通账号功能，不再有只读角色
 
 function renderNav() {
   const navEl = document.getElementById('nav'); if (!navEl) return;
-  if (isTeacher()) {
-    navEl.innerHTML = `<a href="#/teacher">👥 陪读看板</a>
-      <a href="#/teacher/encourage">💌 鼓励信息<span class="nav-dot" id="nav-enc-dot" style="display:none"></span></a>`;
-    const ss = document.getElementById('side-stats');
-    if (ss) ss.innerHTML = `<div class="stat-chip"><span>模式</span><b style="color:var(--warn)">陪伴者 · 只读</b></div>`;
-  } else {
-    navEl.innerHTML = STUDENT_NAV;
-  }
+  navEl.innerHTML = STUDENT_NAV;
   refreshEncDot();
+  refreshPushDot();
 }
 
 function agoIso(ts) {
@@ -3523,7 +3523,7 @@ function tStuCard(s) {
   const line = s.online
     ? `第 ${lv.idx || '?'}/${lv.total || '?'} 题 · ${esc(lv.module || '')}${lv.paused ? ' · 已暂停' : ''}`
     : (s.last_ts ? '最近学习 ' + agoIso(s.last_ts) : '还没有答题记录');
-  return `<a class="card tstu" href="#/teacher/student?uid=${encodeURIComponent(s.id)}" data-uid="${esc(s.id)}">
+  return `<a class="card tstu" href="#/coach/peer?uid=${encodeURIComponent(s.id)}" data-uid="${esc(s.id)}">
     <div class="tstu-top"><b>${esc(s.name || s.username || '陪读')}</b>${liveDot(lv)}</div>
     <div class="tstu-grid">
       <div><span class="sub">今日待复习</span><b style="color:var(--warn)">${s.due_review}</b></div>
@@ -3541,65 +3541,137 @@ function tStuCard(s) {
   </a>`;
 }
 
-async function viewTeacher() {
+/* 陪伴者模块：普通账号的一个功能（不再是独立只读角色）
+   - 我的陪伴圈：互相加的人（双向：都能看对方情况、互相推题）
+   - 我的链接码：别人凭「用户名 + 链接码」加我，不用给密码
+   - 推题收件箱：谁给我推了什么题 */
+async function viewCoach() {
   loading();
-  const d = await API('/api/teacher/students');
-  const list = d.students || [];
+  const [peersD, inD, outD] = await Promise.all([
+    API('/api/coach/peers').catch(() => ({ peers: [], code: '' })),
+    API('/api/push/list?box=in').catch(() => ({ items: [], unread: 0 })),
+    API('/api/push/list?box=out').catch(() => ({ items: [] })),
+  ]);
+  const peers = peersD.peers || [], code = peersD.code || '';
+  const inbox = inD.items || [], outbox = outD.items || [];
+  const meName = (ME && (ME.name || ME.username)) || '我';
+
   app.innerHTML = `
-  <h1>陪读看板</h1>
-  <p class="sub">陪伴者模式为<b>只读</b>：可以查看学习记录、实时看陪读答题，不能修改任何数据。</p>
-  <div class="card tbar">
-    <div class="row" style="justify-content:space-between;gap:12px">
-      <span class="sub" style="margin:0">共 ${list.length} 位陪读 · 实时状态每 5 秒自动刷新</span>
-      <button class="btn" id="t-add">＋ 添加陪读</button>
+  <h1 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">陪伴者
+    <a class="btn ghost" href="#/coach/encourage" style="font-size:13px;padding:5px 12px">💌 鼓励信息</a></h1>
+  <p class="sub">和信任的人互相陪伴：把自己的链接码给对方，或录入对方的链接码，就能互看学习情况、互相推题。查看对方数据始终只读，不会改动对方任何记录。</p>
+
+  <div class="card" style="max-width:760px">
+    <h2 style="margin-top:0">🔑 我的链接码</h2>
+    <p class="sub" style="margin:0 0 10px">别人用「你的用户名 + 这个链接码」就能把你加为陪伴对象，<b>不需要密码</b>。链接码 2-8 位字母或数字，可随时改。</p>
+    <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <label class="fld">我的用户名<input value="${esc((ME && ME.username) || '')}" readonly size="14" style="opacity:.75"></label>
+      <label class="fld">链接码<input id="co-code" size="10" maxlength="8" placeholder="如 8K2M" value="${esc(code)}" autocomplete="off"></label>
+      <button class="btn ok" id="co-code-save">保存链接码</button>
+      ${code ? '<button class="btn ghost" id="co-code-clear">清除</button>' : ''}
     </div>
-    <div id="t-form" class="tform" style="display:none">
-      <p class="sub" style="margin:0 0 10px">添加陪读需要对方本人的<b>用户名 + 密码</b>（经本人同意后提供），添加后即可查看其学习记录与实时答题。</p>
-      <div class="row" style="gap:10px;flex-wrap:wrap">
-        <label class="fld">陪读用户名<input id="t-u" size="16" autocomplete="username"></label>
-        <label class="fld">陪读密码<input id="t-p" type="password" size="16" autocomplete="current-password"></label>
-        <button class="btn ok" id="t-bind">绑定并查看</button>
-      </div>
+    <p class="sub" style="margin:10px 0 0">${code
+      ? `把你的「用户名 + <b>${esc(code)}</b>」告诉对方即可。`
+      : '还没有设置链接码，别人暂时不能加你。'}</p>
+  </div>
+
+  <div class="card" style="max-width:760px;margin-top:16px">
+    <h2 style="margin-top:0">➕ 添加陪伴者 / 陪伴对象</h2>
+    <p class="sub" style="margin:0 0 10px">填对方的<b>用户名 + 链接码</b>（对方在自己的「陪伴者」页能看到）。绑定后是双向的：你能看对方，对方也能看你，双方可以互相推题。</p>
+    <div class="row" style="gap:10px;flex-wrap:wrap;align-items:flex-end">
+      <label class="fld">对方用户名<input id="co-u" size="16" autocomplete="off"></label>
+      <label class="fld">对方的链接码<input id="co-c" size="10" maxlength="8" autocomplete="off"></label>
+      <button class="btn ok" id="co-add">添加</button>
     </div>
   </div>
-  ${list.length ? `<div class="grid g3 tgrid">${list.map(tStuCard).join('')}</div>`
-      : `<div class="card"><p class="sub" style="margin:0">还没有绑定陪读。点上面的「添加陪读」，输入陪读用户名和密码即可开始查看他的学习情况。</p></div>`}
-  <p class="sub" id="t-updated" style="margin-top:14px"></p>`;
 
-  const addBtn = document.getElementById('t-add');
-  const form = document.getElementById('t-form');
-  addBtn.onclick = () => { form.style.display = form.style.display === 'none' ? 'block' : 'none'; };
-  document.getElementById('t-bind').onclick = async () => {
-    const username = document.getElementById('t-u').value.trim();
-    const password = document.getElementById('t-p').value;
-    if (!username || !password) { alert('请填写陪读的用户名和密码'); return; }
+  <h2>👥 我的陪伴圈（${peers.length}）</h2>
+  ${peers.length ? `<div class="grid g3 tgrid">${peers.map(p => coachCard(p)).join('')}</div>`
+      : `<div class="card"><p class="sub" style="margin:0">还没有陪伴关系。把你的链接码给对方，或者填对方的用户名 + 链接码添加。</p></div>`}
+
+  <h2>📥 收到的推题${inD.unread ? `（<span style="color:var(--warn)">${inD.unread} 条未读</span>）` : ''}</h2>
+  ${inbox.length ? `<div class="card">${inbox.map(x => pushRow(x, 'in')).join('')}</div>`
+      : '<div class="card"><p class="sub" style="margin:0">还没有收到推题。对方在任意题目界面点「推题」推给你，就会出现在这里。</p></div>'}
+
+  <h2>📤 我推出的题（${outbox.length}）</h2>
+  ${outbox.length ? `<div class="card">${outbox.map(x => pushRow(x, 'out')).join('')}</div>`
+      : '<div class="card"><p class="sub" style="margin:0">还没有推过题。做题时点右侧「📤 推题」就能把这道题推给陪伴圈里的人。</p></div>'}
+  <p class="sub" id="co-updated" style="margin-top:14px"></p>`;
+  app.querySelectorAll('[data-pushback]').forEach(b => b.onclick = () => openPushDialog(+b.dataset.pushback, '', '把这道题推回去', b.dataset.to || ''));
+
+  const codeEl = document.getElementById('co-code');
+  document.getElementById('co-code-save').onclick = async () => {
+    const v = codeEl.value.trim();
+    if (!/^[0-9A-Za-z]{2,8}$/.test(v)) { alert('链接码为 2-8 位字母或数字'); return; }
+    try { await POST('/api/linkcode', { code: v }); toast('链接码已保存：' + v); viewCoach(); }
+    catch (e) { alert('保存失败：' + (e.message || e)); }
+  };
+  const clearBtn = document.getElementById('co-code-clear');
+  if (clearBtn) clearBtn.onclick = async () => {
+    if (!confirm('清除后别人将不能用链接码加你，已建立的陪伴关系不受影响。确定吗？')) return;
+    try { await POST('/api/linkcode', { code: '' }); viewCoach(); } catch (e) { alert('操作失败'); }
+  };
+  document.getElementById('co-add').onclick = async () => {
+    const username = document.getElementById('co-u').value.trim();
+    const cd = document.getElementById('co-c').value.trim();
+    if (!username || !cd) { alert('请填写对方用户名和链接码'); return; }
+    const btn = document.getElementById('co-add'); btn.disabled = true; btn.textContent = '添加中…';
     try {
-      const r = await POST('/api/teacher/link', { username, password });
-      if (!r.ok) { alert(r.error || '绑定失败'); return; }
-      viewTeacher();
-    } catch (e) { alert('绑定失败：' + e.message); }
+      const r = await POST('/api/teacher/register', { username, code: cd });
+      if (!r.ok) { alert(r.error || '添加失败'); }
+      else { toast('已添加：' + ((r.peer && r.peer.name) || username)); viewCoach(); return; }
+    } catch (e) { alert('添加失败：' + e.message); }
+    btn.disabled = false; btn.textContent = '添加';
   };
 
-  // 只更新在线状态与进度文字，不整页重绘（避免滚动位置乱跳）
+  // 收到推题自动标已读（让角标归零）
+  if (inD.unread) { POST('/api/push/read', {}).then(() => refreshPushDot()).catch(() => { }); }
+
+  // 实时状态轮询：只更新在线圆点与进度文字
   state.tpoll = setInterval(async () => {
     if (document.hidden) return;
-    if ((location.hash || '').split('?')[0] !== '#/teacher') return;
+    if ((location.hash || '').split('?')[0] !== '#/coach') return;
     try {
-      const r = await API('/api/teacher/students');
-      (r.students || []).forEach(s => {
-        const card = document.querySelector(`.tstu[data-uid="${s.id}"]`); if (!card) return;
-        const dot = card.querySelector('.live-dot');
-        const lv = s.live || {};
-        if (dot) { dot.classList.toggle('on', !!s.online); dot.innerHTML = `<i></i>${s.online ? '正在答题' : '未在答题'}`; }
+      const r = await API('/api/coach/peers');
+      (r.peers || []).forEach(p => {
+        const card = document.querySelector(`.tstu[data-uid="${p.id}"]`); if (!card) return;
+        const dot = card.querySelector('.live-dot'); const lv = p.live || {};
+        if (dot) { dot.classList.toggle('on', !!p.online); dot.innerHTML = `<i></i>${p.online ? '正在答题' : '未在答题'}`; }
         const line = card.querySelector('.tstu-live');
-        if (line) line.textContent = s.online
+        if (line) line.textContent = p.online
           ? `第 ${lv.idx || '?'}/${lv.total || '?'} 题 · ${lv.module || ''}${lv.paused ? ' · 已暂停' : ''}`
-          : (s.last_ts ? '最近学习 ' + agoIso(s.last_ts) : '还没有答题记录');
+          : (p.last_ts ? '最近学习 ' + agoIso(p.last_ts) : '还没有答题记录');
       });
-      const up = document.getElementById('t-updated');
+      const up = document.getElementById('co-updated');
       if (up) up.textContent = '实时状态更新于 ' + new Date().toLocaleTimeString();
     } catch (e) { }
   }, 5000);
+}
+
+/* 陪伴圈里的一张卡：技能等同原陪读卡，额外标明「我加的 / 加我的」 */
+function coachCard(p) {
+  const role = p.is_mine ? '我加的陪伴对象' : '加我为陪伴者';
+  const html = tStuCard(p);
+  return html.replace('<div class="tstu-top">', `<div class="tstu-top"><span class="tag" style="margin-right:auto;font-size:11px">${role}</span>`);
+}
+
+/* 推题记录行 */
+function pushRow(x, dir) {
+  const who = esc(x.peer_name || x.peer_username || '对方');
+  const stem = esc((x.stem || '').slice(0, 46));
+  const t = agoIso(x.ts);
+  const dot = (dir === 'in' && !x.read_ts) ? '<span class="push-new">NEW</span>' : '';
+  const openBtn = x.qn ? `<a class="btn ghost" href="#/detail?id=${x.qn}">看这题</a>` : '';
+  const pushBack = (dir === 'in' && x.qn) ? `<button class="btn" data-pushback="${x.qn}" data-to="${esc(x.from_uid || '')}">↩ 推回去</button>` : '';
+  return `<div class="push-row" data-pid="${x.id}">
+    <div class="push-main">
+      <div><b>${dir === 'in' ? '来自 ' + who : '推给 ' + who}</b>${dot}
+        <span class="sub"> · ${t}</span></div>
+      <div class="sub push-stem">${stem || '（题目已不可用）'}</div>
+      ${x.note ? `<div class="push-note">💬 ${esc(x.note)}</div>` : ''}
+    </div>
+    <div class="row" style="gap:8px;flex-wrap:wrap">${openBtn}${pushBack}</div>
+  </div>`;
 }
 
 /* 实时答题面板：尽量直接看到整道题（题干 + 选项），看不清再点开完整习题 */
@@ -3653,7 +3725,7 @@ function tLiveHtml(live, name, uid) {
 
 async function viewTeacherStudent(uid) {
   loading();
-  if (!uid) { location.hash = '#/teacher'; return; }
+  if (!uid) { location.hash = '#/coach'; return; }
   const d = await API('/api/teacher/student?uid=' + encodeURIComponent(uid));
   const s = d.student || {}; const b = d.brief || {};
   const days = d.days || []; const recent = d.recent || []; const wrong = d.wrong || []; const exams = d.exams || [];
@@ -3677,10 +3749,10 @@ async function viewTeacherStudent(uid) {
   }).join('');
 
   app.innerHTML = `
-  <a class="back-link" href="#/teacher">← 返回陪读列表</a>
+  <a class="back-link" href="#/coach">← 返回陪伴者</a>
   <h1 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">${esc(s.name || s.username || '陪读')}
     <span class="tag">${esc(s.username || '')}</span>${liveDot(b.live)}</h1>
-  <p class="sub">只读视图：所有数字直接来自陪读的账号数据，陪伴者端不提供任何修改入口。</p>
+  <p class="sub">查看视图：所有数字直接来自对方的账号数据，且不能修改对方任何记录。可用下方「推题」把自己觉得有价值的题推给对方。</p>
 
   <div class="card tlive" id="tlive">${tLiveHtml(b.live, s.name || s.username, uid)}</div>
 
@@ -3781,12 +3853,12 @@ async function viewTeacherStudent(uid) {
   document.getElementById('t-unlink').onclick = async () => {
     if (!confirm('解除后你将看不到该陪读的任何记录，确定吗？')) return;
     await POST('/api/teacher/unlink', { uid: s.id });
-    location.hash = '#/teacher';
+    location.hash = '#/coach';
   };
 
   state.tpoll = setInterval(async () => {
     if (document.hidden) return;
-    if ((location.hash || '').split('?')[0] !== '#/teacher/student') return;
+    if ((location.hash || '').split('?')[0] !== '#/coach/peer') return;
     try {
       const r = await API('/api/teacher/live?uid=' + encodeURIComponent(uid));
       const box = document.getElementById('tlive');
@@ -4157,38 +4229,92 @@ async function refreshEncDot() {
   } catch (e) { el.style.display = 'none'; }
 }
 
+/* 侧栏推题未读角标 */
+async function refreshPushDot() {
+  const el = document.getElementById('nav-push-dot'); if (!el) return;
+  if (!tok()) { el.style.display = 'none'; return; }
+  try {
+    const d = await API('/api/push/list?box=in');
+    const n = (d && d.unread) || 0;
+    if (n > 0) { el.textContent = n > 99 ? '99+' : n; el.style.display = 'inline-flex'; }
+    else el.style.display = 'none';
+  } catch (e) { el.style.display = 'none'; }
+}
+
+/* ---------- 推题：任意习题界面都能把当前题推给陪伴圈里的人 ---------- */
+async function openPushDialog(qn, qidStr, label, presetTo) {
+  let peers = [];
+  try { const d = await API('/api/coach/peers'); peers = d.peers || []; } catch (e) { }
+  if (!peers.length) {
+    alert('还没有陪伴关系。\n先去侧栏「陪伴者」把你的链接码给对方，或填对方的用户名 + 链接码添加，再回来推题。');
+    return;
+  }
+  document.querySelectorAll('.modal-mask.push-mask').forEach(m => m.remove());
+  const box = document.createElement('div');
+  box.className = 'modal-mask push-mask';
+  box.innerHTML = `<div class="modal card" style="max-width:520px">
+    <h2 style="margin-top:0">📤 推题给陪伴者</h2>
+    <p class="sub" style="margin:0 0 12px">${esc(label || '')}</p>
+    <label class="fld" style="display:block;margin-bottom:10px">推给谁
+      <div class="push-pick" id="pu-who">
+        ${peers.map(p => `<button type="button" class="qtool" data-uid="${esc(p.id)}">${esc(p.name || p.username)}</button>`).join('')}
+      </div>
+    </label>
+    <label class="fld" style="display:block;margin-bottom:12px">留言（可选，200 字内）
+      <input id="pu-note" size="30" maxlength="200" placeholder="比如：这题老是错，帮我看看">
+    </label>
+    <div class="row" style="justify-content:flex-end;gap:8px">
+      <button class="btn ghost" id="pu-cancel">取消</button>
+      <button class="btn ok" id="pu-go">推送</button>
+    </div>
+  </div>`;
+  document.body.appendChild(box);
+  let who = (presetTo && peers.some(p => p.id === presetTo)) ? presetTo
+    : (peers.length === 1 ? peers[0].id : '');
+  const btns = box.querySelectorAll('#pu-who .qtool');
+  btns.forEach(b => {
+    b.classList.toggle('on', b.dataset.uid === who);
+    b.onclick = () => { who = b.dataset.uid; btns.forEach(x => x.classList.toggle('on', x === b)); };
+  });
+  box.querySelector('#pu-cancel').onclick = () => box.remove();
+  box.onclick = e => { if (e.target === box) box.remove(); };
+  box.querySelector('#pu-go').onclick = async () => {
+    if (!who) { alert('请选择推给谁'); return; }
+    const note = box.querySelector('#pu-note').value.trim();
+    const btn = box.querySelector('#pu-go'); btn.disabled = true; btn.textContent = '推送中…';
+    try {
+      const r = await POST('/api/push', { to_uid: who, id: qn, qid: qidStr, note });
+      if (!r.ok) { alert(r.error || '推送失败'); btn.disabled = false; btn.textContent = '推送'; return; }
+      box.remove();
+      toast('已推送，对方在「陪伴者」模块能看到');
+    } catch (e) { alert('推送失败：' + e.message); btn.disabled = false; btn.textContent = '推送'; }
+  };
+}
+
+/* 轻提示（页面底部浮一条，2 秒消失） */
+function toast(msg) {
+  let el = document.getElementById('kg-toast');
+  if (!el) { el = document.createElement('div'); el.id = 'kg-toast'; document.body.appendChild(el); }
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(toast._t); toast._t = setTimeout(() => el.classList.remove('show'), 2200);
+}
+
 /* 设置页：我已绑定的陪伴者（陪读侧） */
 async function renderTeacherBox() {
   const box = document.getElementById('st-teacher-list'); if (!box) return;
-  const d = await API('/api/teacher/mine').catch(() => ({ teachers: [] }));
-  const list = d.teachers || [];
+  const d = await API('/api/coach/peers').catch(() => ({ peers: [] }));
+  const list = d.peers || [];
   box.innerHTML = list.length
     ? list.map(t => `<div class="enc-item"><div class="enc-body"><b>${esc(t.name || t.username)}</b>
         <span class="sub"> · 用户名 ${esc(t.username)} · 绑定于 ${agoIso(t.created)}</span></div>
         <button class="btn ghost st-t-del" data-id="${esc(t.id)}">解除</button></div>`).join('')
-    : '还没有绑定陪伴者。填下面的用户名和密码即可添加。';
+    : '还没有陪伴关系。点下方按钮进入「陪伴者」，用链接码互相添加。';
   box.querySelectorAll('.st-t-del').forEach(b => b.onclick = async () => {
-    if (!confirm('解除后这位陪伴者将看不到你的学习记录，确定吗？')) return;
+    if (!confirm('解除后双方都看不到对方的学习记录，确定吗？')) return;
     try { await POST('/api/teacher/detach', { teacher_uid: b.dataset.id }); } catch (e) { }
     renderTeacherBox();
   });
-  const add = document.getElementById('st-t-add');
-  if (add) add.onclick = async () => {
-    const username = document.getElementById('st-t-user').value.trim();
-    const password = document.getElementById('st-t-pw').value;
-    const name = document.getElementById('st-t-name').value.trim();
-    if (!username || password.length < 6) { alert('用户名不能为空，密码至少 6 位'); return; }
-    add.disabled = true; add.textContent = '添加中…';
-    try {
-      const r = await POST('/api/teacher/register', { username, password, name });
-      if (!r.ok) alert(r.error || '添加失败');
-      else {
-        ['st-t-user', 'st-t-pw', 'st-t-name'].forEach(id => { const el = document.getElementById(id); if (el) el.value = ''; });
-        renderTeacherBox();
-      }
-    } catch (e) { alert('添加失败：' + e.message); }
-    add.disabled = false; add.textContent = '添加陪伴者账号';
-  };
+
 }
 
 /* ---------- 学习实时状态上报（给陪伴者端看） ---------- */
@@ -4243,8 +4369,8 @@ function liveStart() {
 function syncUserChip() {
   const el = document.getElementById('user-name'); if (!el) return;
   const nm = ME ? (ME.name || ME.username) : '';
-  el.textContent = ME ? (isTeacher() ? nm + ' · 陪伴者' : nm) : '未登录';
-  el.title = ME ? (isTeacher() ? '陪伴者账号（只读）：可查看学习记录，不能修改数据' : '点击切换 / 新建账号') : '点击登录';
+  el.textContent = ME ? nm : '未登录';
+  el.title = ME ? '点击切换 / 新建账号' : '点击登录';
 }
 
 function onLoginOk(d) {
@@ -4264,7 +4390,6 @@ function showLogin(msg) {
     <div class="row" style="gap:8px;margin-bottom:12px">
       <button class="qtool on" id="lg-tab-login">登录</button>
       <button class="qtool" id="lg-tab-reg">注册新账号</button>
-      <button class="qtool" id="lg-tab-teacher">陪伴者登录</button>
     </div>
     <label class="fld" style="display:block;margin-bottom:8px">用户名<input id="lg-user" size="20" autocomplete="username"></label>
     <label class="fld" style="display:block;margin-bottom:8px">密码<input id="lg-pw" type="password" size="20" autocomplete="current-password"></label>
@@ -4281,15 +4406,13 @@ function showLogin(msg) {
     mode = m;
     $('lg-tab-login').classList.toggle('on', m === 'login');
     $('lg-tab-reg').classList.toggle('on', m === 'reg');
-    $('lg-tab-teacher').classList.toggle('on', m === 'teacher');
-    $('lg-go').textContent = m === 'login' ? '登录' : (m === 'teacher' ? '陪伴者登录（只读）' : '注册并进入');
+    $('lg-go').textContent = m === 'login' ? '登录' : '注册并进入';
     $('lg-name-wrap').style.display = m === 'reg' ? 'block' : 'none';
-    const gb = $('lg-guest'); if (gb) gb.style.display = m === 'teacher' ? 'none' : '';
-    const sep = box.querySelector('.guest-sep'); if (sep) sep.style.display = m === 'teacher' ? 'none' : '';
+    const gb = $('lg-guest'); if (gb) gb.style.display = '';
+    const sep = box.querySelector('.guest-sep'); if (sep) sep.style.display = '';
   };
   $('lg-tab-login').onclick = () => setMode('login');
   $('lg-tab-reg').onclick = () => setMode('reg');
-  $('lg-tab-teacher').onclick = () => setMode('teacher');
   const submit = async () => {
     const username = $('lg-user').value.trim();
     const password = $('lg-pw').value;
@@ -4309,12 +4432,7 @@ function showLogin(msg) {
         }).then(r => r.json());
         if (r.need_password) { box.remove(); return showSetPassword(username); }
         if (!r.ok) { alert(r.error || '登录失败'); return; }
-        if (mode === 'teacher' && !(r.user && r.user.role === 'teacher')) {
-          alert('这个账号不是陪伴者账号。\n陪伴者账号需要由陪读在「设置 → 陪伴者督导」里添加后才能使用。');
-          return;
-        }
         onLoginOk(r); box.remove();
-        if (mode === 'teacher') { location.hash = '#/teacher'; }
         location.reload();
       }
     } catch (e) { alert('操作失败：' + e); }
@@ -4371,10 +4489,10 @@ function openUserMenu() {
   box.className = 'modal-mask';
   box.innerHTML = `<div class="modal card">
     <h2 style="margin-top:0">👤 账号</h2>
-    <p class="sub" style="margin-bottom:14px">当前登录：<b>${esc((ME && ME.name) || '—')}</b>${(ME && ME.username) ? '（用户名 ' + esc(ME.username) + '）' : ''}${isTeacher() ? ' · <b style="color:var(--warn)">陪伴者账号（只读）</b>' : ''}</p>
+    <p class="sub" style="margin-bottom:14px">当前登录：<b>${esc((ME && ME.name) || '—')}</b>${(ME && ME.username) ? '（用户名 ' + esc(ME.username) + '）' : ''}</p>
     <button class="btn" id="um-pw" style="width:100%;margin-bottom:8px">🔑 修改密码</button>
     <button class="btn danger" id="um-out" style="width:100%;margin-bottom:8px">退出账号</button>${(ME && ME.anon) ? '<p class="sub" style="margin:0">游客模式：退出将清除本浏览器的全部学习数据。</p>' : ''}
-    ${isTeacher() ? '' : '<a class="btn ghost" href="#/settings" style="width:100%;margin-bottom:8px" onclick="document.querySelector(\'.modal-mask\').remove()">⚙ 账号管理</a>'}
+    <a class="btn ghost" href="#/settings" style="width:100%;margin-bottom:8px" onclick="document.querySelector('.modal-mask').remove()">⚙ 账号管理</a>
     <button class="btn ghost" id="um-close" style="width:100%">关闭</button>
   </div>`;
   document.body.appendChild(box);
