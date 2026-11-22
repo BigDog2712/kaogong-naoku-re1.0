@@ -4,7 +4,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261122b';
+const APP_VER = '20261122c';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -1451,7 +1451,7 @@ function renderOptions() {
     box.innerHTML = `<div class="row"><button class="btn" id="btn-reveal">🧠 先回忆，然后点击显示选项与答案</button></div>`;
     document.getElementById('btn-reveal').onclick = doReveal;
   } else if (!answerable && S.phase === 'answer') {
-    // 复习模式：先自己回忆，答案默认不点亮；悬停答案行 / 按 V / 点按钮才揭示
+    // 复习模式：先自己回忆，答案默认不点亮；悬停答案行 / 按 0 / 点按钮才揭示
     box.innerHTML = `<div class="opts">` + opts.map(o => `<div class="opt${o.is_answer ? ' ans-key' : ''}">
         <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
         ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>' : ''}
@@ -1494,7 +1494,7 @@ function renderAct() {
         ${revealHtml(f)}
         <div class="answer-line ans-line" id="ans-line" title="悬停核对答案 · 点击揭晓">
           <span>正确答案：</span><b class="ans-secret">${esc(f.answer)}</b>
-          <span class="ans-peek-tip"><span class="tip-hover">🙈 悬停核对 · 按 V 揭晓</span><span class="tip-touch">🙈 点这一行揭晓答案</span></span>
+          <span class="ans-peek-tip"><span class="tip-hover">🙈 悬停核对 · 按 0 揭晓</span><span class="tip-touch">🙈 点这一行揭晓答案</span></span>
         </div>
       </div>`;
   act.innerHTML = `
@@ -1766,6 +1766,8 @@ async function doReveal() {
 
 async function doGrade(g) {
   const S = state.session, c = S.queue[S.idx];
+  if (S._grading) return;          // 自评立即跳转后，连按 1/2/3/4 不能重复评分
+  S._grading = true;
   const dur = qElapsed(S);
   S.times.push(dur); stopLimitTimer();
   let gr = null;
@@ -1779,16 +1781,13 @@ async function doGrade(g) {
   markPractice(S, [{ qid: c.qid, choice: S.chosen || '', correct, timeout: 0, ms: dur, pos: S.idx + 1 }]);
   refreshSide();
   S.graded = g;
+  S._grading = false;
   if (isRev(S)) {
-    // 需求：复习自评后自动进入下一题，不用再按空格；留 1.6s 看「下次复习时间」反馈，也可点「停留查看」取消
-    const idx = S.idx;
-    clearTimeout(S._autoT);
-    S._autoT = setTimeout(() => {
-      const C = state.session;
-      if (C && isRev(C) && C.idx === idx && C.graded) nextCard();
-    }, 1600);
+    // 需求：复习自评后立即进入下一题，不再有停留延迟
+    nextCard();
+    return;
   }
-  renderNextBar(isRev(S));
+  renderNextBar(false);
   saveSession();
 }
 
@@ -1796,6 +1795,7 @@ function nextCard() {
   const S = state.session; if (!S) return;
   clearTimeout(S._autoT);
   S.graded = 0;
+  S._grading = false;      // 换题即解锁：下一题必须能正常自评
   S.idx++;
   if (S.idx >= S.queue.length) {
     // 这一批题做完了：回溯里把本组收尾；接着抽到的下一批算新的一组
@@ -2364,6 +2364,11 @@ window.addEventListener('pagehide', () => {
 
 /* keyboard */
 document.addEventListener('keydown', (e) => {
+  // Ctrl/Cmd+B：收起 / 展开左侧功能栏（唯一需要放行的组合键）
+  if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === 'b' || e.key === 'B')) {
+    if (window.innerWidth > 820) { e.preventDefault(); toggleNavFit(); }
+    return;
+  }
   // 组合键与输入法组字一律不当作答 / 不自评：
   // PC 上划完线顺手 Ctrl+C 复制选中的文字，e.key 就是 c，曾被当成「按 C 选答案」，
   // 而且选完还会自动跳下一题，看起来完全像「划线把选项选上了」。Ctrl+A / Ctrl+D / Ctrl+1~4 同理。
@@ -2388,13 +2393,17 @@ document.addEventListener('keydown', (e) => {
       return;
     }
     if (S.phase === 'question') {
+      // 复习模式：先回忆阶段按 0 也直接揭示答案（等同于点「显示选项与答案」）
+      if (!answerable && e.key === '0') {
+        e.preventDefault(); doReveal(); return;
+      }
       if (answerable && 'ABCD'.includes(e.key.toUpperCase())) {
         const o = S.queue[S.idx].options.find(x => x.key.toUpperCase() === e.key.toUpperCase());
         if (o) { S.chosen = o.key; doReveal(); }
       } else if ((e.key === ' ' || e.key === 'Enter') && !answerable) { e.preventDefault(); doReveal(); }
     } else if (S.phase === 'answer') {
       // 复习模式：V 键随时展开/收起答案与解析（组合键已在函数开头排除，不会抢 Ctrl+V）
-      if (!answerable && (e.key === 'v' || e.key === 'V') && document.getElementById('ans-line')) {
+      if (!answerable && e.key === '0' && document.getElementById('ans-line')) {
         e.preventDefault(); toggleAns(); return;
       }
       if (S.graded) {   // 已评分：空格/回车进入下一题
@@ -3223,6 +3232,10 @@ async function viewSettings() {
       <span>专注模式（隐藏侧栏，居中窄列）</span>
       <button class="btn ghost" id="st-focus"></button>
     </div>
+    <div class="row" id="st-navfit-row" style="justify-content:space-between;margin:14px 0">
+      <span>收起左侧功能栏（内容区更宽 · 快捷键 Ctrl+B）</span>
+      <button class="btn ghost" id="st-navfit"></button>
+    </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">答题模式</h2>
@@ -3324,6 +3337,13 @@ async function viewSettings() {
   const fbtn = document.getElementById('st-focus');
   const syncFocus = () => { fbtn.textContent = isFocus() ? '已开启 · 关闭' : '已关闭 · 开启'; fbtn.className = 'btn ' + (isFocus() ? 'ok' : 'ghost'); };
   syncFocus(); fbtn.onclick = () => { setFocus(!isFocus()); syncFocus(); };
+  const nfb = document.getElementById('st-navfit');
+  const syncNavFit = () => {
+    const on = isNavFit();
+    nfb.textContent = on ? '已收起 · 展开' : '已展开 · 收起';
+    nfb.className = 'btn ' + (on ? 'ok' : 'ghost');
+  };
+  syncNavFit(); nfb.onclick = () => { setNavFit(!isNavFit()); syncNavFit(); };
   try { renderTeacherBox(); } catch (e) { }   // 陪伴者督导：读我已绑定的陪伴者
   API('/api/streak').then(s => {
     document.getElementById('st-goal').value = s.goal;
@@ -3463,6 +3483,15 @@ function toggleTheme() {
 function getFont() { try { return +(localStorage.getItem('kg_fontscale')) || 15; } catch (e) { return 15; } }
 function setFont(px) { try { localStorage.setItem('kg_fontscale', px); } catch (e) { } document.documentElement.style.fontSize = px + 'px'; cloudSchedule(); }
 function isFocus() { return document.documentElement.getAttribute('data-focus') === '1'; }
+/* 左侧功能栏收起/展开（桌面端）：状态存 localStorage，并随偏好同步到账号 */
+function isNavFit() { return document.documentElement.getAttribute('data-navfit') === '1'; }
+function setNavFit(on) {
+  if (on) document.documentElement.setAttribute('data-navfit', '1');
+  else document.documentElement.removeAttribute('data-navfit');
+  try { localStorage.setItem('kg_navfit', on ? '1' : '0'); } catch (e) { }
+  cloudSchedule();
+}
+function toggleNavFit() { if (window.innerWidth <= 820) return; setNavFit(!isNavFit()); }   // 窄屏侧栏本就是顶部横条，不收
 function setFocus(on) {
   if (on) document.documentElement.setAttribute('data-focus', '1'); else document.documentElement.removeAttribute('data-focus');
   try { localStorage.setItem('kg_focus', on ? '1' : '0'); } catch (e) { }
@@ -4588,6 +4617,7 @@ function collectPrefs() {
     theme: getTheme(),
     fontscale: getFont(),
     focus: isFocus() ? 1 : 0,
+    navfit: isNavFit() ? 1 : 0,
     answerMode: getAnswerMode(),
     readw: getReadW(),
     sessionSize: loadSessionSize(),
@@ -4612,6 +4642,10 @@ function applyPrefs(d) {
     }
     if (+d.fontscale >= 12 && +d.fontscale <= 24) setFont(+d.fontscale);
     if (d.focus === 0 || d.focus === 1) setFocus(!!d.focus);
+    // 侧栏收起是纯界面状态：本机已明确设置过就以本机为准，避免刚收起就被账号旧值拉回
+    if ((d.navfit === 0 || d.navfit === 1) && localStorage.getItem('kg_navfit') === null) {
+      setNavFit(!!d.navfit);
+    }
     if (d.readw && READW_ORDER.indexOf(d.readw) >= 0) { setReadW(d.readw); syncReadWSeg(); }
     if (+d.sessionSize >= 1) { try { localStorage.setItem(SESSION_SIZE_KEY, String(clampSessionSize(d.sessionSize))); } catch (e) { } }
     if (d.rmouse === 0 || d.rmouse === 1) { try { localStorage.setItem(RMOUSE_KEY, d.rmouse ? '1' : '0'); } catch (e) { } syncRmouseBtn(); }
@@ -4664,6 +4698,8 @@ async function prefsFlush() {
   try { localStorage.removeItem('kg_preferred_years'); } catch (e) { }   // 已下线功能的遗留键
 
   const tb = document.getElementById('theme-toggle'); if (tb) tb.onclick = toggleTheme;
+  const nb = document.getElementById('nav-toggle'); if (nb) nb.onclick = toggleNavFit;
+  const nr = document.getElementById('nav-reveal'); if (nr) nr.onclick = toggleNavFit;
   const fe = document.getElementById('focus-exit'); if (fe) fe.onclick = () => { setFocus(false); };
   if (window.matchMedia) {
     try { matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => { if (getTheme() === 'auto') applyTheme('auto'); }); } catch (e) { }

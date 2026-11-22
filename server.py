@@ -2433,7 +2433,7 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True, "name": name})
 
-    PREFS_KEYS = ("limits", "limitOn", "theme", "fontscale", "focus",
+    PREFS_KEYS = ("limits", "limitOn", "theme", "fontscale", "focus", "navfit",
                   "answerMode", "readw", "sessionSize", "rmouse", "seen")
 
     def api_prefs(self, p):
