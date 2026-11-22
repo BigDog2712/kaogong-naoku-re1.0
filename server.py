@@ -3,7 +3,7 @@
 """考公间隔重复系统 - 零依赖后端 (Python 标准库)
 启动:  python server.py    然后浏览器打开 http://127.0.0.1:8300
 """
-import os, re, sys, json, gzip, shutil, sqlite3, datetime, mimetypes, urllib.parse, threading, email.utils, hashlib, secrets, time
+import os, re, sys, json, gzip, shutil, sqlite3, datetime, mimetypes, urllib.parse, threading, email.utils, hashlib, secrets, time, base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -130,10 +130,15 @@ class Unauthorized(Exception):
 
 def auth_uid(token):
     """由 token 反查账号 id；无效或缺失返回 None。
-    注意：绝不采信客户端传来的 u= 参数，避免越权访问他人数据。"""
+    注意：绝不采信客户端传来的 u= 参数，避免越权访问他人数据。
+    多设备支持：每个登录会话在 sessions 表各占一行，互不顶掉；
+    users.token 仍保留为「最近一次签发」的兼容回落。"""
     tok = (token or "").strip()
     if not tok:
         return None
+    r = q_one("SELECT uid FROM sessions WHERE token=?", (tok,))
+    if r and r["uid"]:
+        return r["uid"]
     r = q_one("SELECT id FROM users WHERE token=? AND IFNULL(token,'')<>''", (tok,))
     return r["id"] if r else None
 
@@ -144,6 +149,58 @@ def need_uid(token):
     if not uid:
         raise Unauthorized()
     return uid
+
+
+def user_role(uid):
+    """账号角色：student（默认）/ teacher（陪伴者，只读）。"""
+    if not uid:
+        return "student"
+    r = q_one("SELECT IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
+    return (r["role"] if r else "student") or "student"
+
+
+def is_teacher_token(token):
+    """token 是否属于陪伴者账号。陪伴者的一切写操作都在 do_POST 里被拦掉。"""
+    uid = auth_uid(token)
+    return bool(uid) and user_role(uid) == "teacher"
+
+
+def link_ok(teacher_uid, student_uid):
+    return bool(q_one("SELECT 1 FROM teacher_links WHERE teacher_uid=? AND student_uid=?",
+                      (teacher_uid, student_uid)))
+
+
+# ---------- 陪读"正在答题"的实时状态（进程内存，单进程够用；120 秒没心跳即视为离线） ----------
+_LIVE = {}
+_LIVE_LOCK = threading.Lock()
+
+
+def live_put(uid, data):
+    with _LIVE_LOCK:
+        _LIVE[uid] = dict(data, ts=int(time.time() * 1000))
+        if len(_LIVE) > 400:      # 顺手清理一小时前的僵尸条目，别让字典无限涨
+            cut = int(time.time() * 1000) - 3600_000
+            for k in [k for k, v in _LIVE.items() if (v or {}).get("ts", 0) < cut]:
+                _LIVE.pop(k, None)
+
+
+def live_get(uid):
+    with _LIVE_LOCK:
+        d = _LIVE.get(uid)
+    if not d:
+        return None
+    out = dict(d)
+    out["age_ms"] = int(time.time() * 1000) - int(out.get("ts") or 0)
+    # 只有「在答题」且心跳新鲜才算在线：切到别的页面后陪读端会主动报 idle
+    out["online"] = out["age_ms"] < 120000 and out.get("status") == "answering"
+    return out
+
+
+def plain_text(h, n=80):
+    """题目 HTML → 纯文本摘要（陪伴者的实时看板只需要一小段题干）。"""
+    t = re.sub(r"<[^>]+>", " ", h or "")
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:n]
 
 
 def ensure_user(uid):
@@ -376,6 +433,8 @@ def ensure_tables():
     migrate_v2.ensure(db())   # v2：多用户隔离 / 错题本字段 / 超时标记（幂等；含缺表兜底）
     db().executescript("""
     CREATE TABLE IF NOT EXISTS users(id TEXT PRIMARY KEY, name TEXT, created TEXT);
+    CREATE TABLE IF NOT EXISTS sessions(
+        token TEXT PRIMARY KEY, uid TEXT NOT NULL, created TEXT);
     CREATE TABLE IF NOT EXISTS notes(
         qid TEXT PRIMARY KEY, text TEXT, updated TEXT);
     CREATE TABLE IF NOT EXISTS favorites(
@@ -384,12 +443,23 @@ def ensure_tables():
         qid TEXT PRIMARY KEY, status TEXT, note TEXT, updated TEXT);
     CREATE TABLE IF NOT EXISTS settings(
         key TEXT PRIMARY KEY, value TEXT);
+    CREATE TABLE IF NOT EXISTS user_settings(
+        uid TEXT NOT NULL, key TEXT NOT NULL, value TEXT, PRIMARY KEY(uid,key));
     CREATE TABLE IF NOT EXISTS exam_history(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         title TEXT, total INT, correct INT, score REAL, duration INT, ts TEXT);
+    CREATE TABLE IF NOT EXISTS study_time(
+        uid TEXT NOT NULL, day TEXT NOT NULL, ms INTEGER DEFAULT 0,
+        PRIMARY KEY(uid, day));
     """)
     if not q_one("SELECT value FROM settings WHERE key='daily_goal'"):
-        db().execute("INSERT INTO settings(key,value) VALUES('daily_goal','20')")
+        db().execute("INSERT INTO settings(key,value) VALUES('daily_goal','120')")
+    # 每日目标默认值由旧版 20 题调整为 120 题（只迁移一次，用户改过的值不再覆盖）
+    if not q_one("SELECT value FROM settings WHERE key='goal_default_v2'"):
+        cur = q_one("SELECT value FROM settings WHERE key='daily_goal'")
+        if (not cur) or str(cur["value"]).strip() == '20':
+            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('daily_goal','120')")
+        db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('goal_default_v2','1')")
     db().commit()
     # 游客(匿名)账号标记：anon=1 表示免注册账号，退出时一并清除数据
     try:
@@ -397,6 +467,73 @@ def ensure_tables():
         db().commit()
     except Exception:
         pass
+    # ---------- 陪伴者账号（只读督导）：role=teacher 的账号只能看，不能改 ----------
+    try:
+        db().execute("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'student'")
+        db().commit()
+    except Exception:
+        pass
+    db().executescript("""
+    CREATE TABLE IF NOT EXISTS teacher_links(
+        teacher_uid TEXT NOT NULL, student_uid TEXT NOT NULL, created TEXT,
+        PRIMARY KEY(teacher_uid, student_uid));
+    CREATE TABLE IF NOT EXISTS encouragements(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        teacher_uid TEXT NOT NULL,
+        student_uid TEXT NOT NULL DEFAULT '*',
+        text TEXT, image TEXT, ts TEXT);
+    """)
+    db().execute("CREATE INDEX IF NOT EXISTS idx_link_teacher ON teacher_links(teacher_uid)")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_link_student ON teacher_links(student_uid)")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_enc_student ON encouragements(student_uid, id)")
+    # ---------- 寄语可回复：一条寄语 = 一个会话线程 ----------
+    # parent_id=0 是陪伴者发的根留言，>0 是跟在这条留言下的往来消息；
+    # role 记消息作者身份（teacher / student），teacher_uid 始终是「这条线程属于哪位陪伴者」，
+    # 陪读的回复也照抄根的 teacher_uid，这样按陪伴者查列表的口径不用改。
+    for _col, _ddl in (
+        ("parent_id", "ALTER TABLE encouragements ADD COLUMN parent_id INTEGER DEFAULT 0"),
+        ("author_uid", "ALTER TABLE encouragements ADD COLUMN author_uid TEXT DEFAULT ''"),
+        ("role", "ALTER TABLE encouragements ADD COLUMN role TEXT DEFAULT 'teacher'"),
+        ("read_ts", "ALTER TABLE encouragements ADD COLUMN read_ts TEXT DEFAULT ''"),
+    ):
+        try:
+            db().execute(_ddl)
+            db().commit()
+        except Exception:
+            pass
+    db().execute("CREATE INDEX IF NOT EXISTS idx_enc_parent ON encouragements(parent_id, id)")
+    # ---------- 今日回溯：一次练习 = 一组，逐题记录「对答案那一刻」的选择与正误 ----------
+    # practice_groups 记组（模式 / 范围 / 起止时间），practice_items 记组内每题的状态。
+    # 先答后对交卷时才判分，因此这里存的是交卷瞬间的选择，之后再怎么复看/自评都不会改它。
+    db().executescript("""
+    CREATE TABLE IF NOT EXISTS practice_groups(
+        gid TEXT PRIMARY KEY,
+        uid TEXT NOT NULL,
+        mode TEXT,
+        answer_mode TEXT,
+        title TEXT,
+        scope TEXT,
+        size INTEGER DEFAULT 0,
+        started TEXT,
+        ended TEXT,
+        total_ms INTEGER DEFAULT 0,
+        state TEXT DEFAULT 'open');
+    CREATE TABLE IF NOT EXISTS practice_items(
+        gid TEXT NOT NULL,
+        uid TEXT NOT NULL,
+        qid TEXT NOT NULL,
+        pos INTEGER DEFAULT 0,
+        choice TEXT,
+        answer TEXT,
+        correct INTEGER DEFAULT 0,
+        timeout INTEGER DEFAULT 0,
+        ms INTEGER DEFAULT 0,
+        graded_at TEXT,
+        PRIMARY KEY(gid, qid));
+    """)
+    db().execute("CREATE INDEX IF NOT EXISTS idx_pg_uid_day ON practice_groups(uid, started)")
+    db().execute("CREATE INDEX IF NOT EXISTS idx_pi_gid ON practice_items(gid, pos)")
+    db().commit()
     # ---------- 云端账号体系（与本地纯昵称账号并存，互不影响） ----------
     db().executescript("""
     CREATE TABLE IF NOT EXISTS cloud_accounts(
@@ -433,6 +570,17 @@ def ensure_tables():
 def get_setting(key, default=None):
     r = q_one("SELECT value FROM settings WHERE key=?", (key,))
     return r["value"] if r else default
+
+
+def get_user_setting(uid, key, default=None):
+    """按账号读取设置，缺省回落到全局默认值（每日目标等必须按账号隔离，否则多账号互相影响）。"""
+    r = q_one("SELECT value FROM user_settings WHERE uid=? AND key=?", (uid, key))
+    return r["value"] if r else default
+
+
+def set_user_setting(uid, key, value):
+    db().execute("INSERT OR REPLACE INTO user_settings(uid,key,value) VALUES(?,?,?)",
+                 (uid, key, str(value)))
 
 def resolve_qid(qid_int):
     r = q_one("SELECT qid FROM qdb.questions WHERE id=?", (qid_int,))
@@ -523,7 +671,7 @@ def clean_card(row, reveal=False, uid=DEFAULT_UID):
             "answer": row["answer"], "reasoning": row["reasoning"],
             "fastest": row["fastest"], "pitfalls": row["pitfalls"],
             "mother": row["mother"], "analysis": row["analysis"],
-            "doubt": row["doubt"], "related": row["related"],
+            "doubt": clean_doubt(row["doubt"]), "related": row["related"],
         })
         eqid = row["qid"]
         nt = q_one("SELECT text,updated FROM notes WHERE qid=? AND user_id=?", (eqid, uid))
@@ -551,6 +699,28 @@ def plain_text(html, n=None):
     s = re.sub(r"&(nbsp|amp|lt|gt|quot);?", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s[:n] if n else s
+
+
+def brief_text(html, n=None):
+    """给陪伴者看板用的摘要：图片留一个占位，别让图形题/带图材料变成空白。"""
+    s = re.sub(r"<img[^>]*>", " ［图］ ", html or "", flags=re.I)
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
+    s = re.sub(r"</(p|div|li|tr)>", "\n", s, flags=re.I)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"&(nbsp|amp|lt|gt|quot);?", " ", s)
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n\s*\n+", "\n", s).strip()
+    return s[:n] if n else s
+
+
+_DOUBT_HEAD = re.compile(r"^\s*\[![a-zA-Z]+\]\s*(疑点\s*（[^）]*）\s*)?", re.I)
+
+
+def clean_doubt(s):
+    """疑点正文来自题库的 Obsidian callout，去掉 '[!warning] 疑点（官方解析可能有误，待人工复核）'
+    这类给编辑器看的前缀，只留真正的疑点内容。"""
+    t = _DOUBT_HEAD.sub("", (s or "").strip()).strip()
+    return t or (s or "").strip()
 
 
 def build_where(module, category, kadian):
@@ -876,6 +1046,15 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/"):
             borrow()   # 本请求独占一条连接（多线程不再共用，杜绝 database is locked）
             try:
+                # 陪伴者账号只读：只放行陪伴者自己的看板接口与最基础的引导接口
+                # （寄语会话例外：陪伴者要能读陪读的回复、也要能回话，这属于沟通而非改记录）
+                if is_teacher_token(g("token")):
+                    allow = (path.startswith("/api/teacher/")
+                             or path in ("/api/auth/me", "/api/bootstrap", "/api/encourage/img",
+                                         "/api/encourage/unread", "/api/encourage/thread"))
+                    if not allow:
+                        return self._send(403, {"error": "陪伴者账号为只读模式：可以查看记录，不能修改任何数据",
+                                                "readonly": True})
                 return self.api(path, g)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
@@ -900,13 +1079,30 @@ class Handler(BaseHTTPRequestHandler):
 
         routes = {
             "/api/grade": self.api_grade,
+            # 今日回溯：组 / 逐题作答状态
+            "/api/practice/start": self.api_practice_start,
+            "/api/practice/mark": self.api_practice_mark,
+            "/api/practice/end": self.api_practice_end,
             "/api/note": self.api_note,
             "/api/fav": self.api_fav,
             "/api/goal": self.api_goal,
+            "/api/pacing": self.api_pacing,
             "/api/doubt": self.api_doubt,
             "/api/exam/submit": self.api_exam_submit,
             "/api/users/rename": self.api_users_rename,
             "/api/users/delete": self.api_users_delete,
+            "/api/account/reset-practice": self.api_account_reset,
+            "/api/study-time": self.api_study_time,
+            "/api/prefs": self.api_prefs,
+            # 陪伴者（只读督导）
+            "/api/live/ping": self.api_live_ping,
+            "/api/teacher/register": self.api_teacher_register,
+            "/api/teacher/link": self.api_teacher_link,
+            "/api/teacher/unlink": self.api_teacher_unlink,
+            "/api/teacher/detach": self.api_teacher_detach,
+            "/api/teacher/encourage": self.api_teacher_encourage,
+            "/api/teacher/encourage/delete": self.api_teacher_encourage_delete,
+            "/api/encourage/reply": self.api_encourage_reply,
             # 账号：注册 / 登录 / 退出 / 改密码 / 老账号补设密码
             "/api/auth/register": self.api_auth_register,
             "/api/auth/login": self.api_auth_login,
@@ -920,6 +1116,14 @@ class Handler(BaseHTTPRequestHandler):
         if fn:
             borrow()   # 同上：注册/登录/游客等写操作各用各的连接
             try:
+                # 陪伴者账号只读：除登录/退出/改密码与陪伴者自己的发布、回复接口外，一律禁止写
+                if path.startswith("/api/") and is_teacher_token(payload.get("token")):
+                    allow = (path.startswith("/api/teacher/")
+                             or path in ("/api/auth/login", "/api/auth/logout", "/api/auth/password",
+                                         "/api/encourage/reply"))
+                    if not allow:
+                        return self._send(403, {"error": "陪伴者账号为只读模式：可以查看记录，不能修改任何数据",
+                                                "readonly": True})
                 return fn(payload)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
@@ -1006,6 +1210,371 @@ class Handler(BaseHTTPRequestHandler):
             total = q_one("SELECT COUNT(*) n FROM qdb.questions")["n"]
             return self._send(200, {"total": total, "modules": mods, "categories": cats, "today": today()})
 
+        # ---------- 复习计划：未来逐日到期题数 ----------
+        if path == "/api/review/plan":
+            return self.api_review_plan({"token": g("token")})
+
+        # ---------- 今日回溯：按组回看当天练过的题，以及「对答案那一刻」的状态 ----------
+        if path == "/api/practice/today":
+            uid = need_uid(g("token"))
+            day = (g("date") or "").strip()
+            try:
+                d0 = datetime.date.fromisoformat(day) if day else datetime.date.today()
+            except Exception:
+                d0 = datetime.date.today()
+            span = (datetime.date.today() - d0).days
+            if span < 0 or span > 31:          # 只开放最近 31 天，避免随意翻库
+                d0 = datetime.date.today()
+            day = d0.isoformat()
+            rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
+                                   gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
+                                   IFNULL(gp.state,'open') state,
+                                   COUNT(it.qid) n,
+                                   SUM(CASE WHEN it.graded_at IS NOT NULL THEN 1 ELSE 0 END) answered,
+                                   SUM(CASE WHEN IFNULL(it.correct,0)=1 THEN 1 ELSE 0 END) right_n,
+                                   SUM(CASE WHEN it.graded_at IS NOT NULL AND IFNULL(it.correct,0)=0
+                                            THEN 1 ELSE 0 END) wrong_n,
+                                   SUM(IFNULL(it.timeout,0)) timeout_n,
+                                   SUM(IFNULL(it.ms,0)) spent_ms
+                            FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
+                            WHERE gp.uid=? AND date(gp.started)=?
+                            GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
+            groups = []
+            for r in rows:
+                r["n"] = int(r["n"] or 0)
+                r["answered"] = int(r["answered"] or 0)
+                r["right_n"] = int(r["right_n"] or 0)
+                r["wrong_n"] = int(r["wrong_n"] or 0)
+                r["timeout_n"] = int(r["timeout_n"] or 0)
+                r["spent_ms"] = int(r["spent_ms"] or 0)
+                r["total_ms"] = int(r["total_ms"] or 0)
+                r["legacy"] = False
+                groups.append(r)
+            # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
+            legacy = q_all("""SELECT r.qid, r.grade, r.ts, IFNULL(r.timeout,0) timeout,
+                                     s.id, s.module, s.category, s.stem, s.answer
+                              FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
+                              WHERE r.user_id=? AND date(r.ts)=?
+                                AND r.id=(SELECT MAX(r2.id) FROM reviews r2
+                                          WHERE r2.user_id=r.user_id AND r2.qid=r.qid AND date(r2.ts)=?)
+                                AND r.qid NOT IN (SELECT it.qid FROM practice_items it
+                                                  JOIN practice_groups gp ON gp.gid=it.gid
+                                                  WHERE gp.uid=? AND date(gp.started)=?)
+                              ORDER BY r.id""", (uid, day, day, uid, day))
+            if legacy:
+                items = []
+                for i, r in enumerate(legacy, 1):
+                    items.append({"qid": r["qid"], "id": r["id"], "pos": i,
+                                  "module": r["module"], "category": r["category"],
+                                  "stem": plain_text(r["stem"], 140), "answer": r["answer"],
+                                  "choice": "", "correct": 1 if int(r["grade"] or 0) >= 3 else 0,
+                                  "timeout": r["timeout"], "ms": 0, "graded_at": r["ts"]})
+                right_n = sum(1 for x in items if x["correct"])
+                groups.append({"gid": "legacy-" + day, "mode": "legacy", "answer_mode": "instant",
+                               "title": "未分组的作答记录", "scope": "", "size": len(items),
+                               "started": legacy[0]["ts"], "ended": legacy[-1]["ts"],
+                               "total_ms": 0, "state": "done", "n": len(items),
+                               "answered": len(items), "right_n": right_n,
+                               "wrong_n": len(items) - right_n, "timeout_n": sum(1 for x in items if x["timeout"]),
+                               "spent_ms": 0, "legacy": True, "items": items})
+            summary = {
+                "groups": len(groups),
+                "questions": sum(x["n"] for x in groups),
+                "answered": sum(x["answered"] for x in groups),
+                "right": sum(x["right_n"] for x in groups),
+                "wrong": sum(x["wrong_n"] for x in groups),
+                "timeout": sum(x["timeout_n"] for x in groups),
+                "ms": sum(x["spent_ms"] for x in groups),
+            }
+            return self._send(200, {"ok": True, "date": day, "summary": summary, "groups": groups})
+
+        if path == "/api/practice/group":
+            uid = need_uid(g("token"))
+            gid = (g("gid") or "").strip()
+            gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+            if not gp:
+                return self._send(404, {"error": "没有这组练习记录"})
+            items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
+                                    IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
+                                    IFNULL(it.ms,0) ms, it.graded_at,
+                                    s.id, s.module, s.category, s.kadian, s.stem
+                             FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
+                             WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
+            for x in items:
+                x["stem"] = plain_text(x["stem"], 140)
+            # full=1：把每题的完整卡片（材料/选项/官方解析/收藏）一起带回，
+            # 让回溯能直接复用「交卷后解析」那套界面，不用逐题再请求
+            if g("full") == "1":
+                ids = [x["id"] for x in items if x.get("id")]
+                cards = {}
+                if ids:
+                    ph = ",".join("?" * len(ids))
+                    for r in q_all(f"SELECT * FROM qdb.questions WHERE id IN ({ph})", ids):
+                        cards[r["id"]] = clean_card(r, reveal=True, uid=uid)
+                for x in items:
+                    x["card"] = cards.get(x.get("id"))
+            gp["legacy"] = False
+            return self._send(200, {"ok": True, "group": gp, "items": items})
+
+        # ---------- 陪伴者（只读督导）：陪读列表 / 陪读详情 / 实时看板 / 鼓励信息 ----------
+        if path == "/api/teacher/students":
+            uid = need_uid(g("token"))
+            if user_role(uid) != "teacher":
+                return self._send(403, {"error": "仅陪伴者账号可访问"})
+            rows = q_all("""SELECT u.id, u.name, u.username, l.created FROM teacher_links l
+                            JOIN users u ON u.id=l.student_uid
+                            WHERE l.teacher_uid=? ORDER BY l.created DESC""", (uid,))
+            out = []
+            for r in rows:
+                b = self._student_brief(r["id"])
+                b.update({"id": r["id"], "name": r["name"], "username": r["username"], "linked": r["created"]})
+                out.append(b)
+            out.sort(key=lambda x: str(x.get("last_ts") or ""), reverse=True)
+            out.sort(key=lambda x: 0 if x.get("online") else 1)   # 正在答题的排最前
+            return self._send(200, {"ok": True, "students": out})
+
+        if path == "/api/teacher/student":
+            uid = need_uid(g("token"))
+            if user_role(uid) != "teacher":
+                return self._send(403, {"error": "仅陪伴者账号可访问"})
+            sid = (g("uid") or "").strip()
+            if not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            u = q_one("""SELECT id, name, username, created, IFNULL(anon,0) anon,
+                                IFNULL(role,'student') role FROM users WHERE id=?""", (sid,))
+            days = q_all("""SELECT day, ms FROM study_time WHERE uid=? AND day>=date(?,'-13 day') ORDER BY day""",
+                         (sid, today()))
+            recent = q_all("""SELECT r.ts, r.grade, IFNULL(r.timeout,0) timeout, s.id, s.qid,
+                                     s.module, s.category, s.stem
+                              FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
+                              WHERE r.user_id=? ORDER BY r.id DESC LIMIT 40""", (sid,))
+            for x in recent:
+                x["stem"] = plain_text(x["stem"], 120)
+                x["right"] = int(x["grade"] or 0) >= 3
+            wrong = q_all("""SELECT x.qid, x.wrong, x.due, x.wb_status, s.id, s.module, s.category, s.stem
+                             FROM srs x JOIN qdb.questions s ON s.qid=x.qid
+                             WHERE x.user_id=? AND x.wrong>0
+                             ORDER BY x.wrong DESC, x.due ASC LIMIT 20""", (sid,))
+            for x in wrong:
+                x["stem"] = plain_text(x["stem"], 140)
+            exams = q_all("""SELECT id,title,total,correct,score,duration,ts FROM exam_history
+                             WHERE user_id=? ORDER BY id DESC LIMIT 10""", (sid,))
+            return self._send(200, {"ok": True, "student": u, "brief": self._student_brief(sid, full=True),
+                                    "days": days, "recent": recent, "wrong": wrong, "exams": exams})
+
+        if path == "/api/teacher/question":
+            # 陪伴者点开陪读做过的题：只读查看整道题（题干 / 材料 / 选项 / 答案 / 解析）
+            uid = need_uid(g("token"))
+            if user_role(uid) != "teacher":
+                return self._send(403, {"error": "仅陪伴者账号可访问"})
+            sid = (g("uid") or "").strip()
+            if not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            qid = (g("qid") or "").strip()
+            qidn = _int(g("id"), 0)
+            row = (q_one("SELECT * FROM qdb.questions WHERE id=?", (qidn,)) if qidn
+                   else q_one("SELECT * FROM qdb.questions WHERE qid=?", (qid,)))
+            if not row:
+                return self._send(404, {"error": "题目不存在"})
+            srs = q_one("""SELECT status, due, interval, correct, wrong FROM srs
+                            WHERE user_id=? AND qid=?""", (sid, row["qid"]))
+            hist = q_all("""SELECT ts, grade, IFNULL(timeout,0) timeout FROM reviews
+                            WHERE user_id=? AND qid=? ORDER BY id DESC LIMIT 10""", (sid, row["qid"]))
+            for h in hist:
+                h["right"] = int(h["grade"] or 0) >= 3
+            return self._send(200, {"ok": True, "card": clean_card(row, reveal=True, uid=sid),
+                                    "srs": srs, "history": hist})
+
+        if path == "/api/teacher/live":
+            uid = need_uid(g("token"))
+            if user_role(uid) != "teacher":
+                return self._send(403, {"error": "仅陪伴者账号可访问"})
+            sid = (g("uid") or "").strip()
+            if not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            return self._send(200, {"ok": True, "live": live_get(sid) or {"online": False, "status": "idle"},
+                                    "student": q_one("SELECT name,username FROM users WHERE id=?", (sid,))})
+
+        if path == "/api/teacher/encouragements":
+            uid = need_uid(g("token"))
+            if user_role(uid) != "teacher":
+                return self._send(403, {"error": "仅陪伴者账号可访问"})
+            rows = q_all("""SELECT e.id, e.text, e.ts, e.student_uid,
+                                   CASE WHEN IFNULL(e.image,'')='' THEN 0 ELSE 1 END has_img,
+                                   IFNULL(su.name,'全部陪读') target_name
+                            FROM encouragements e LEFT JOIN users su ON su.id=e.student_uid
+                            WHERE e.teacher_uid=? AND IFNULL(e.parent_id,0)=0
+                            ORDER BY e.id DESC LIMIT 30""", (uid,))
+            # 每条寄语下按陪读分组，给出「谁回过、回了什么、我还有几条没看」
+            reps = q_all("""SELECT r.id, r.parent_id, r.text, r.ts, r.student_uid, r.role,
+                                   IFNULL(r.read_ts,'') read_ts,
+                                   CASE WHEN IFNULL(r.image,'')='' THEN 0 ELSE 1 END has_img,
+                                   IFNULL(su.name, su.username) author_name
+                            FROM encouragements r LEFT JOIN users su ON su.id=r.student_uid
+                            WHERE r.teacher_uid=? AND IFNULL(r.parent_id,0)>0
+                            ORDER BY r.id""", (uid,))
+            by_root = {}
+            for r in reps:
+                if r["role"] == "student":
+                    t = by_root.setdefault(r["parent_id"], {}).setdefault(
+                        r["student_uid"], {"sid": r["student_uid"], "name": r["author_name"],
+                                           "n": 0, "unread": 0, "last_ts": "", "last_text": ""})
+                    t["n"] += 1
+                    t["last_ts"] = r["ts"]
+                    t["last_text"] = r["text"] or ("［图片］" if r["has_img"] else "")
+                    if not r["read_ts"]:
+                        t["unread"] += 1
+            for e in rows:
+                th = list((by_root.get(e["id"]) or {}).values())
+                th.sort(key=lambda x: x["last_ts"] or "", reverse=True)
+                e["threads"] = th
+                e["reply_n"] = sum(t["n"] for t in th)
+                e["unread"] = sum(t["unread"] for t in th)
+                e["last_ts"] = th[0]["last_ts"] if th else ""
+                e["last_text"] = th[0]["last_text"] if th else ""
+                e["last_name"] = th[0]["name"] if th else ""
+            return self._send(200, {"ok": True, "items": rows})
+
+        if path == "/api/teacher/mine":
+            uid = need_uid(g("token"))
+            rows = q_all("""SELECT t.id, t.name, t.username, l.created FROM teacher_links l
+                            JOIN users t ON t.id=l.teacher_uid
+                            WHERE l.student_uid=? ORDER BY l.created""", (uid,))
+            return self._send(200, {"ok": True, "teachers": rows})
+
+        if path == "/api/encourage":
+            uid = need_uid(g("token"))
+            rows = q_all("""SELECT e.id, e.text, e.ts, e.student_uid,
+                                   CASE WHEN IFNULL(e.image,'')='' THEN 0 ELSE 1 END has_img,
+                                   IFNULL(t.name, t.username) teacher_name
+                            FROM encouragements e
+                            JOIN teacher_links l ON l.teacher_uid=e.teacher_uid AND l.student_uid=?
+                            LEFT JOIN users t ON t.id=e.teacher_uid
+                            WHERE IFNULL(e.parent_id,0)=0 AND (e.student_uid='*' OR e.student_uid=?)
+                            ORDER BY e.id DESC LIMIT 6""", (uid, uid))
+            reps = q_all("""SELECT r.parent_id, r.text, r.ts, r.role, IFNULL(r.read_ts,'') read_ts,
+                                   CASE WHEN IFNULL(r.image,'')='' THEN 0 ELSE 1 END has_img
+                            FROM encouragements r
+                            WHERE r.student_uid=? AND IFNULL(r.parent_id,0)>0
+                            ORDER BY r.id""", (uid,))
+            by_root = {}
+            for r in reps:
+                b = by_root.setdefault(r["parent_id"], {"n": 0, "unread": 0, "last_ts": "", "last_text": "", "last_role": ""})
+                b["n"] += 1
+                b["last_ts"] = r["ts"]
+                b["last_text"] = r["text"] or ("［图片］" if r["has_img"] else "")
+                b["last_role"] = r["role"]
+                if r["role"] == "teacher" and not r["read_ts"]:
+                    b["unread"] += 1
+            for e in rows:
+                b = by_root.get(e["id"]) or {"n": 0, "unread": 0, "last_ts": "", "last_text": "", "last_role": ""}
+                e.update(b)
+            return self._send(200, {"ok": True, "items": rows})
+
+        if path == "/api/encourage/unread":
+            # 陪读看「陪伴者回复了几条没读」，陪伴者看「陪读回复了几条没读」
+            uid = need_uid(g("token"))
+            if user_role(uid) == "teacher":
+                n = q_one("""SELECT COUNT(*) n FROM encouragements
+                             WHERE teacher_uid=? AND role='student' AND IFNULL(read_ts,'')=''
+                               AND IFNULL(parent_id,0)>0""", (uid,))["n"]
+            else:
+                n = q_one("""SELECT COUNT(*) n FROM encouragements
+                             WHERE student_uid=? AND role='teacher' AND IFNULL(read_ts,'')=''
+                               AND IFNULL(parent_id,0)>0""", (uid,))["n"]
+            return self._send(200, {"ok": True, "n": n})
+
+        if path == "/api/encourage/thread":
+            # 一条寄语 = 一个会话线程；陪伴者侧按 (寄语, 陪读) 打开，陪读侧就是自己那条
+            uid = need_uid(g("token"))
+            rid = _int(g("id"), 0)
+            root = q_one("""SELECT e.id, e.text, e.ts, e.teacher_uid, e.student_uid,
+                                   CASE WHEN IFNULL(e.image,'')='' THEN 0 ELSE 1 END has_img,
+                                   IFNULL(t.name, t.username) teacher_name,
+                                   IFNULL(su.name,'全部陪读') target_name
+                            FROM encouragements e
+                            LEFT JOIN users t ON t.id=e.teacher_uid
+                            LEFT JOIN users su ON su.id=e.student_uid
+                            WHERE e.id=? AND IFNULL(e.parent_id,0)=0""", (rid,))
+            if not root:
+                return self._send(404, {"error": "这条寄语不存在"})
+            is_t = user_role(uid) == "teacher"
+            if is_t:
+                if root["teacher_uid"] != uid:
+                    return self._send(403, {"error": "只能查看自己发布的寄语"})
+                sid = (g("sid") or "").strip()
+                if not sid and root["student_uid"] != "*":
+                    sid = root["student_uid"]
+                if sid and not link_ok(uid, sid):
+                    return self._send(403, {"error": "没有该陪读的查看权限"})
+            else:
+                sid = uid
+                if (root["student_uid"] not in ("*", uid)) or not link_ok(root["teacher_uid"], uid):
+                    return self._send(403, {"error": "没有这条寄语的查看权限"})
+            if sid:
+                msgs = q_all("""SELECT r.id, r.text, r.ts, r.role, r.student_uid,
+                                       CASE WHEN IFNULL(r.image,'')='' THEN 0 ELSE 1 END has_img,
+                                       IFNULL(su.name, su.username) author_name
+                                FROM encouragements r LEFT JOIN users su ON su.id=r.student_uid
+                                WHERE r.id=? OR (r.parent_id=? AND r.student_uid=?)
+                                ORDER BY r.id""", (rid, rid, sid))
+            else:
+                msgs = [dict(root, role="teacher", author_name=root["teacher_name"])]
+            for m in msgs:
+                # 陪伴者发的消息作者就是这位陪伴者；陪读发的取自己的名字
+                m["author_name"] = (root["teacher_name"] if m.get("role") == "teacher"
+                                    else (m.get("author_name") or "陪读"))
+            # 打开即已读：只看「对端发给我的」那几条，不碰自己发的
+            with _LOCK:
+                if is_t and sid:
+                    db().execute("""UPDATE encouragements SET read_ts=?
+                                    WHERE parent_id=? AND role='student' AND student_uid=?
+                                      AND IFNULL(read_ts,'')=''""", (now(), rid, sid))
+                elif not is_t:
+                    db().execute("""UPDATE encouragements SET read_ts=?
+                                    WHERE parent_id=? AND role='teacher' AND student_uid=?
+                                      AND IFNULL(read_ts,'')=''""", (now(), rid, uid))
+                db().commit()
+            partner = (root["target_name"] if not is_t else
+                       (q_one("SELECT IFNULL(name,username) nm FROM users WHERE id=?", (sid,)) or {}).get("nm", "陪读"))
+            return self._send(200, {"ok": True, "root": root, "messages": msgs,
+                                    "sid": sid or "", "is_teacher": is_t, "partner": partner or "陪读"})
+
+        if path == "/api/encourage/img":
+            uid = need_uid(g("token"))
+            eid = _int(g("id"), 0)
+            r = q_one("SELECT id, teacher_uid, student_uid, image FROM encouragements WHERE id=?", (eid,))
+            if not r or not r["image"]:
+                return self._send(404, {"error": "图片不存在"})
+            allowed = (r["teacher_uid"] == uid or r["student_uid"] == uid
+                       or (r["student_uid"] == "*" and link_ok(r["teacher_uid"], uid)))
+            if not allowed:
+                return self._send(403, {"error": "没有权限"})
+            m = re.match(r"data:(image/[A-Za-z0-9.+-]+);base64,(.+)", r["image"], re.S)
+            if not m:
+                return self._send(404, {"error": "图片格式异常"})
+            try:
+                data = base64.b64decode(m.group(2))
+            except Exception:
+                return self._send(404, {"error": "图片数据损坏"})
+            return self._send(200, data, m.group(1),
+                              extra={"Cache-Control": "private, max-age=86400"})
+
+        if path == "/api/prefs":
+            # 本机偏好（主题、字号、答题模式、限时、题量、宽度、右键手势、已做缓存）随应用账号走，不再依赖 WorkBuddy 云账号
+            uid = need_uid(g("token"))
+            raw = get_user_setting(uid, "prefs")
+            data = {}
+            if raw:
+                try:
+                    data = json.loads(raw) or {}
+                except Exception:
+                    data = {}
+            if not isinstance(data, dict):
+                data = {}
+            return self._send(200, {"ok": True, "prefs": data,
+                                    "updated": get_user_setting(uid, "prefs_at", "")})
+
         if path == "/api/stats":
             t = today(); uid = need_uid(g("token"))
             learned = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new'", (uid,))["n"]
@@ -1013,6 +1582,9 @@ class Handler(BaseHTTPRequestHandler):
             due_new = max(0, total_q - learned)   # 没进度行的题都算新题，不必预铺行
             due_rev = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
             studied_today = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?", (uid, t))["n"]
+            # 学习时长（答题 + 看解析，由前端按秒累计后分批上报）
+            st_today = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, t))
+            st_total = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
             wrong_n = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0", (uid,))["n"]
             fav_n = q_one("SELECT COUNT(*) n FROM favorites WHERE user_id=?", (uid,))["n"]
             by_mod = q_all("""SELECT q.module m, COUNT(*) total,
@@ -1030,6 +1602,8 @@ class Handler(BaseHTTPRequestHandler):
                 "studied_today": studied_today, "by_module": by_mod,
                 "due_by_module": due_by_mod, "mastery": buckets,
                 "wrong": wrong_n, "fav": fav_n,
+                "today_ms": int((st_today or {}).get("ms") or 0),
+                "total_ms": int((st_total or {}).get("s") or 0),
                 "total": total_q,
             })
 
@@ -1038,6 +1612,10 @@ class Handler(BaseHTTPRequestHandler):
             size = max(1, min(60, _int(g("size"), 10)))
             uid = need_uid(g("token"))
             cond, args = build_where(g("module"), g("category"), g("kadian"))
+            year = g("year")
+            if year in {str(y) for y in range(2020, 2027)}:
+                cond += " AND q.year=?"
+                args.append(year)
             ref = g("ref")
             # 跨次去重：排除近期已练习过的 qid（由前端传入，限额 500，仅作用于新题补充分支）
             excl = g("exclude", "")
@@ -1062,21 +1640,23 @@ class Handler(BaseHTTPRequestHandler):
                 rows = q_all("SELECT * FROM qdb.questions WHERE material_ref=? ORDER BY id LIMIT ?", (ref, size))
             elif mode == "fav":
                 rows = q_all(f"""SELECT q.* {J}
-                                WHERE q.qid IN (SELECT qid FROM favorites WHERE user_id=?){cond}{excl_clause}
-                                ORDER BY RANDOM() LIMIT ?""", (uid, uid, *ea, size))
+                                WHERE q.qid IN (SELECT qid FROM favorites WHERE user_id=?){cond}
+                                ORDER BY RANDOM() LIMIT ?""", (uid, uid, *args, size))
             elif mode == "wrongredo":
                 # 错题专项重练：只抽「待重练」的错题，随机打散
+                # 注意：错题重练就是「再做一遍」，绝不能套用 exclude（刚做完的错题会被全部排除，
+                # 表现为「今天的错题一题都抽不到」）。
                 rows = q_all(f"""SELECT q.* {J}
-                                WHERE s.wrong>0 AND IFNULL(s.wb_status,'active')='active'{cond}{excl_clause}
-                                ORDER BY RANDOM() LIMIT ?""", (uid, *ea, size))
+                                WHERE s.wrong>0 AND IFNULL(s.wb_status,'active')='active'{cond}
+                                ORDER BY RANDOM() LIMIT ?""", (uid, *args, size))
             elif mode == "wrong":
                 rows = q_all(f"""SELECT q.* {J}
-                                WHERE s.wrong>0{cond}{excl_clause} ORDER BY s.wrong DESC, s.ease ASC LIMIT ?""",
-                             (uid, *ea, size))
+                                WHERE s.wrong>0{cond} ORDER BY s.wrong DESC, s.ease ASC LIMIT ?""",
+                             (uid, *args, size))
             elif mode == "review":
                 rows = q_all(f"""SELECT q.* {J}
-                                WHERE s.status!='new' AND s.due<=?{cond}{excl_clause}
-                                ORDER BY s.due ASC, s.ease ASC LIMIT ?""", (uid, today(), *ea, size))
+                                WHERE s.status!='new' AND s.due<=?{cond}
+                                ORDER BY s.due ASC, s.ease ASC LIMIT ?""", (uid, today(), *args, size))
             elif mode == "mix":
                 # 重复练习题优先：答错 > 遗忘(lapses) > 到期复习（此池不受 exclude 限制，刚做错的也能立刻重练）；
                 # 新题仅作补充，且排除近期已练过的，避免无意义重复。
@@ -1192,7 +1772,7 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     run = 1
                 best = max(best, run); prev = dt
-            goal = int(get_setting("daily_goal", "20") or 20)
+            goal = int(get_user_setting(uid, "daily_goal", get_setting("daily_goal", "120")) or 120)
             today_n = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?",
                             (uid, today()))["n"]
             return self._send(200, {"current": cur, "best": best, "goal": goal, "today": today_n})
@@ -1239,18 +1819,33 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/doubts":
             page = max(1, _int(g("page"), 1)); size = max(1, min(50, _int(g("size"), 20)))
-            only = g("only")  # pending
+            only = g("only")            # pending = 仅待复核；mine = 我标记过的
+            sort = g("sort")            # time = 按我的标记时间倒序
+            uid = auth_uid(g("token")) or ""
             cond = "q.doubt!=''"; args = []
             if only == "pending":
-                cond += " AND (ds.status IS NULL OR ds.status='')"
-            total = q_one(f"""SELECT COUNT(*) n FROM qdb.questions q LEFT JOIN doubt_status ds ON ds.qid=q.qid
-                             WHERE {cond}""", args)["n"]
+                cond += " AND IFNULL(ds.status,'')=''"
+            elif only == "mine":
+                cond += " AND ds.user_id IS NOT NULL"
+            # 复核状态必须按人隔离：以前只按 qid 关联，多人标记同一题会出现重复行并串号
+            join = "LEFT JOIN doubt_status ds ON ds.qid=q.qid AND ds.user_id=?"
+            order = "q.module,q.category"
+            if sort == "time":
+                order = "(IFNULL(ds.updated,'')=''), ds.updated DESC, q.module, q.category"
+            total = q_one(f"""SELECT COUNT(*) n FROM qdb.questions q {join}
+                             WHERE {cond}""", [uid] + args)["n"]
             rows = q_all(f"""SELECT q.id,q.qid,q.module,q.category,q.kadian,q.region,q.year,q.doubt,
-                            ds.status ds_status, ds.note ds_note
-                            FROM qdb.questions q LEFT JOIN doubt_status ds ON ds.qid=q.qid
-                            WHERE {cond} ORDER BY q.module,q.category LIMIT ? OFFSET ?""",
-                         args + [size, (page - 1) * size])
-            return self._send(200, {"total": total, "page": page, "size": size, "rows": rows})
+                            ds.status ds_status, ds.note ds_note, IFNULL(ds.updated,'') ds_updated
+                            FROM qdb.questions q {join}
+                            WHERE {cond} ORDER BY {order} LIMIT ? OFFSET ?""",
+                         [uid] + args + [size, (page - 1) * size])
+            for r in rows:
+                r["doubt"] = clean_doubt(r["doubt"])
+            mine_n = q_one("""SELECT COUNT(*) n FROM qdb.questions q
+                              JOIN doubt_status ds ON ds.qid=q.qid AND ds.user_id=?
+                              WHERE q.doubt!=''""", (uid,))["n"] if uid else 0
+            return self._send(200, {"total": total, "page": page, "size": size,
+                                    "rows": rows, "mine": mine_n})
 
         if path == "/api/exam/history":
             uid = need_uid(g("token"))
@@ -1267,7 +1862,9 @@ class Handler(BaseHTTPRequestHandler):
             uid = auth_uid(g("token"))
             if not uid:
                 return self._send(200, {"ok": False})
-            u = q_one("SELECT id,name,username,anon FROM users WHERE id=?", (uid,))
+            u = q_one("SELECT id,name,username,anon,IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
+            if u:
+                u["role"] = u["role"] or "student"
             return self._send(200, {"ok": True, "user": u})
 
         # ---------- 功能1：错题本统计 ----------
@@ -1277,6 +1874,44 @@ class Handler(BaseHTTPRequestHandler):
             mastered = q_one("""SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0
                                 AND wb_status='cleared'""", (uid,))["n"]
             return self._send(200, {"total": total, "mastered": mastered, "pending": total - mastered})
+
+        # ---------- 错题/收藏逐题翻阅：返回同序 id 列表，供详情页「上一题 / 下一题」 ----------
+        if path == "/api/idseq":
+            uid = need_uid(g("token"))
+            only = g("only") or "wrong"
+            if only == "fav":
+                rows = q_all("""SELECT q.id FROM qdb.questions q
+                                JOIN favorites f ON f.qid=q.qid AND f.user_id=?
+                                ORDER BY q.module,q.category,q.year DESC, q.id LIMIT 2000""", (uid,))
+                return self._send(200, {"ids": [r["id"] for r in rows]})
+            if only in ("today_review", "today_wrong"):
+                # 空池兜底：今天已经练过 / 今天答错的题，允许立刻再过一遍
+                t = today()
+                if only == "today_review":
+                    qids = [r["qid"] for r in q_all(
+                        """SELECT qid, MAX(ts) mt FROM reviews WHERE user_id=? AND date(ts)=?
+                           GROUP BY qid ORDER BY mt DESC LIMIT 200""", (uid, t))]
+                else:
+                    a = q_all("""SELECT DISTINCT pi.qid FROM practice_items pi
+                                 JOIN practice_groups pg ON pg.gid=pi.gid
+                                 WHERE pi.uid=? AND date(pg.started)=?
+                                   AND IFNULL(pi.choice,'')!='' AND pi.correct=0""", (uid, t))
+                    b = q_all("""SELECT DISTINCT qid FROM reviews WHERE user_id=? AND date(ts)=?
+                                 AND (grade<=2 OR timeout=1)""", (uid, t))
+                    qids = list(dict.fromkeys([r["qid"] for r in a] + [r["qid"] for r in b]))[:200]
+                ids = []
+                if qids:
+                    ph = ",".join("?" * len(qids))
+                    mp = {r["qid"]: r["id"] for r in q_all(
+                        f"SELECT id,qid FROM qdb.questions WHERE qid IN ({ph})", qids)}
+                    ids = [mp[q] for q in qids if q in mp]   # 保持「最近先重练」的顺序
+                return self._send(200, {"ids": ids})
+            # 与「错题本」列表同序（browse?only=wrong）
+            rows = q_all("""SELECT q.id FROM qdb.questions q
+                            LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
+                            WHERE s.wrong>0 AND IFNULL(s.wb_status,'active')='active'
+                            ORDER BY q.module,q.category,q.year DESC, q.id LIMIT 2000""", (uid,))
+            return self._send(200, {"ids": [r["id"] for r in rows]})
 
         # ---------- 功能4：题干关键词搜题 ----------
         if path == "/api/search":
@@ -1374,7 +2009,8 @@ class Handler(BaseHTTPRequestHandler):
         if not st:
             return None
         before = st["interval"]
-        new = sm2.grade_state(st, grade)
+        pacing = get_user_setting(uid, "review_pacing", "std") or "std"
+        new = sm2.grade_state(st, grade, pacing)
         correct = 1 if grade >= 3 else 0
         wrong_now = (st["wrong"] or 0) + (0 if correct else 1)
         streak = st["wb_streak"] or 0
@@ -1397,6 +2033,82 @@ class Handler(BaseHTTPRequestHandler):
                         VALUES(?,?,?,?,?,?,?,?)""",
                      (eqid, uid, grade, now(), before, new["interval"], new["ease"], 1 if timeout else 0))
         return new
+
+    # ---------- 今日回溯：练习分组 / 逐题对答案状态 ----------
+    def api_practice_start(self, p):
+        """开始一组练习：先落组与题目骨架，未作答的题也能在回溯里显示为「未答」。"""
+        uid = need_uid(p.get("token"))
+        qids = [str(x).strip() for x in (p.get("qids") or []) if str(x).strip()][:300]
+        if not qids:
+            return self._send(400, {"error": "这一组没有题目"})
+        gid = "g" + secrets.token_hex(8)
+        mode = (p.get("mode") or "mix").strip()[:20]
+        am = "deferred" if (p.get("answer_mode") == "deferred") else "instant"
+        title = (p.get("title") or "").strip()[:40]
+        scope = (p.get("scope") or "").strip()[:80]
+        with _LOCK:
+            db().execute("""INSERT INTO practice_groups(gid,uid,mode,answer_mode,title,scope,size,started,state)
+                            VALUES(?,?,?,?,?,?,?,?,'open')""",
+                         (gid, uid, mode, am, title, scope, len(qids), now()))
+            for i, q in enumerate(qids, 1):
+                db().execute("INSERT OR IGNORE INTO practice_items(gid,uid,qid,pos) VALUES(?,?,?,?)",
+                             (gid, uid, q, i))
+            db().commit()
+        return self._send(200, {"ok": True, "gid": gid})
+
+    def api_practice_mark(self, p):
+        """写入某组若干题的作答状态。choice 非空时以后端算的客观正误为准。"""
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()
+        gp = q_one("SELECT gid FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+        if not gp:
+            return self._send(404, {"error": "没有这组练习记录"})
+        items = p.get("items") or []
+        ts = now()
+        with _LOCK:
+            for it in items[:400]:
+                qid = str(it.get("qid") or "").strip()
+                if not qid:
+                    continue
+                row = q_one("SELECT answer FROM qdb.questions WHERE qid=?", (qid,))
+                if not row:
+                    continue
+                ans = (row["answer"] or "").strip()
+                choice = (it.get("choice") or "").strip()[:8]
+                timeout = 1 if it.get("timeout") else 0
+                if choice:
+                    correct = 1 if choice.upper() == ans.upper() else 0
+                else:                       # 复习自评 / 超时：没有选项，用前端给的判定
+                    correct = 1 if it.get("correct") else 0
+                ms = max(0, min(6 * 3600 * 1000, _int(it.get("ms"), 0)))
+                pos = _int(it.get("pos"), 0)
+                db().execute("""INSERT INTO practice_items(gid,uid,qid,pos,choice,answer,correct,timeout,ms,graded_at)
+                                VALUES(?,?,?,?,?,?,?,?,?,?)
+                                ON CONFLICT(gid,qid) DO UPDATE SET
+                                  choice=excluded.choice, answer=excluded.answer,
+                                  correct=excluded.correct, timeout=excluded.timeout,
+                                  ms=excluded.ms, graded_at=excluded.graded_at,
+                                  pos=CASE WHEN excluded.pos>0 THEN excluded.pos ELSE practice_items.pos END""",
+                             (gid, uid, qid, pos, choice, ans, correct, timeout, ms, ts))
+            if p.get("finish"):
+                db().execute("""UPDATE practice_groups SET state='done', ended=?, total_ms=?
+                                WHERE gid=? AND uid=?""",
+                             (ts, max(0, _int(p.get("total_ms"), 0)), gid, uid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_practice_end(self, p):
+        """结束本组：记下结束时间与总用时（中途离开的组保持 open，回溯里显示「进行中」）。"""
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()
+        with _LOCK:
+            n = db().execute("""UPDATE practice_groups SET state='done', ended=?, total_ms=?
+                                WHERE gid=? AND uid=?""",
+                             (now(), max(0, _int(p.get("total_ms"), 0)), gid, uid)).rowcount
+            db().commit()
+        if not n:
+            return self._send(404, {"error": "没有这组练习记录"})
+        return self._send(200, {"ok": True})
 
     def api_grade(self, p):
         try:
@@ -1449,11 +2161,34 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "on": on})
 
     def api_goal(self, p):
-        v = max(1, min(500, int(p.get("value", 20) or 20)))
+        uid = need_uid(p.get("token"))
+        v = max(1, min(500, int(p.get("value", 120) or 120)))
         with _LOCK:
-            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('daily_goal',?)", (str(v),))
+            set_user_setting(uid, "daily_goal", v)
             db().commit()
         return self._send(200, {"ok": True, "goal": v})
+
+    def api_pacing(self, p):
+        """复习节奏：tight 紧凑 ×0.7 / std 标准 ×1.0 / loose 舒缓 ×1.6，乘在每次算出的间隔上。"""
+        uid = need_uid(p.get("token"))
+        v = (p.get("value") or "std").strip()
+        if v not in ("tight", "std", "loose"):
+            return self._send(400, {"error": "不支持的节奏"})
+        with _LOCK:
+            set_user_setting(uid, "review_pacing", v)
+            db().commit()
+        return self._send(200, {"ok": True, "pacing": v})
+
+    def api_review_plan(self, p):
+        """复习计划：未来 30 天逐日到期题数 + 区间汇总，让「明天复习多少」看得见。"""
+        uid = need_uid(p.get("token"))
+        rows = q_all("""SELECT due, COUNT(*) n FROM srs WHERE user_id=? AND status!='new'
+                        AND due IS NOT NULL AND due > date('now')
+                        GROUP BY due""", (uid,))
+        today_n = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=date('now')", (uid,))["n"]
+        plan = {r["due"]: r["n"] for r in rows}
+        return self._send(200, {"today": today_n, "plan": plan,
+                                "pacing": get_user_setting(uid, "review_pacing", "std") or "std"})
 
     def api_doubt(self, p):
         eqid = resolve_qid(int(p.get("id", 0)))
@@ -1503,13 +2238,17 @@ class Handler(BaseHTTPRequestHandler):
         """签发新 token 并返回账号公开信息。"""
         tok = new_token()
         try:
+            # 只新增一条会话，不覆盖 users.token 之外的东西：另一台设备的 token 依旧有效
+            db().execute("INSERT OR REPLACE INTO sessions(token,uid,created) VALUES(?,?,?)",
+                         (tok, uid, now()))
             db().execute("UPDATE users SET token=? WHERE id=?", (tok, uid))
             db().commit()
         except Exception:
             db().rollback()
             raise
-        r = q_one("SELECT id,name,username,anon FROM users WHERE id=?", (uid,))
-        return {"ok": True, "token": tok, "user": {"id": r["id"], "name": r["name"], "username": r["username"], "anon": bool(r["anon"])}}
+        r = q_one("SELECT id,name,username,anon,IFNULL(role,'student') role FROM users WHERE id=?", (uid,))
+        return {"ok": True, "token": tok, "user": {"id": r["id"], "name": r["name"], "username": r["username"],
+                                                  "anon": bool(r["anon"]), "role": r["role"] or "student"}}
 
     def api_auth_register(self, p):
         username = (p.get("username") or "").strip()
@@ -1551,14 +2290,19 @@ class Handler(BaseHTTPRequestHandler):
     def api_auth_logout(self, p):
         tok = (p.get("token") or "").strip()
         if tok:
+            uid = auth_uid(tok)          # 先按会话表解析，旧版单 token 也能识别
             with _LOCK:
-                u = q_one("SELECT id,anon FROM users WHERE token=?", (tok,))
+                u = q_one("SELECT id,anon FROM users WHERE id=?", (uid,)) if uid else None
                 if u and u["anon"]:
                     # 游客账号：退出即彻底清除，不留痕迹
                     for t in ("srs", "reviews", "notes", "favorites", "doubt_status", "exam_history"):
                         db().execute(f"DELETE FROM {t} WHERE user_id=?", (u["id"],))
+                    db().execute("DELETE FROM study_time WHERE uid=?", (u["id"],))
+                    db().execute("DELETE FROM sessions WHERE uid=?", (u["id"],))
+                    db().execute("DELETE FROM user_settings WHERE uid=?", (u["id"],))
                     db().execute("DELETE FROM users WHERE id=?", (u["id"],))
                 else:
+                    db().execute("DELETE FROM sessions WHERE token=?", (tok,))
                     db().execute("UPDATE users SET token='' WHERE token=?", (tok,))
                 db().commit()
         return self._send(200, {"ok": True})
@@ -1658,6 +2402,360 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True, "name": name})
 
+    PREFS_KEYS = ("limits", "limitOn", "theme", "fontscale", "focus",
+                  "answerMode", "readw", "sessionSize", "rmouse", "seen")
+
+    def api_prefs(self, p):
+        """保存本机偏好到当前账号。写入为「合并」：seen 取并集（保留最近 800 条），
+        limits 按模块合并，其余字段后写覆盖先写，避免多设备互相清空。"""
+        uid = need_uid(p.get("token"))
+        d = p.get("prefs")
+        if not isinstance(d, dict):
+            return self._send(400, {"ok": False, "error": "prefs 必须是对象"})
+        cur = {}
+        raw = get_user_setting(uid, "prefs")
+        if raw:
+            try:
+                cur = json.loads(raw) or {}
+            except Exception:
+                cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+        merged = dict(cur)
+        for k in self.PREFS_KEYS:
+            if k not in d:
+                continue
+            v = d[k]
+            if k == "seen":
+                if isinstance(v, list):
+                    seq = []
+                    for q in list(cur.get("seen") or []) + [str(x) for x in v]:
+                        if q and q not in seq:
+                            seq.append(q)
+                    merged["seen"] = seq[-800:]
+                continue
+            if k == "limits":
+                if isinstance(v, dict):
+                    lm = dict(cur.get("limits") or {})
+                    for a, b in v.items():
+                        try:
+                            lm[str(a)] = max(1, min(500, int(b)))
+                        except Exception:
+                            pass
+                    merged["limits"] = lm
+                continue
+            merged[k] = v
+        ts = now()
+        with _LOCK:
+            set_user_setting(uid, "prefs", json.dumps(merged, ensure_ascii=False))
+            set_user_setting(uid, "prefs_at", ts)
+            db().commit()
+        return self._send(200, {"ok": True, "updated": ts})
+
+    def api_study_time(self, p):
+        """累计学习时长（毫秒）。前端在答题页 / 解析页按秒累计，每 20 秒或离开页面时上报一次。
+        单次上限 6 小时，避免异常数据把统计冲爆。"""
+        uid = need_uid(p.get("token"))
+        try:
+            ms = int(p.get("ms") or 0)
+        except (TypeError, ValueError):
+            ms = 0
+        ms = max(0, min(ms, 6 * 3600 * 1000))
+        d = today()
+        if ms:
+            with _LOCK:
+                db().execute("INSERT OR IGNORE INTO study_time(uid,day,ms) VALUES(?,?,0)", (uid, d))
+                db().execute("UPDATE study_time SET ms=ms+? WHERE uid=? AND day=?", (ms, uid, d))
+                db().commit()
+        cur = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, d))
+        tot = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
+        return self._send(200, {
+            "ok": True, "added": ms,
+            "today_ms": int((cur or {}).get("ms") or 0),
+            "total_ms": int((tot or {}).get("s") or 0),
+        })
+
+    def api_account_reset(self, p):
+        """清空当前账号的做题信息：答题/复习记录、模考历史、进度与统计全部归零。
+        收藏、笔记、疑点标记属于用户资产，保留不清。"""
+        uid = need_uid(p.get("token"))
+        with _LOCK:
+            n_srs = db().execute("DELETE FROM srs WHERE user_id=?", (uid,)).rowcount
+            n_rev = db().execute("DELETE FROM reviews WHERE user_id=?", (uid,)).rowcount
+            n_exam = db().execute("DELETE FROM exam_history WHERE user_id=?", (uid,)).rowcount
+            db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
+            db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
+            n_time = db().execute("DELETE FROM study_time WHERE uid=?", (uid,)).rowcount
+            # 偏好里还存着「已做题目缓存」，不清掉的话换设备登录又会被拉回来
+            raw = get_user_setting(uid, "prefs")
+            if raw:
+                try:
+                    pf = json.loads(raw) or {}
+                except Exception:
+                    pf = {}
+                if isinstance(pf, dict) and pf.get("seen"):
+                    pf["seen"] = []
+                    set_user_setting(uid, "prefs", json.dumps(pf, ensure_ascii=False))
+                    set_user_setting(uid, "prefs_at", now())
+            db().commit()
+        return self._send(200, {"ok": True, "srs": n_srs, "reviews": n_rev, "exams": n_exam, "study_time": n_time})
+
+    # ---------- 陪伴者（只读督导） ----------
+    def _student_brief(self, uid, full=False):
+        """陪伴者的列表/详情共用的陪读摘要（纯读，不改任何记录）。
+
+        口径与陪读自己的总览面板（/api/stats）保持一致：
+        今日待复习 / 未学新题 / 今日已练习 / 已纳入复习 / 错题本 / 收藏 / 今日学习时长 / 总学习时长。
+        full=True 时额外给「各模块进度」与「掌握度分布」（各模块要扫题库，只在详情页算）。
+        """
+        t = today()
+        learned = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new'", (uid,))["n"]
+        due = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
+        wrong = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0", (uid,))["n"]
+        today_n = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?", (uid, t))["n"]
+        ans = q_one("""SELECT COUNT(*) n, SUM(CASE WHEN grade>=3 THEN 1 ELSE 0 END) ok
+                       FROM reviews WHERE user_id=?""", (uid,)) or {}
+        st_today = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, t))
+        st_all = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
+        last = q_one("SELECT MAX(ts) ts FROM reviews WHERE user_id=?", (uid,))
+        fav = q_one("SELECT COUNT(*) n FROM favorites WHERE user_id=?", (uid,))["n"]
+        total_q = q_total()
+        live = live_get(uid)
+        n = int(ans.get("n") or 0); ok = int(ans.get("ok") or 0)
+        out = {
+            "learned": learned, "due_review": due, "wrong": wrong, "studied_today": today_n,
+            "new": max(0, total_q - learned), "fav": fav, "total": total_q,
+            "answered": n, "accuracy": round(ok * 100.0 / n, 1) if n else 0,
+            "today_ms": int((st_today or {}).get("ms") or 0),
+            "total_ms": int((st_all or {}).get("s") or 0),
+            "last_ts": (last or {}).get("ts") or "",
+            "online": bool(live and live.get("online")),
+            "live": live or {"online": False, "status": "idle"},
+        }
+        if full:
+            out["by_module"] = q_all("""SELECT q.module m, COUNT(*) total,
+                                        SUM(CASE WHEN s.qid IS NOT NULL AND s.status!='new' THEN 1 ELSE 0 END) learned
+                                        FROM qdb.questions q LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
+                                        GROUP BY q.module""", (uid,))
+            out["due_by_module"] = q_all("""SELECT q.module m, COUNT(*) n FROM srs s JOIN qdb.questions q ON q.qid=s.qid
+                                            WHERE s.user_id=? AND s.status!='new' AND s.due<=? GROUP BY q.module""",
+                                         (uid, t))
+            buckets = {"学习中": 0, "初记": 0, "短期": 0, "长期": 0, "稳固": 0}
+            for r in q_all("SELECT interval FROM srs WHERE user_id=? AND status!='new'", (uid,)):
+                buckets[sm2.mastery_bucket(r["interval"])] += 1
+            out["mastery"] = buckets
+        return out
+
+    def _username_err(self, username):
+        if len(username) < 2 or len(username) > 20:
+            return "用户名需 2-20 个字符"
+        if not re.fullmatch(r"[\w一-龥\-]+", username):
+            return "用户名仅支持中文、字母、数字、下划线、连字符"
+        return ""
+
+    def api_live_ping(self, p):
+        """陪读端答题心跳：陪伴者端据此实时看到"正在答哪一题"。只写内存，不落库。"""
+        uid = need_uid(p.get("token"))
+        if user_role(uid) == "teacher":
+            return self._send(403, {"error": "陪伴者账号为只读模式"})
+        d = {"status": "idle"}
+        for k in ("status", "mode", "idx", "total", "answered", "right", "wrong",
+                  "q_ms", "all_ms", "paused", "choice", "submitted", "started_at", "id"):
+            if k in p and not isinstance(p.get(k), (dict, list)):
+                d[k] = p.get(k)
+        # 选项也带过来：陪伴者光看题干无法判断孩子在做什么，必须能看到四个选项
+        # （图形推理的选项本身就是图片，所以带原文 HTML，纯文本只作兜底）
+        opts = p.get("options")
+        if isinstance(opts, list) and opts:
+            d["options"] = []
+            for o in opts[:6]:
+                if not isinstance(o, dict):
+                    continue
+                raw = str(o.get("label") or "")
+                d["options"].append({"key": str(o.get("key") or "")[:2],
+                                     "label": brief_text(raw, 200),
+                                     "html": raw[:600]})
+        qid = str(p.get("qid") or "").strip()
+        if qid:
+            q = q_one("SELECT module, category, stem, material FROM qdb.questions WHERE qid=?", (qid,))
+            if q:
+                d["qid"] = qid
+                d["module"] = q["module"]
+                d["category"] = q["category"]
+                # 纯文本摘要（兜底 / 截断判断）
+                d["stem"] = brief_text(q["stem"], 3000)
+                mat = brief_text(q["material"] or "", 5000)
+                if mat:
+                    d["material"] = mat
+                # 原文 HTML：资料分析的图表/公式都是 <img>，纯文本会全变成「［图］」，
+                # 陪伴者根本看不懂孩子在读什么，所以看板直接按练习页的方式渲染原文
+                sh, mh = q["stem"] or "", q["material"] or ""
+                d["stem_html"] = sh[:12000]
+                if mh:
+                    d["material_html"] = mh[:20000]
+                d["cut"] = len(sh) > 12000 or len(mh) > 20000
+        live_put(uid, d)
+        return self._send(200, {"ok": True})
+
+    def api_teacher_register(self, p):
+        """陪读把自己的督导陪伴者加进来：陪伴者账号不存在就建一个，然后把两人绑定。"""
+        uid = need_uid(p.get("token"))
+        if user_role(uid) == "teacher":
+            return self._send(403, {"error": "陪伴者账号为只读模式"})
+        username = (p.get("username") or "").strip()
+        pw = p.get("password") or ""
+        name = (p.get("name") or username).strip()[:12]
+        err = self._username_err(username)
+        if err:
+            return self._send(400, {"error": err})
+        if len(pw) < 6:
+            return self._send(400, {"error": "密码至少 6 位"})
+        r = q_one("SELECT * FROM users WHERE username=?", (username,))
+        if r:
+            if (r["role"] or "student") != "teacher":
+                return self._send(400, {"error": "该用户名已被其他账号占用，请换一个用户名"})
+            if not r["pw_hash"] or not pw_verify(pw, r["pw_hash"]):
+                return self._send(401, {"error": "该陪伴者账号已存在，密码不正确"})
+            tid, created = r["id"], False
+            if name and name != r["name"]:
+                name = r["name"]
+        else:
+            tid, created = self._new_uid(), True
+            with _LOCK:
+                try:
+                    db().execute("""INSERT INTO users(id,name,username,pw_hash,token,created,anon,role)
+                                    VALUES(?,?,?,?,?,?,0,'teacher')""",
+                                 (tid, name or username, username, pw_hash(pw), "", now()))
+                    db().commit()
+                except Exception:
+                    db().rollback()
+                    raise
+        with _LOCK:
+            db().execute("INSERT OR IGNORE INTO teacher_links(teacher_uid,student_uid,created) VALUES(?,?,?)",
+                         (tid, uid, now()))
+            db().commit()
+        return self._send(200, {"ok": True, "created": created,
+                                "teacher": {"id": tid, "name": name or username, "username": username}})
+
+    def api_teacher_link(self, p):
+        """陪伴者主动加陪读：需要陪读本人的用户名 + 密码（证明由陪读本人同意）。"""
+        tid = need_uid(p.get("token"))
+        if user_role(tid) != "teacher":
+            return self._send(403, {"error": "仅陪伴者账号可操作"})
+        username = (p.get("username") or "").strip()
+        pw = p.get("password") or ""
+        u = q_one("SELECT * FROM users WHERE username=?", (username,))
+        if not u or not u["pw_hash"] or not pw_verify(pw, u["pw_hash"]):
+            return self._send(401, {"error": "陪读账号或密码不正确"})
+        if (u["role"] or "student") == "teacher":
+            return self._send(400, {"error": "这个账号本身是陪伴者，不能再作为陪读添加"})
+        with _LOCK:
+            db().execute("INSERT OR IGNORE INTO teacher_links(teacher_uid,student_uid,created) VALUES(?,?,?)",
+                         (tid, u["id"], now()))
+            db().commit()
+        return self._send(200, {"ok": True, "student": {"id": u["id"], "name": u["name"], "username": u["username"]}})
+
+    def api_teacher_unlink(self, p):
+        tid = need_uid(p.get("token"))
+        if user_role(tid) != "teacher":
+            return self._send(403, {"error": "仅陪伴者账号可操作"})
+        sid = (p.get("uid") or "").strip()
+        with _LOCK:
+            db().execute("DELETE FROM teacher_links WHERE teacher_uid=? AND student_uid=?", (tid, sid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_teacher_detach(self, p):
+        """陪读解除某个陪伴者的查看权限。"""
+        uid = need_uid(p.get("token"))
+        tid = (p.get("teacher_uid") or "").strip()
+        with _LOCK:
+            db().execute("DELETE FROM teacher_links WHERE teacher_uid=? AND student_uid=?", (tid, uid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_teacher_encourage(self, p):
+        tid = need_uid(p.get("token"))
+        if user_role(tid) != "teacher":
+            return self._send(403, {"error": "仅陪伴者账号可发布"})
+        text = (p.get("text") or "").strip()[:300]
+        image = p.get("image") or ""
+        target = (p.get("student_uid") or "*").strip() or "*"
+        if target != "*" and not link_ok(tid, target):
+            return self._send(403, {"error": "没有该陪读的权限"})
+        if not text and not image:
+            return self._send(400, {"error": "写点文字或选一张照片吧"})
+        if image and not image.startswith("data:image/"):
+            return self._send(400, {"error": "图片格式不支持"})
+        if len(image) > 2_400_000:
+            return self._send(400, {"error": "图片过大，请换一张（建议 2MB 以内）"})
+        with _LOCK:
+            cur = db().execute("""INSERT INTO encouragements
+                                  (teacher_uid, student_uid, text, image, ts, parent_id, author_uid, role, read_ts)
+                                  VALUES(?,?,?,?,?,0,?,'teacher','')""",
+                               (tid, target, text, image, now(), tid))
+            db().commit()
+            eid = cur.lastrowid
+        return self._send(200, {"ok": True, "id": eid})
+
+    def api_teacher_encourage_delete(self, p):
+        tid = need_uid(p.get("token"))
+        if user_role(tid) != "teacher":
+            return self._send(403, {"error": "仅陪伴者账号可操作"})
+        eid = _int(p.get("id"), 0)
+        with _LOCK:
+            # 删的是整条线程：根留言和它下面的往来一起消失
+            db().execute("DELETE FROM encouragements WHERE teacher_uid=? AND (id=? OR parent_id=?)",
+                         (tid, eid, eid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_encourage_reply(self, p):
+        """寄语回复：双方共用，按登录身份决定这条消息算谁说的。
+
+        陪伴者回给某位陪读时必须指定 sid（从哪条会话里点的），
+        且这位陪读要么是这条寄语的指定对象，要么已经在这条寄语下回过话。
+        """
+        uid = need_uid(p.get("token"))
+        rid = _int(p.get("id"), 0)
+        text = (p.get("text") or "").strip()[:1000]
+        image = p.get("image") or ""
+        if not text and not image:
+            return self._send(400, {"error": "写点内容或选一张照片再发吧"})
+        if image and not image.startswith("data:image/"):
+            return self._send(400, {"error": "图片格式不支持"})
+        if len(image) > 2_400_000:
+            return self._send(400, {"error": "图片过大，请换一张（建议 2MB 以内）"})
+        root = q_one("""SELECT id, teacher_uid, student_uid, text FROM encouragements
+                        WHERE id=? AND IFNULL(parent_id,0)=0""", (rid,))
+        if not root:
+            return self._send(404, {"error": "这条寄语不存在"})
+        is_t = user_role(uid) == "teacher"
+        if is_t:
+            if root["teacher_uid"] != uid:
+                return self._send(403, {"error": "只能回复自己发布的寄语"})
+            sid = (p.get("sid") or "").strip() or (root["student_uid"] if root["student_uid"] != "*" else "")
+            if not sid or not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的权限"})
+            if root["student_uid"] != sid:
+                joined = q_one("""SELECT 1 n FROM encouragements
+                                  WHERE parent_id=? AND student_uid=? LIMIT 1""", (rid, sid))
+                if not joined:
+                    return self._send(403, {"error": "这位陪读还没在这条寄语下留过言"})
+        else:
+            sid = uid
+            if root["student_uid"] not in ("*", uid) or not link_ok(root["teacher_uid"], uid):
+                return self._send(403, {"error": "没有这条寄语的回复权限"})
+        with _LOCK:
+            cur = db().execute("""INSERT INTO encouragements
+                                  (teacher_uid, student_uid, text, image, ts, parent_id, author_uid, role, read_ts)
+                                  VALUES(?,?,?,?,?,?,?,?,'')""",
+                               (root["teacher_uid"], sid, text, image, now(), rid, uid,
+                                "teacher" if is_t else "student"))
+            db().commit()
+            nid = cur.lastrowid
+        return self._send(200, {"ok": True, "id": nid})
+
     def api_users_delete(self, p):
         """删除当前登录账号及其全部学习数据（需再次输入密码确认）。"""
         uid = need_uid(p.get("token"))
@@ -1667,6 +2765,14 @@ class Handler(BaseHTTPRequestHandler):
         with _LOCK:
             for t in ("srs", "reviews", "notes", "favorites", "doubt_status", "exam_history"):
                 db().execute(f"DELETE FROM {t} WHERE user_id=?", (uid,))
+            db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
+            db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
+            db().execute("DELETE FROM study_time WHERE uid=?", (uid,))
+            db().execute("DELETE FROM user_settings WHERE uid=?", (uid,))
+            db().execute("DELETE FROM sessions WHERE uid=?", (uid,))
+            # 陪伴者关联与陪伴者发布的鼓励：账号没了，关联也不该留着
+            db().execute("DELETE FROM teacher_links WHERE teacher_uid=? OR student_uid=?", (uid, uid))
+            db().execute("DELETE FROM encouragements WHERE teacher_uid=? OR student_uid=?", (uid, uid))
             db().execute("DELETE FROM users WHERE id=?", (uid,))
             db().commit()
         return self._send(200, {"ok": True})

@@ -2,10 +2,12 @@
 
 <img src="docs/logo.webp" alt="考公脑库 Logo" width="140">
 
-# 考公脑库
+# 考公脑库 · re1.0
 
 **把 27,506 道行测真题，变成一台听话的记忆机器。**
 不是题库浏览器，是间隔重复引擎——学过的题，会在你刚好要忘的那一刻回来找你。
+
+> 🙏 **本项目基于开源项目 [jangviktor-web/GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 开发。** 在其 SM-2 间隔重复题库与整套基础设施之上，新增画笔划线、学习计时、边做边对 / 先做后对、陪伴模式等能力。**谨向原作者 [@jangviktor-web](https://github.com/jangviktor-web) 及原项目所有贡献者致以最诚挚的谢意**——没有这份扎实、开放的开源底座，就没有 re1.0。
 
 [![在线体验](https://img.shields.io/badge/🚀_在线体验_·_仅供演示-2EA043?style=for-the-badge)](https://a2de5e308362285fb.app.workbuddy.host/)
 
@@ -14,13 +16,30 @@
 ![存储](https://img.shields.io/badge/存储-SQLite%20单文件-blue)
 ![前端](https://img.shields.io/badge/前端-原生%20JS%20SPA-orange)
 ![许可](https://img.shields.io/badge/许可-仅供个人学习-lightgrey)
-![版本](https://img.shields.io/badge/版本-v1.3.1-2EA043)
+![版本](https://img.shields.io/badge/版本-re1.0-2EA043)
 
 📚 题库与蒸馏方法来自开源项目 [ERRRC/xingcezhenti](https://github.com/ERRRC/xingcezhenti)（515 卷 / 58,890 题行），本项目在其基础上**逐题去重为 27,506 道**，并做结构化深度标注与 SM-2 复习排程
 
-为什么「58,890 → 27,506」？[逐题核查结论看这里](#素材来源与致谢)
+⬆️ **本仓库为 GongkaoNaoku 的增强分支**：[查看 re1.0 新增功能](#re1-features) ｜ 为什么「58,890 → 27,506」？[逐题核查结论看这里](#素材来源与致谢)
 
 </div>
+
+<a id="re1-features"></a>
+## ✨ re1.0 新增功能
+
+> 在 [原项目 GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 的基础上，围绕「做题手感、学习反馈、复习陪伴」做了以下增强：
+
+| 功能 | 说明 |
+| :--- | :--- |
+| 🖌️ **画笔与划线** | 支持多端画笔，可放大图片后自由批注；PC 端支持框选划线——左键框选即可对文字划线，适合标记材料与解析重点 |
+| ⏱️ **学习计时** | 对复习与做题分别计时，自动汇总为「今日学习时长」与「总学习时长」，学习投入一目了然 |
+| ✅ **边做边对 / 先做后对** | 新增两种刷题模式，参考粉笔刷题体验，既可选即时反馈也可选整套完成后再统一核对 |
+| 🤝 **陪伴模式** | 允许他人读取你的学习数据并进行简单对话，把独自刷题变成结伴学习 |
+| 📅 **复习模式优化** | 复习界面新增「已复习天数」显示，坚持天数看得见 |
+| 🩹 **题库与同步修复** | 删改部分题目参考文献不一致之处；修复部分设置在多端无法同步的问题 |
+| 🔧 **其他更新** | 细节体验与稳定性持续改进 |
+
+---
 
 ## ⚠️ 关于演示站
 
@@ -32,7 +51,7 @@
 
 **想要一个属于自己的稳定实例？三步，不用装任何东西：**
 
-1. 复制仓库地址 `https://gitee.com/jangviktor/GongkaoNaoku`；
+1. 复制本仓库地址 `https://github.com/BigDog2712/gongkaonaoku-re1.0`；
 2. 打开 [WorkBuddy](https://www.workbuddy.ai)，新建会话，把地址发给 AI 助手，让它帮你部署成在线应用；
 3. 等几分钟，你会拿到一个**只属于你的在线应用地址**，自己用或分享给同学都行。
 
@@ -40,11 +59,12 @@
 
 ## 更新日志
 
-> 最新：**v1.3.1** — 修复页面停在「加载中…」/ 空白（接口失败异常被吞）、修复健康检查锁库、新增只读运营面板（`/ops`）、修复注册/游客登录偶发 `database is locked`、修复评分后解析看不到、纸感 UI 重做。
-> 完整版本说明见 [CHANGELOG.md](CHANGELOG.md) ｜ [Releases](https://gitee.com/jangviktor/GongkaoNaoku/releases)
+> 最新：**re1.0** — 基于 [GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 的增强分支，新增画笔划线、学习计时、边做边对 / 先做后对、陪伴模式、复习天数显示，并修复题库参考文献与设置同步问题。详见 [re1.0 新增功能](#re1-features)。
+> 原项目版本说明见 [CHANGELOG.md](CHANGELOG.md) ｜ [原项目 Releases](https://github.com/jangviktor-web/GongkaoNaoku/releases)
 
 ## 目录
 
+- [re1.0 新增功能](#re1-features)
 - [更新日志](#更新日志)
 - [关于演示站](#关于演示站)
 - [为什么不是直接刷题](#为什么不是直接刷题)
@@ -79,16 +99,16 @@
 > 🚀 **不想安装？** [先打开线上版体验一下](https://a2de5e308362285fb.app.workbuddy.host/)——注册账号或点「游客模式」，10 秒开刷。觉得好用再回来自建，数据完全本地。
 
 ```bash
-git clone https://gitee.com/jangviktor/GongkaoNaoku.git   # Gitee（国内速度推荐）
-cd GongkaoNaoku
+git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git   # 本仓库（re1.0 增强版）
+cd gongkaonaoku-re1.0
 python3 assemble_db.py   # 合并分卷题库，生成 kaogong.db（约 10 秒）
 python3 server.py        # 启动
 ```
 
-或者
+或者克隆原项目（不含 re1.0 增强功能）：
 
 ```bash
-git clone https://github.com/jangviktor-web/GongkaoNaoku.git   # GitHub
+git clone https://github.com/jangviktor-web/GongkaoNaoku.git   # 原项目
 cd GongkaoNaoku
 python3 assemble_db.py   # 合并分卷题库，生成 kaogong.db（约 10 秒）
 python3 server.py        # 启动
@@ -394,7 +414,7 @@ OPS_TOKEN="改成你自己的至少16位随机串" python3 server.py
 
 对助手说：
 
-> 帮我克隆这个仓库到工作区：`git clone https://gitee.com/jangviktor/GongkaoNaoku.git /workspace/kaogong-webapp`
+> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git /workspace/kaogong-webapp`
 
 也可以把仓库打包成 zip 直接上传（仓库含 200MB 题库数据，克隆/上传需几分钟，耐心等它跑完）。
 
@@ -439,6 +459,8 @@ WorkBuddy 内置浏览器预览，可以先自己刷几题确认一切正常。
 > ⚠️ 题库版权归原作者，部署后的站点**仅限个人与小范围学习交流**，请勿公开传播真题内容。
 
 ### 素材来源与致谢
+
+> 🌟 **重点鸣谢：本仓库 re1.0 完全基于开源项目 [jangviktor-web/GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 开发。** 原项目提供了 SM-2 间隔重复引擎、27,506 道深度标注题库、整套 Web 应用与题库处理工具链，是本一切增强的基石。衷心感谢原作者 [@jangviktor-web](https://github.com/jangviktor-web) 及所有贡献者开源这份优秀的作品。re1.0 仅在其之上做增量改进，原项目的版权与贡献归属原作者所有。
 
 本项目的**题库原题与蒸馏方法**来自开源项目 **[ERRRC/xingcezhenti](https://github.com/ERRRC/xingcezhenti)**（718 ⭐ / 104 fork）——「2016–2026 年中国公务员考试国考＋省考全部行测真题」：**515 套卷 / 58,890 题 / 39,463 张图片**，图片全部本地化（断网也能看），每题标注原始 `qid` 可回溯。该项目中的 `蒸馏方法参考.md`（RIA-TV++ 拆书方法论、字段设计、十二条踩坑经验、prompt 的六个坑、产出评估方法）是本应用每题「审题路径 / 最快解法 / 易错坑 / 拿分口诀 / 母题」等深度标注的**方法来源**。
 
@@ -499,8 +521,8 @@ WorkBuddy 内置浏览器预览，可以先自己刷几题确认一切正常。
 题库收录自公开渠道整理的「考公真题整理」Vault——**506 份试卷、2008–2026 年、31 个省区市 + 国考 + 选调 + 联考**的行测真题，试卷以各考试当年考生回忆版为基础整理。详细构成与完整地区/年份分布见上文 [题库来源明细](#题库来源明细)。
 
 ```bash
-git clone https://gitee.com/jangviktor/GongkaoNaoku.git    # 或 GitHub: https://github.com/jangviktor-web/GongkaoNaoku.git
-cd GongkaoNaoku
+git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git    # 本仓库（re1.0 增强版）
+cd gongkaonaoku-re1.0
 python3 assemble_db.py   # 合并分卷题库 → kaogong.db
 python3 server.py
 ```
@@ -509,6 +531,7 @@ python3 server.py
 
 ## 免责声明
 
+- 本项目为 [jangviktor-web/GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 的增强分支，原项目版权归原作者所有，在此重点致谢；本项目仅做增量改进。
 - 题库原题与蒸馏方法来自 [ERRRC/xingcezhenti](https://github.com/ERRRC/xingcezhenti)，在此致谢；真题版权归原作者与原题库平台所有。
 - 本系统只做「学习 / 练习 / 复习」，不改动原始题库笔记。
 - 真题、选项、材料、配图版权归原作者及原题库平台，**仅供个人学习使用**。
@@ -520,8 +543,8 @@ python3 server.py
 
 **如果这份题库帮你记住了一道曾经做错的题，欢迎点一个 ⭐**
 
-[![RepoStars](https://repostars.dev/api/embed?repo=jangviktor-web%2FGongkaoNaoku&theme=grape)](https://repostars.dev/?repos=jangviktor-web%2FGongkaoNaoku&theme=grape)
+[![RepoStars](https://repostars.dev/api/embed?repo=BigDog2712%2Fgongkaonaoku-re1.0&theme=grape)](https://repostars.dev/?repos=BigDog2712%2Fgongkaonaoku-re1.0&theme=grape)
 
-**考公脑库** · 把每一道做过的题，都变成稳稳记住的题
+**考公脑库 re1.0** · 把每一道做过的题，都变成稳稳记住的题 · 基于 [GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 增强
 
 </div>
