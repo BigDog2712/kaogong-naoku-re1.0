@@ -51,7 +51,7 @@
 
 **想要一个属于自己的稳定实例？三步，不用装任何东西：**
 
-1. 复制本仓库地址 `https://github.com/BigDog2712/gongkaonaoku-re1.0`；
+1. 复制本仓库地址 `https://github.com/BigDog2712/GongkaoNaoku-re1.0`；
 2. 打开 [WorkBuddy](https://www.workbuddy.ai)，新建会话，把地址发给 AI 助手，让它帮你部署成在线应用；
 3. 等几分钟，你会拿到一个**只属于你的在线应用地址**，自己用或分享给同学都行。
 
@@ -99,8 +99,8 @@
 > 🚀 **不想安装？** [先打开线上版体验一下](https://a2de5e308362285fb.app.workbuddy.host/)——注册账号或点「游客模式」，10 秒开刷。觉得好用再回来自建，数据完全本地。
 
 ```bash
-git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git   # 本仓库（re1.0 增强版）
-cd gongkaonaoku-re1.0
+git clone https://github.com/BigDog2712/GongkaoNaoku-re1.0.git   # 本仓库（re1.0 增强版）
+cd GongkaoNaoku-re1.0
 python3 assemble_db.py   # 合并分卷题库，生成 kaogong.db（约 10 秒）
 python3 server.py        # 启动
 ```
@@ -414,7 +414,7 @@ OPS_TOKEN="改成你自己的至少16位随机串" python3 server.py
 
 对助手说：
 
-> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git /workspace/kaogong-webapp`
+> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/GongkaoNaoku-re1.0.git /workspace/kaogong-webapp`
 
 也可以把仓库打包成 zip 直接上传（仓库含 200MB 题库数据，克隆/上传需几分钟，耐心等它跑完）。
 
@@ -521,8 +521,8 @@ WorkBuddy 内置浏览器预览，可以先自己刷几题确认一切正常。
 题库收录自公开渠道整理的「考公真题整理」Vault——**506 份试卷、2008–2026 年、31 个省区市 + 国考 + 选调 + 联考**的行测真题，试卷以各考试当年考生回忆版为基础整理。详细构成与完整地区/年份分布见上文 [题库来源明细](#题库来源明细)。
 
 ```bash
-git clone https://github.com/BigDog2712/gongkaonaoku-re1.0.git    # 本仓库（re1.0 增强版）
-cd gongkaonaoku-re1.0
+git clone https://github.com/BigDog2712/GongkaoNaoku-re1.0.git    # 本仓库（re1.0 增强版）
+cd GongkaoNaoku-re1.0
 python3 assemble_db.py   # 合并分卷题库 → kaogong.db
 python3 server.py
 ```
