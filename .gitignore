@@ -2,6 +2,7 @@
 # v1.5.0 起线上/本地实际数据文件固定为 data/users.db —— 该目录不打包发布，避免覆盖线上真实账号
 users.db
 data/
+dev-data/
 
 # ---------- 数据库备份与运行时快照（分卷 kaogong.db.part-* 入库；克隆后用 assemble_db.py 合并） ----------
 # kaogong.db 是本地合并产物（约 154MB，超过 GitHub 单文件 100MB 上限），不入库

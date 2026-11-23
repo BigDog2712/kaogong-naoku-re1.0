@@ -433,6 +433,9 @@ OPS_TOKEN="改成你自己的至少16位随机串" python3 server.py
 
 WorkBuddy 内置浏览器预览，可以先自己刷几题确认一切正常。
 
+> 本地学习数据保存在 `dev-data/users.db`（`启动考公系统.bat` / `start.sh` 会自动设置 `KAOGONG_USER_DB`），
+> 与线上的 `data/users.db` 分开，本地怎么折腾都不会影响线上账号。
+
 **⑤ 发布为在线应用**
 
 > 把 /workspace/kaogong-webapp 发布为应用，启动命令用 `PORT=$PORT python3 server.py`

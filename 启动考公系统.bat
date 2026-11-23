@@ -2,6 +2,8 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 set "PYTHONUNBUFFERED=1"
+rem 本地开发数据放在 dev-data\（与线上 data\ 隔离，发布时不会被上传覆盖）
+set "KAOGONG_USER_DB=%~dp0dev-data\users.db"
 
 set "PY="
 if exist "D:\Python310\python.exe" set "PY=D:\Python310\python.exe"
