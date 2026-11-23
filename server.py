@@ -17,7 +17,28 @@ MAX_USERS = 3
 
 VAULT_ROOT = os.environ.get("KAOGONG_VAULT") or os.path.abspath(os.path.join(HERE, "..", "kaogongzhentizhengliu-main"))
 DB_PATH = os.path.join(HERE, "kaogong.db")          # 题库（只读，ATTACH 为 qdb）
-USERS_DB_PATH = os.path.join(HERE, "users.db")      # 用户库（主连接：账号/学习记录，首次启动自动生成）
+USERS_DB_PATH = (os.path.abspath(os.environ["KAOGONG_USER_DB"]) if os.environ.get("KAOGONG_USER_DB")
+                 else os.path.join(HERE, "data", "users.db"))   # 用户库放在 data/ 下（不随发布上传，见 _prepare_user_db）
+
+def _prepare_user_db():
+    """用户库与「源码目录」分离，避免发布时把本地开发库传上去覆盖线上真实账号。
+
+    发布打包的是整个项目目录：只要 users.db 躺在根目录，每次上线都会用本地那份覆盖线上，
+    线上新注册的账号与学习记录就全没了（v1.4.0 线上事故的根因）。
+    现在线上数据固定落在 data/users.db —— 该目录不入版本库、打包也不带，
+    首次启动时若只有根目录的旧 users.db，则一次性搬过去（之后线上文件始终保留）。
+    """
+    d = os.path.dirname(USERS_DB_PATH)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    legacy = os.path.join(HERE, "users.db")
+    if os.path.abspath(legacy) == USERS_DB_PATH or os.path.exists(USERS_DB_PATH):
+        return
+    if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+        shutil.copy2(legacy, USERS_DB_PATH)
+        print(f"[db] 用户库已迁移到独立数据文件: {USERS_DB_PATH}")
+
+_prepare_user_db()
 # 图片优先读本目录内的自包含副本（WebP），没有再回退到原题库
 _LOCAL_IMG = os.path.join(HERE, "90-图片")
 IMG_ROOT = _LOCAL_IMG if os.path.isdir(_LOCAL_IMG) else os.path.join(VAULT_ROOT, "90-图片")
