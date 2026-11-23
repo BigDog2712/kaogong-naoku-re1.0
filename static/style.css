@@ -511,11 +511,59 @@ html[data-focus="1"] .nav-reveal{display:none !important}
   border-radius:var(--radius-pill);padding:6px 12px;font-size:13px;font-weight:600;max-width:140px;
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap;transition:.16s var(--ease)}
 .user-chip:hover{border-color:var(--brand);color:var(--brand)}
-.modal-mask{position:fixed;inset:0;background:oklch(20% 0.02 65 / .38);display:flex;align-items:center;
-  justify-content:center;z-index:100;padding:var(--s5)}
-.modal{max-width:440px;width:100%;max-height:90vh;overflow:auto;box-shadow:var(--shadow-lift)}
+/* ===== 弹窗：半透明纸感底图 =====
+   遮罩轻模糊让背后内容退成底图，弹窗本身是半透明纸面 + 背景模糊，
+   既看得见底下的页面（有层次），文字又始终清楚。 */
+.modal-mask{position:fixed;inset:0;background:oklch(20% 0.02 65 / .42);display:flex;align-items:center;
+  justify-content:center;z-index:100;padding:var(--s5);
+  -webkit-backdrop-filter:blur(4px) saturate(.92);backdrop-filter:blur(4px) saturate(.92);
+  animation:mask-fade .22s var(--ease) both}
+html[data-theme="dark"] .modal-mask{background:oklch(8% 0.012 70 / .60)}
+
+.modal{position:relative;width:100%;max-width:520px;max-height:min(88vh,760px);overflow:auto;
+  padding:var(--s6);border:1px solid oklch(100% 0 0 / .58);border-radius:calc(var(--radius) + 6px);
+  background:oklch(99.2% 0.006 88 / .84);
+  -webkit-backdrop-filter:blur(22px) saturate(1.2);backdrop-filter:blur(22px) saturate(1.2);
+  box-shadow:0 1px 2px rgba(28,25,20,.10), 0 30px 70px -24px rgba(28,25,20,.42);
+  animation:modal-rise .34s var(--ease) both}
+html[data-theme="dark"] .modal{border-color:oklch(100% 0 0 / .14);
+  background:oklch(23% 0.012 70 / .86);
+  box-shadow:0 2px 6px rgba(0,0,0,.50), 0 30px 70px -24px rgba(0,0,0,.78)}
+/* 不支持背景模糊时退回接近不透明的纸面，优先保证正文可读 */
+@supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  .modal{background:var(--surface)}
+  html[data-theme="dark"] .modal{background:var(--surface)}
+}
 .modal h2{font-size:1.1875rem}
 .modal input{width:100%}
+
+@keyframes mask-fade{from{opacity:0}to{opacity:1}}
+@keyframes modal-rise{from{opacity:0;transform:translateY(14px) scale(.985)}to{opacity:1;transform:none}}
+
+/* ===== 管理员公告弹窗 ===== */
+.announce-modal{max-width:540px;padding:0;overflow:hidden;display:flex;flex-direction:column}
+.announce-modal::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--brand),var(--accent) 62%,oklch(100% 0 0 / 0))}
+.announce-head{display:flex;gap:var(--s3);align-items:flex-start;padding:var(--s5) var(--s6) var(--s3)}
+.announce-badge{flex:0 0 auto;width:38px;height:38px;border-radius:11px;display:grid;place-items:center;
+  color:var(--brand);
+  background:color-mix(in oklch,var(--brand) 12%,transparent);
+  border:1px solid color-mix(in oklch,var(--brand) 20%,transparent)}
+.announce-badge svg{width:19px;height:19px}
+html[data-theme="dark"] .announce-badge{background:color-mix(in oklch,var(--brand) 20%,transparent);
+  border-color:color-mix(in oklch,var(--brand) 34%,transparent)}
+.announce-kicker{margin:0 0 3px;font-size:11.5px;font-weight:700;letter-spacing:.04em;
+  color:var(--brand)}
+.announce-modal h2{margin:0;font-size:1.125rem;line-height:1.45;letter-spacing:-.01em;
+  overflow-wrap:anywhere}
+.announce-body{flex:1 1 auto;min-height:0;overflow:auto;white-space:pre-wrap;
+  padding:var(--s2) var(--s6) var(--s4);color:var(--ink-2);
+  font-size:.9375rem;line-height:var(--leading);overflow-wrap:anywhere}
+.announce-foot{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);
+  padding:var(--s3) var(--s6);border-top:1px solid var(--rule);
+  background:color-mix(in oklch,var(--paper-2) 52%,transparent)}
+.announce-time{font-size:12px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.modal-mask.is-preview .announce-foot{background:color-mix(in oklch,var(--accent) 10%,transparent)}
 .guest-sep{display:flex;align-items:center;gap:10px;color:var(--ink-3);font-size:12px;margin:var(--s4) 0 var(--s3)}
 .guest-sep::before,.guest-sep::after{content:"";flex:1;height:1px;background:var(--rule)}
 
@@ -1105,6 +1153,10 @@ tr.qrow:hover td{background:var(--surface-2)}
 
 @media(max-width:560px){
   .modal-mask{padding:10px}
+  .announce-head{padding:var(--s4) var(--s4) var(--s2)}
+  .announce-body{padding:0 var(--s4) var(--s3);font-size:.9375rem}
+  .announce-foot{padding:var(--s2) var(--s4);flex-wrap:wrap}
+  .announce-modal h2{font-size:1.0625rem}
   .enc-modal{max-height:94vh;border-radius:var(--radius)}
   .enc-bar{padding:11px 12px}
   .enc-bar b{font-size:.95rem}

@@ -3364,6 +3364,44 @@ async function initUserBackupSettings() {
   } catch (e) { list.textContent = '云端快照加载失败：' + (e.message || e); }
 }
 
+function announceTimeLabel(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function announcementHTML(item) {
+  const stamp = announceTimeLabel(item && item.updated);
+  return `<div class="modal announce-modal" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
+    <div class="announce-head">
+      <span class="announce-badge" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M3 11v2a1 1 0 0 0 1 1h2l4.5 3.5A1 1 0 0 0 12 16.7V6.3a1 1 0 0 0-1.5-.8L6 9H4a1 1 0 0 0-1 1z"/><path d="M16 8.5a4 4 0 0 1 0 7"/><path d="M18.5 6a7 7 0 0 1 0 12"/></svg></span>
+      <div style="flex:1;min-width:0">
+        <p class="announce-kicker">管理员公告</p>
+        <h2 id="announcement-title">${esc((item && item.title) || '公告')}</h2>
+      </div>
+    </div>
+    <div class="announce-body">${esc((item && item.content) || '')}</div>
+    <div class="announce-foot">
+      <span class="announce-time">${stamp ? '发布于 ' + esc(stamp) : ''}</span>
+      <button class="btn ok" id="announcement-ack">知晓</button>
+    </div>
+  </div>`;
+}
+
+function openAnnouncementPreview(title, content) {
+  const mask = document.createElement('div');
+  mask.className = 'modal-mask is-preview';
+  mask.innerHTML = announcementHTML({ title, content, updated: new Date().toISOString() });
+  document.body.appendChild(mask);
+  const btn = mask.querySelector('#announcement-ack');
+  btn.textContent = '关闭预览';
+  btn.onclick = () => mask.remove();
+  mask.addEventListener('click', e => { if (e.target === mask) mask.remove(); });
+}
+
 async function showAnnouncementIfNeeded() {
   if (!ME || sessionStorage.getItem('kg_announcement_open') === '1') return;
   try {
@@ -3372,11 +3410,7 @@ async function showAnnouncementIfNeeded() {
     if (!item || data.seen) return;
     const mask = document.createElement('div');
     mask.className = 'modal-mask';
-    mask.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
-      <h2 id="announcement-title">${esc(item.title)}</h2>
-      <div style="white-space:pre-wrap;max-height:55vh;overflow:auto">${esc(item.content)}</div>
-      <div class="row" style="justify-content:flex-end;margin-top:18px"><button class="btn ok" id="announcement-ack">知晓</button></div>
-    </div>`;
+    mask.innerHTML = announcementHTML(item);
     document.body.appendChild(mask);
     sessionStorage.setItem('kg_announcement_open', '1');
     mask.querySelector('#announcement-ack').onclick = async () => {
@@ -3450,10 +3484,24 @@ async function initAdminSettings() {
     };
     const title = document.getElementById('admin-announcement-title');
     const content = document.getElementById('admin-announcement-content');
+    const counter = document.getElementById('admin-announcement-count');
+    const syncCount = () => {
+      if (!counter || !content) return;
+      const n = (content.value || '').length;
+      counter.textContent = n + ' 字';
+    };
+    if (content && counter) { content.addEventListener('input', syncCount); syncCount(); }
+    const previewBtn = document.getElementById('admin-announcement-preview');
+    if (previewBtn) previewBtn.onclick = () => {
+      const t = (title.value || '').trim();
+      const c = (content.value || '').trim();
+      if (!t && !c) { alert('先写个标题或正文，再预览效果'); return; }
+      openAnnouncementPreview(t || '公告', c || '（正文为空）');
+    };
     document.getElementById('admin-announcement-publish').onclick = async () => {
       try {
         await POST('/api/admin/announcement', { title: title.value, content: content.value });
-        title.value = ''; content.value = ''; toast('公告已发布');
+        title.value = ''; content.value = ''; syncCount(); toast('公告已发布');
       } catch (e) { alert('公告发布失败：' + (e.message || e)); }
     };
   } catch (e) { root.textContent = '管理员数据加载失败：' + (e.message || e); }
@@ -3560,12 +3608,16 @@ async function viewSettings() {
     <div id="admin-users">加载中…</div>
   </div>
   <div class="card" style="max-width:900px;margin-top:16px">
-    <h2 style="margin-top:0">管理员：发布更新公告</h2>
-    <p class="sub">发布后，用户登录时会看到弹窗；点击“知晓”后，同一公告不会再次显示。发布新公告会重新通知所有账号。</p>
+    <h2 style="margin-top:0">📢 管理员：发布更新公告</h2>
+    <p class="sub">发布后，所有账号下次打开或刷新页面时会看到这个弹窗；点「知晓」后同一公告不再打扰，发布新公告会重新通知所有人。</p>
     <div class="grid" style="gap:10px">
       <label class="fld">标题<input id="admin-announcement-title" maxlength="120" placeholder="例如：本次更新内容"></label>
       <label class="fld">公告内容<textarea id="admin-announcement-content" rows="5" maxlength="12000" placeholder="填写更新说明或其他通知"></textarea></label>
-      <div><button class="btn ok" id="admin-announcement-publish">发布公告</button></div>
+      <div class="row" style="gap:10px">
+        <button class="btn ok" id="admin-announcement-publish">发布公告</button>
+        <button class="btn ghost" id="admin-announcement-preview">预览效果</button>
+        <span class="sub" id="admin-announcement-count" style="margin:0 0 0 auto">0 字</span>
+      </div>
     </div>
   </div>
   <div class="card" style="max-width:900px;margin-top:16px">
