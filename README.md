@@ -152,8 +152,8 @@
 不需要安装。确认本机有 Python 3.8 以上版本，然后：
 
 ```bash
-git clone https://github.com/BigDog2712/GongkaoNaoku-re1.0.git
-cd GongkaoNaoku-re1.0
+git clone https://github.com/BigDog2712/kaogong-naoku.git
+cd kaogong-naoku
 python3 assemble_db.py   # 合并分卷题库，生成 kaogong.db，约 10 秒
 python3 server.py        # 启动
 ```
@@ -177,11 +177,74 @@ python3 parse.py
 
 ### 部署成在线版本
 
-想让同学一起用，可以部署成公开网址，不用人人都装 Python。这台线上演示站就是这么来的：[kaogong-naoku-87074.app.workbuddy.host](https://kaogong-naoku-87074.app.workbuddy.host/?sharecode=DAYKONVYCN)。
+本地跑只适合自己用。想让同学、研友一起用，可以部署成公开网址，别人打开浏览器就能刷，不用装 Python，也不用传题库。部署完成后拿到一个形如 `https://xxxx.app.workbuddy.host` 的地址，学习数据存服务端并按账号隔离。
 
-演示站仅供看效果：它跑在共享沙箱上，人多会卡，数据也可能被重置，不要拿它存正式进度。
+这台线上演示站就是这么来的：[kaogong-naoku-87074.app.workbuddy.host](https://kaogong-naoku-87074.app.workbuddy.host/?sharecode=DAYKONVYCN)。它仅供看效果：跑在共享沙箱上，人多会卡，数据也可能被重置，不要拿它存正式进度。
 
-自己部署的话，打开 [WorkBuddy](https://www.workbuddy.ai) 新建会话，把仓库地址发给助手，让它克隆、合并题库、启动、发布。这些步骤的完整还原和踩坑记录见 [docs/部署到WorkBuddy.md](docs/部署到WorkBuddy.md)。
+下面是我实际部署这个项目的完整过程，全程只需要对 WorkBuddy 的 AI 助手说人话。
+
+**① 准备**
+
+打开 [WorkBuddy](https://www.workbuddy.ai)，新建一个会话。沙箱工作区自带 Python 3.11 和 git，不用配环境。
+
+**② 把代码放进工作区**
+
+对助手说：
+
+> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/kaogong-naoku.git /workspace/kaogong-webapp`
+
+也可以把仓库打包成 zip 直接上传。仓库带 340MB 题库和配图，克隆或上传要几分钟，等它跑完。
+
+**③ 合并题库**
+
+> 运行 `python3 assemble_db.py`，把分卷合并成 kaogong.db
+
+大约 10 秒完成。看到「27,506 题」的提示就是成功了。
+
+**④ 本地试运行**
+
+> 运行 `python3 server.py`，然后预览页面
+
+WorkBuddy 有内置浏览器预览，先自己刷几题确认正常。
+
+本地学习数据存在 `dev-data/users.db`（`启动考公系统.bat` 和 `start.sh` 会自动设置 `KAOGONG_USER_DB`），和线上的 `data/users.db` 分开，本地怎么折腾都不影响线上账号。
+
+**⑤ 发布为在线应用**
+
+> 把 /workspace/kaogong-webapp 发布为应用，启动命令用 `PORT=$PORT python3 server.py`
+
+发布时弹一次确认，确认后拿到公开链接。
+
+**⑥ 分享使用**
+
+把链接发给别人。打开是登录页，注册自己的账号，或者点游客模式直接开刷。每个账号的进度、错题本、笔记互相隔离。
+
+**⑦ 日常更新**
+
+代码或题库有更新时，在工作区 `git pull` 拉最新版，再发布一次即可覆盖线上版本，链接不变。
+
+**更新前必须先备份。** 发布工具不一定保护运行时数据目录。即使源码仓库排除了用户库，也要在每次更新前把数据库取回自己电脑：
+
+1. 用管理员账号打开线上应用，进入「设置 → 管理员：全库快照」，点击「立即创建快照」。
+2. 等列表刷新，找到刚生成的快照，点击「下载」。确认文件大小大于 0，移到项目目录之外的安全位置，例如 `D:\kaogong-backups\`。建议再复制一份到独立磁盘或受控云盘。
+3. 记下快照文件名和下载日期。含密码哈希的全库数据库不要提交到 Git，不要上传到公开仓库，也不要放进待发布的源码包。
+4. 确认本机文件存在，再拉代码并发布。发布后用现有账号登录，核对账号数量和学习数据；发现异常立即停止，用管理员页面从已下载的快照恢复。
+
+下载按钮不可用、或本机文件无法确认完整时，不要继续发布。不要用本地 `dev-data/users.db` 替代线上库。
+
+本地自托管的更新方式不同：更新前停服务，用 SQLite backup API 对 `KAOGONG_USER_DB` 指向的实际用户库做一致性备份，确认文件完整后再更新代码。服务端快照只留在运行服务的机器上，不会自动传到你的电脑。
+
+**本地自托管和在线部署怎么选：**
+
+| | 本地自托管 | 在线部署 |
+| :--- | :--- | :--- |
+| 适合 | 自己一个人用 | 想分享给同学一起用 |
+| 安装 | 需要 Python 3.8+ | 零安装，浏览器即用 |
+| 数据位置 | 题库 `kaogong.db`（只读）加用户库 `data/users.db` | 服务端 SQLite，换设备登录不丢 |
+| 访问 | `http://127.0.0.1:8300` | 公网地址，手机也能开 |
+| 备份 | 用 SQLite backup API 备份实际用户库 | 管理员下载全库快照到本机，每次发布前必须完成 |
+
+自 v1.5.0 起，线上默认用 `data/users.db`，本地启动脚本用独立的 `dev-data/users.db`。目录隔离能降低覆盖概率，但不能替代发布前把备份下载到本机这一步。
 
 ## 账号与数据
 
@@ -222,7 +285,7 @@ python3 parse.py
 ## 项目结构
 
 ```
-GongkaoNaoku-re1.0/
+kaogong-naoku/
 ├─ server.py              HTTP 服务、JSON API、图片服务（Python 标准库）
 ├─ sm2.py                 SM-2 间隔重复算法
 ├─ parse.py               题库 Vault → SQLite 导入器，只产出题库
