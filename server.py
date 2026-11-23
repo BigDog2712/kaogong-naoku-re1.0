@@ -35,7 +35,14 @@ def _prepare_user_db():
     if d:
         os.makedirs(d, exist_ok=True)
     legacy = os.path.join(HERE, "users.db")
-    if os.path.abspath(legacy) == USERS_DB_PATH or os.path.exists(USERS_DB_PATH):
+    if os.path.abspath(legacy) == USERS_DB_PATH:
+        return
+    if os.path.exists(USERS_DB_PATH):
+        # 两份并存（历史遗留：data/ 曾被误上传过）：以最近写入的那份为准，
+        # 避免旧快照盖掉正在使用的新库
+        if os.path.exists(legacy) and os.path.getmtime(legacy) > os.path.getmtime(USERS_DB_PATH):
+            shutil.copy2(legacy, USERS_DB_PATH)
+            print(f"[db] 根目录 users.db 更新，已同步到 {USERS_DB_PATH}")
         return
     if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
         shutil.copy2(legacy, USERS_DB_PATH)
