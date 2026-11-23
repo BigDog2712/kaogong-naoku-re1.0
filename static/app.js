@@ -3325,34 +3325,41 @@ async function viewStats() {
 }
 
 async function initUserBackupSettings() {
-  const pathInput = document.getElementById('user-backup-path');
   const list = document.getElementById('user-backup-list');
-  if (!pathInput || !list) return;
+  const tip = document.getElementById('user-backup-tip');
+  if (!list) return;
   const refresh = async () => {
     const data = await API('/api/user-backup/config');
-    pathInput.value = data.path || '';
-    list.dataset.folder = data.folder || '';
-    list.innerHTML = (data.snapshots || []).length ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>个人快照</th><th>时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${data.snapshots.map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><button class="btn ghost sm ub-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm ub-restore" data-name="${esc(s.name)}">恢复到我的账号</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="sub">暂无个人快照</p>';
+    const rows = data.snapshots || [];
+    if (tip) tip.textContent = `保留最近 ${data.keep || 7} 份 · 当前 ${rows.length} 份`;
+    list.innerHTML = rows.length
+      ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照日期</th><th>生成时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows.map(s => `<tr><td><code>${esc(String(s.name).replace(/^account-|\.json$/g, ''))}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><button class="btn ghost sm ub-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm ub-restore" data-name="${esc(s.name)}">恢复</button> <button class="btn danger sm ub-delete" data-name="${esc(s.name)}">删除</button></td></tr>`).join('')}</tbody></table></div>`
+      : '<p class="sub" style="margin:0">暂无云端快照，点「立即保存到云端」生成第一份。</p>';
     list.querySelectorAll('.ub-download').forEach(btn => btn.onclick = () => {
       location.href = '/api/user-backup/download?token=' + encodeURIComponent(tok()) + '&name=' + encodeURIComponent(btn.dataset.name);
     });
     list.querySelectorAll('.ub-restore').forEach(btn => btn.onclick = async () => {
-      if (!confirm(`将 ${btn.dataset.name} 合并恢复到当前账号，不会修改其他账号。继续？`)) return;
-      try { await POST('/api/user-backup/restore', { name: btn.dataset.name }); toast('个人数据已恢复'); }
+      const d = String(btn.dataset.name).replace(/^account-|\.json$/g, '');
+      if (!confirm(`把 ${d} 的云端快照合并回当前账号？\n同一题以较新的记录为准，不会回退更晚的进度。`)) return;
+      try { await POST('/api/user-backup/restore', { name: btn.dataset.name }); toast('已从云端快照恢复'); await refresh(); }
       catch (e) { alert('恢复失败：' + (e.message || e)); }
+    });
+    list.querySelectorAll('.ub-delete').forEach(btn => btn.onclick = async () => {
+      if (!confirm(`永久删除云端快照 ${btn.dataset.name}？删除后不可恢复。`)) return;
+      try { await POST('/api/user-backup/delete', { name: btn.dataset.name }); await refresh(); toast('快照已删除'); }
+      catch (e) { alert('删除失败：' + (e.message || e)); }
     });
   };
   try {
     await refresh();
-    document.getElementById('user-backup-save').onclick = async () => {
-      try { await POST('/api/user-backup/config', { path: pathInput.value }); await refresh(); toast('个人备份目录已保存'); }
-      catch (e) { alert('保存失败：' + (e.message || e)); }
+    document.getElementById('user-backup-now').onclick = async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = '保存中…';
+      try { await POST('/api/user-backup/run', {}); await refresh(); toast('已保存到云端'); }
+      catch (err) { alert('保存失败：' + (err.message || err)); }
+      finally { btn.disabled = false; btn.textContent = '立即保存到云端'; }
     };
-    document.getElementById('user-backup-now').onclick = async () => {
-      try { await POST('/api/user-backup/run', {}); await refresh(); toast('个人数据快照已完成'); }
-      catch (e) { alert('备份失败：' + (e.message || e)); }
-    };
-  } catch (e) { list.textContent = '个人备份加载失败：' + (e.message || e); }
+  } catch (e) { list.textContent = '云端快照加载失败：' + (e.message || e); }
 }
 
 async function showAnnouncementIfNeeded() {
@@ -3401,35 +3408,41 @@ async function initAdminSettings() {
     });
   };
   const refreshBackups = async () => {
-    const d = await API('/api/backup/config');
-    document.getElementById('admin-backup-path').value = d.path || '';
+    const d = await API('/api/admin/backups');
     const box = document.getElementById('admin-backup-list');
-    const fullRows = (d.snapshots || []).map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${esc(s.location || '服务端')}</td><td>${(s.size / 1048576).toFixed(2)} MB</td><td><button class="btn ghost sm bk-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm bk-restore" data-name="${esc(s.name)}">恢复</button> <button class="btn danger sm bk-delete" data-name="${esc(s.name)}">删除</button></td></tr>`).join('');
-    const accountRows = (d.account_snapshots || []).map(s => `<tr><td><code>${esc(s.uid)}</code></td><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><span class="sub">由本人账户管理</span></td></tr>`).join('');
-    box.innerHTML = `<h3>全库快照（最多 7 份）</h3>${fullRows ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照</th><th>时间</th><th>位置</th><th>大小</th><th>操作</th></tr></thead><tbody>${fullRows}</tbody></table></div>` : '<p class="sub">暂无全库快照</p>'}<h3 style="margin-top:18px">按账号独立快照（每账号最多 7 份）</h3>${accountRows ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>账号 ID</th><th>文件</th><th>时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${accountRows}</tbody></table></div>` : '<p class="sub">暂无账号快照</p>'}`;
+    const tip = document.getElementById('admin-backup-tip');
+    const rows = d.snapshots || [];
+    if (tip) tip.textContent = `保留最近 ${d.keep || 7} 份 · 当前 ${rows.length} 份`;
+    const html = rows.map(s => {
+      const t = new Date(s.mtime * 1000).toLocaleString();
+      const badge = s.valid ? `<span class="tag">${esc(s.kind || '快照')}</span>` : '<span class="tag" style="color:var(--bad)">校验失败</span>';
+      return `<tr><td><code>${esc(s.name)}</code></td><td>${t}</td><td>${(s.size / 1048576).toFixed(2)} MB</td><td>${badge}</td><td><button class="btn ghost sm bk-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm bk-restore" data-name="${esc(s.name)}"${s.valid ? '' : ' disabled'}>恢复</button> <button class="btn danger sm bk-delete" data-name="${esc(s.name)}">删除</button></td></tr>`;
+    }).join('');
+    box.innerHTML = rows.length
+      ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照文件</th><th>生成时间</th><th>大小</th><th>类型</th><th>操作</th></tr></thead><tbody>${html}</tbody></table></div>`
+      : '<p class="sub" style="margin:0">暂无全库快照，点「立即创建快照」生成第一份。</p>';
     box.querySelectorAll('.bk-download').forEach(btn => btn.onclick = () => {
       location.href = '/api/backup/download?token=' + encodeURIComponent(tok()) + '&name=' + encodeURIComponent(btn.dataset.name);
     });
     box.querySelectorAll('.bk-restore').forEach(btn => btn.onclick = async () => {
-      if (!confirm(`将用快照 ${btn.dataset.name} 替换当前全库；恢复前系统会自动保存当前库。继续？`)) return;
+      if (!confirm(`将用快照 ${btn.dataset.name} 替换当前全库（所有账号的学习数据）。\n系统会先自动保存当前库作为恢复前保护快照。继续？`)) return;
       try { await POST('/api/backup/restore', { name: btn.dataset.name }); alert('全库恢复完成，建议重新登录。'); location.reload(); }
       catch (e) { alert('恢复失败：' + (e.message || e)); }
     });
     box.querySelectorAll('.bk-delete').forEach(btn => btn.onclick = async () => {
-      if (!confirm(`永久删除快照 ${btn.dataset.name} 的所有副本？此操作不可撤销。`)) return;
+      if (!confirm(`永久删除快照 ${btn.dataset.name}？此操作不可撤销。`)) return;
       try { await POST('/api/backup/delete', { name: btn.dataset.name }); await refreshBackups(); toast('快照已删除'); }
       catch (e) { alert('删除失败：' + (e.message || e)); }
     });
   };
   try {
     await renderUsers(); await refreshBackups();
-    document.getElementById('admin-backup-save').onclick = async () => {
-      try { await POST('/api/backup/config', { path: document.getElementById('admin-backup-path').value }); await refreshBackups(); toast('备份目录已保存'); }
-      catch (e) { alert('保存失败：' + (e.message || e)); }
-    };
-    document.getElementById('admin-backup-now').onclick = async () => {
-      try { await POST('/api/backup/run', {}); await refreshBackups(); toast('全库备份完成'); }
-      catch (e) { alert('备份失败：' + (e.message || e)); }
+    document.getElementById('admin-backup-now').onclick = async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = '创建中…';
+      try { await POST('/api/backup/run', {}); await refreshBackups(); toast('全库快照已创建'); }
+      catch (err) { alert('创建失败：' + (err.message || err)); }
+      finally { btn.disabled = false; btn.textContent = '立即创建快照'; }
     };
     const title = document.getElementById('admin-announcement-title');
     const content = document.getElementById('admin-announcement-content');
@@ -3516,21 +3529,25 @@ async function viewSettings() {
       <span class="sub" id="st-rmouse-tip" style="margin:0"></span>
     </div>
   </div>
-  <div class="card" style="max-width:640px;margin-top:16px">
+  <div class="card" style="max-width:760px;margin-top:16px">
     <h2 style="margin-top:0">💾 备份与恢复</h2>
-    <p class="sub" style="margin:0 0 12px">可导出并恢复当前账号的独立学习数据；管理员全库快照每日 0 点保存，最近 7 份。</p>
-    <div class="row">
-      <label class="fld" style="flex:1;min-width:240px">个人备份目录<input id="user-backup-path" type="text" placeholder="服务端可访问路径"></label>
-      <button class="btn" id="user-backup-save">保存路径</button>
-      <button class="btn ok" id="user-backup-now">立即备份</button>
+    <p class="sub" style="margin:0">学习数据本身就存在账号里，换设备登录即可看到。这里只提供两种额外备份，各管一件事。</p>
+    <h3 style="margin:18px 0 6px">云端快照 · 跟随账号</h3>
+    <p class="sub" style="margin:0 0 10px">服务器每天 0 点自动为你的账号留一份，保留最近 7 份；也可以随时手动保存。只有本账号能看到、下载和恢复。</p>
+    <div class="row" style="gap:12px;align-items:center">
+      <button class="btn ok" id="user-backup-now">立即保存到云端</button>
+      <span class="sub" id="user-backup-tip" style="margin:0"></span>
     </div>
     <div id="user-backup-list" style="margin-top:12px"></div>
-    <div class="row" style="margin-top:12px">
-      <button class="btn ghost" id="st-bk-exp">导出 JSON 到本机</button>
-      <button class="btn ghost" id="st-bk-imp">从 JSON 恢复</button>
+    <hr style="margin:20px 0;border:0;border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 6px">本地文件 · 存到你自己的电脑</h3>
+    <p class="sub" style="margin:0 0 10px">导出成 JSON 文件保存。服务端数据万一出问题，或想搬到别的部署上，都靠这份文件找回。</p>
+    <div class="row">
+      <button class="btn ghost" id="st-bk-exp">导出到本机（.json）</button>
+      <button class="btn ghost" id="st-bk-imp">从本机文件恢复</button>
       <input type="file" id="st-bk-file" accept=".json,application/json" style="display:none">
     </div>
-    <p class="sub" id="st-bk-tip" style="margin:10px 0 0">服务端快照按账号隔离，其他账号无法查看或恢复；JSON 导出只含你本人数据。</p>
+    <p class="sub" id="st-bk-tip" style="margin:10px 0 0">恢复是「合并」：同一题以较新的记录为准，不会用旧备份盖掉更新的进度。</p>
   </div>
   ${(ME && ME.role === 'admin') ? `
   <div class="card" style="max-width:900px;margin-top:16px">
@@ -3548,12 +3565,11 @@ async function viewSettings() {
     </div>
   </div>
   <div class="card" style="max-width:900px;margin-top:16px">
-    <h2 style="margin-top:0">管理员：全库备份与恢复</h2>
-    <p class="sub">每日 0 点在服务端与配置目录分别创建实例专属文件夹，各保留最近 7 份；可手动备份、下载、恢复或删除快照。配置路径指服务进程可访问的文件系统，不是浏览器本机路径。</p>
-    <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
-      <label class="fld" style="flex:1;min-width:280px">全库备份根目录<input id="admin-backup-path" type="text" placeholder="服务运行机器上的路径"></label>
-      <button class="btn" id="admin-backup-save">保存目录</button>
-      <button class="btn ok" id="admin-backup-now">立即备份</button>
+    <h2 style="margin-top:0">管理员：全库快照</h2>
+    <p class="sub" style="margin:0 0 12px">每天 0 点自动为整个服务器数据库（所有账号、学习进度、公告）保存一份快照，存在服务端云端目录，保留最近 7 份。服务在 0 点停机也没关系，启动后会补做当天那份。需要本机副本请用「下载」。</p>
+    <div class="row" style="gap:12px;align-items:center">
+      <button class="btn ok" id="admin-backup-now">立即创建快照</button>
+      <span class="sub" id="admin-backup-tip" style="margin:0"></span>
     </div>
     <div id="admin-backup-list" style="margin-top:12px">加载中…</div>
   </div>` : ''}
