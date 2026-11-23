@@ -12,7 +12,7 @@
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
 ![依赖](https://img.shields.io/badge/第三方依赖-无-brightgreen)
 ![存储](https://img.shields.io/badge/存储-SQLite%20单文件-blue)
-![许可](https://img.shields.io/badge/许可-Apache--2.0-lightgrey)
+![代码许可](https://img.shields.io/badge/代码许可-Apache--2.0-lightgrey)
 
 </div>
 
@@ -177,9 +177,9 @@ python3 parse.py
 
 ### 部署成在线版本
 
-本地跑只适合自己用。想让同学、研友一起用，可以部署成公开网址，别人打开浏览器就能刷，不用装 Python，也不用传题库。部署完成后拿到一个形如 `https://xxxx.app.workbuddy.host` 的地址，学习数据存服务端并按账号隔离。
+本地跑只适合自己用。如果确实需要多人共用一套题库和复习进度，可以部署成在线版本：别人用浏览器打开就能刷，不用装 Python，也不用传题库。学习数据存在服务端，按账号隔离。
 
-这台线上演示站就是这么来的：[kaogong-naoku-87074.app.workbuddy.host](https://kaogong-naoku-87074.app.workbuddy.host/?sharecode=DAYKONVYCN)。它仅供看效果：跑在共享沙箱上，人多会卡，数据也可能被重置，不要拿它存正式进度。
+这台线上演示站就是这么来的：[kaogong-naoku-87074.app.workbuddy.host](https://kaogong-naoku-87074.app.workbuddy.host/?sharecode=DAYKONVYCN)。它只用于看界面效果，**数据不做保证**：跑在共享沙箱上，人多会卡，扩容或迁移时可能被重置，**不要在这里存唯一的复习进度**，重要数据定期从「设置 → 数据管理」导出快照。地址也不建议往公开群组里转，真题内容不适合公开扩散。
 
 下面是我实际部署这个项目的完整过程，全程只需要对 WorkBuddy 的 AI 助手说人话。
 
@@ -341,9 +341,13 @@ kaogong-naoku/
 
 ## 许可
 
-代码采用 [Apache License 2.0](LICENSE)。
+这个仓库装了两类东西，许可不一样，用之前先分清自己用的是哪一类。
 
-真题、选项、材料和配图版权归原作者及原题库平台所有，解析由程序批量抽取，个别题（尤其纯图形选项）以原库为准，发现疑点会在题内「疑点待复核」区提示。部署后的站点仅限个人和小范围学习交流，请勿公开传播真题内容。
+**代码：Apache License 2.0。** 覆盖全部源代码（`*.py`、`static/*`、`*.bat`、`*.sh`）和文档。上游 [jangviktor-web/GongkaoNaoku](https://github.com/jangviktor-web/GongkaoNaoku) 同样以 Apache-2.0 授权，我在它基础上的修改也以 Apache-2.0 提供。允许商用、允许闭源分发、允许改名，前提只有两条：再分发时带上 [LICENSE](LICENSE) 全文，改动过的文件保留文件头那句修改声明。
+
+**题库与配图：不在 Apache-2.0 范围内。** `kaogong.db.part-*` 和 `90-图片/` 里的题干、选项、材料、答案、解析和图形，版权归原作者及原题库平台所有，我没有权利再许可。自己读、自己做题、自己部署使用都可以；要把这些内容再分发、商用或对外提供，需要你自己去取得权利人许可。完整划分写在 [NOTICE](NOTICE)。
+
+解析由程序批量抽取，个别题（尤其纯图形选项）以原库为准，发现疑点会在题内「疑点待复核」区提示。
 
 ---
 
