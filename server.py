@@ -61,71 +61,165 @@ def _prepare_user_db():
 
 _prepare_user_db()
 
-# ---------- 用户库自动快照：防止再次被「整目录发布」覆盖 ----------
-# 与 data/users.db 同目录的 backups/ 下，按需留最近 20 份；该目录同样不随发布上传，
-# 所以即使线上库被覆盖，也能从快照里找回上一份。
+# ---------- SQLite 快照 ----------
 BACKUP_DIR = os.path.join(os.path.dirname(USERS_DB_PATH), "backups")
-BACKUP_KEEP = 20
+BACKUP_KEEP = 7
+_BACKUP_LOCK = threading.RLock()
 
-def _snapshot_user_db(force=False, tag=""):
-    """给当前用户库做一致性快照（sqlite backup API，不怕并发写）。
-    仅当库内容有变化时才新增，避免每次重启都堆一份一样的文件。"""
-    try:
-        if not os.path.exists(USERS_DB_PATH) or os.path.getsize(USERS_DB_PATH) == 0:
-            return None
-        os.makedirs(BACKUP_DIR, exist_ok=True)
-        snaps = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("users-") and f.endswith(".db"))
-        if snaps and not force:
-            latest = os.path.join(BACKUP_DIR, snaps[-1])
-            if (os.path.getsize(latest) == os.path.getsize(USERS_DB_PATH)
-                    and os.path.getmtime(USERS_DB_PATH) <= os.path.getmtime(latest)):
-                return None
-        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        name = "users-%s%s.db" % (stamp, tag)
-        dst = os.path.join(BACKUP_DIR, name)
-        src = sqlite3.connect(USERS_DB_PATH, timeout=10)
+
+def _backup_instance_dir(root):
+    identity = hashlib.sha256(os.path.realpath(USERS_DB_PATH).encode("utf-8")).hexdigest()[:12]
+    return os.path.join(root, "kaogong-" + identity)
+
+
+def _prune_snapshots(folder):
+    files = sorted((os.path.join(folder, f) for f in os.listdir(folder)
+                    if f.startswith("users-") and f.endswith(".db") and os.path.isfile(os.path.join(folder, f))),
+                   key=os.path.getmtime, reverse=True)
+    for old in files[BACKUP_KEEP:]:
         try:
-            out = sqlite3.connect(dst)
-            with out:
-                src.backup(out)
-            out.close()
-        finally:
-            src.close()
-        snaps = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("users-") and f.endswith(".db"))
-        for old in snaps[:-BACKUP_KEEP]:
+            os.remove(old)
+        except OSError as e:
+            print("[backup] 清理旧快照失败:", e)
+
+def _snapshot_user_db(force=False, tag="", roots=None):
+    """对当前 SQLite 用户库做一致性快照；每个实例目录独立保留最近 7 份。"""
+    if not os.path.exists(USERS_DB_PATH) or os.path.getsize(USERS_DB_PATH) == 0:
+        return None
+    roots = roots or [BACKUP_DIR]
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    name = "users-%s-%s%s.db" % (stamp, secrets.token_hex(3), tag)
+    created = []
+    try:
+        with _BACKUP_LOCK:
+            source = sqlite3.connect(USERS_DB_PATH, timeout=30)
             try:
-                os.remove(os.path.join(BACKUP_DIR, old))
-            except Exception:
-                pass
-        print(f"[backup] 用户库快照: {dst}")
-        local_path = get_setting("backup_local_path", "")
-        if local_path:
-            try:
-                os.makedirs(local_path, exist_ok=True)
-                local_dst = os.path.join(local_path, name)
-                local_db = sqlite3.connect(local_dst)
-                try:
-                    check_src = sqlite3.connect(dst, timeout=10)
-                    with local_db:
-                        check_src.backup(local_db)
-                    check_src.close()
-                finally:
-                    local_db.close()
-                print(f"[backup] 本地路径副本: {local_dst}")
-            except Exception as e:
-                print("[backup] 本地路径副本失败:", e)
-        return dst
+                for root in dict.fromkeys(os.path.abspath(os.path.expanduser(r)) for r in roots if r):
+                    folder = _backup_instance_dir(root)
+                    os.makedirs(folder, exist_ok=True)
+                    dst = os.path.join(folder, name)
+                    target = sqlite3.connect(dst, timeout=30)
+                    try:
+                        source.backup(target)
+                        target.commit()
+                    finally:
+                        target.close()
+                    check = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(dst)), uri=True)
+                    try:
+                        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                            raise RuntimeError("快照完整性校验失败: " + dst)
+                    finally:
+                        check.close()
+                    created.append(dst)
+                    if tag not in ("-prerestore", "-prebaseline"):
+                        _prune_snapshots(folder)
+            finally:
+                source.close()
+        for dst in created:
+            print("[backup] 用户库快照:", dst)
+        return created[0] if created else None
     except Exception as e:
         print("[backup] 快照失败:", e)
         return None
 
-def _backup_loop():
-    """每 30 分钟检查一次，有变化就留一份快照（进程内后台线程）。"""
-    while True:
-        time.sleep(1800)
-        _snapshot_user_db()
 
-_snapshot_user_db()   # 启动即留一份
+def _scheduled_snapshot():
+    ctx = borrow()
+    try:
+        roots = [BACKUP_DIR]
+        admin_path = get_setting("backup_local_path", "")
+        if admin_path:
+            roots.append(admin_path)
+        full = _snapshot_user_db(force=True, roots=roots)
+        if not full:
+            return {"full": None, "accounts": 0, "error": "全库快照失败；已跳过关联个人快照"}
+        account_ids = [row[0] for row in db().execute("SELECT id FROM users ORDER BY id")]
+        personal = sum(1 for uid in account_ids if _snapshot_one_account(uid, roots, snapshot_date=datetime.date.today().strftime("%Y%m%d")))
+        for uid in account_ids:
+            personal_path = get_user_setting(uid, "personal_backup_path", "")
+            if personal_path:
+                _snapshot_one_account(uid, [personal_path], snapshot_date=datetime.date.today().strftime("%Y%m%d"))
+        return {"full": full, "accounts": personal}
+    finally:
+        unborrow()
+
+
+def _snapshot_one_account(uid, roots, snapshot_date=None):
+    safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80]
+    connection = sqlite3.connect(USERS_DB_PATH, timeout=30)
+    connection.row_factory = sqlite3.Row
+    specs = {
+        "srs": "SELECT qid,status,ease,interval,repetitions,lapses,due,last_review,correct,wrong,wb_status,wb_streak,last_choice FROM srs WHERE user_id=?",
+        "reviews": "SELECT qid,grade,ts,interval_before,interval_after,ease,timeout FROM reviews WHERE user_id=?",
+        "notes": "SELECT qid,text,updated FROM notes WHERE user_id=?",
+        "favorites": "SELECT qid,added FROM favorites WHERE user_id=?",
+        "doubt": "SELECT qid,status,note,updated FROM doubt_status WHERE user_id=?",
+        "discarded": "SELECT qid,ts FROM discarded WHERE uid=?",
+        "exam": "SELECT title,total,correct,score,duration,ts FROM exam_history WHERE user_id=?",
+        "study_time": "SELECT day,ms FROM study_time WHERE uid=?",
+    }
+    try:
+        connection.execute("BEGIN")
+        data = {"format": "kaogong-backup-v1", "exported": now(), "user": {"id": uid}, "errors": []}
+        for key, sql in specs.items():
+            try:
+                data[key] = [dict(row) for row in connection.execute(sql, (uid,)).fetchall()]
+            except sqlite3.OperationalError:
+                data[key] = []
+        data["counts"] = {key: len(data.get(key, [])) for key in specs}
+    finally:
+        connection.close()
+    written = []
+    date_name = "account-%s.json" % (snapshot_date or datetime.datetime.now().strftime("%Y%m%d"))
+    for root in roots:
+        folder = os.path.join(_backup_instance_dir(root), "accounts", safe_uid)
+        os.makedirs(folder, exist_ok=True)
+        target = os.path.join(folder, date_name)
+        tmp = target + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp, target)
+        files = sorted((os.path.join(folder, f) for f in os.listdir(folder)
+                        if f.startswith("account-") and f.endswith(".json")),
+                       key=os.path.getmtime, reverse=True)
+        for old in files[BACKUP_KEEP:]:
+            os.remove(old)
+        written.append(target)
+    return written[0] if written else None
+
+
+def _snapshot_accounts_json(roots):
+    """Store uid-scoped personal learning exports separately for selective recovery."""
+    conn = sqlite3.connect(USERS_DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.execute("BEGIN")
+        users = [row[0] for row in conn.execute("SELECT id FROM users ORDER BY id")]
+    finally:
+        conn.close()
+    today_key = datetime.date.today().strftime("%Y%m%d")
+    for uid in users:
+        _snapshot_one_account(uid, roots, snapshot_date=today_key)
+    return len(users)
+
+
+
+
+def _backup_loop():
+    """跨过本地日期边界时创建每日快照；失败时每 15 秒重试至成功。"""
+    last_snapshot_date = datetime.date.today()
+    while True:
+        time.sleep(15)
+        current_date = datetime.date.today()
+        if current_date > last_snapshot_date:
+            try:
+                result = _scheduled_snapshot()
+                if result.get("full"):
+                    last_snapshot_date = current_date
+                else:
+                    print("[backup] 每日快照未完成，将继续重试:", result.get("error", "未知错误"))
+            except Exception as e:
+                print("[backup] 每日快照异常:", e)
 
 # 图片优先读本目录内的自包含副本（WebP），没有再回退到原题库
 _LOCAL_IMG = os.path.join(HERE, "90-图片")
@@ -843,32 +937,80 @@ def _backup_config():
     return {"path": os.path.abspath(os.path.expanduser(raw)) if raw else ""}
 
 
+APP_RELEASE_VERSION = app_ver()
+APP_RELEASE_NOTES = "备份与恢复优化：全库和个人学习数据每日自动快照，常规快照各保留最近 7 份；管理员可配置全库备份目录、下载、恢复和删除快照；新增管理员公告，用户确认状态按账号独立保存。"
+
+
+def ensure_release_announcement():
+    """代码版本变化时发布一次更新公告；用户已读状态按公告 ID 和 uid 独立保存。"""
+    if get_setting("announcement_app_version") == APP_RELEASE_VERSION:
+        return
+    announcement = {"id": "release-" + APP_RELEASE_VERSION + "-" + secrets.token_hex(4),
+                    "title": "应用更新：" + APP_RELEASE_VERSION,
+                    "content": APP_RELEASE_NOTES, "updated": now()}
+    set_setting("announcement_current", json.dumps(announcement, ensure_ascii=False))
+    set_setting("announcement_app_version", APP_RELEASE_VERSION)
+    db().commit()
+    print("[announcement] 已发布版本更新公告:", APP_RELEASE_VERSION)
+
+
 def _list_user_snapshots():
     files = []
-    dirs = [BACKUP_DIR]
+    roots = [(BACKUP_DIR, "server")]
     local = _backup_config().get("path")
-    if local and os.path.isdir(local):
-        dirs.append(local)
-    seen = set()
-    for folder in dirs:
+    if local:
+        roots.append((local, "configured"))
+    for root, location in roots:
+        folder = _backup_instance_dir(root)
         try:
             for name in os.listdir(folder):
                 full = os.path.join(folder, name)
                 if name.startswith("users-") and name.endswith(".db") and os.path.isfile(full):
-                    mtime = os.path.getmtime(full)
-                    location = "local" if folder == local else "server"
-                    if name in seen:
-                        for item in files:
-                            if item["name"] == name and location == "local":
-                                item["location"] = "server + local"
-                                break
-                        continue
-                    seen.add(name)
-                    files.append({"name": name, "size": os.path.getsize(full), "mtime": mtime,
-                                  "location": location})
+                    check = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(full)), uri=True)
+                    try:
+                        if check.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                            continue
+                    finally:
+                        check.close()
+                    files.append({"name": name, "size": os.path.getsize(full),
+                                  "mtime": os.path.getmtime(full), "location": location,
+                                  "folder": folder})
         except OSError:
             continue
-    return sorted(files, key=lambda x: x["mtime"], reverse=True)
+    merged = {}
+    for item in files:
+        entry = merged.setdefault(item["name"], dict(item))
+        if entry["location"] != item["location"]:
+            entry["location"] = "server + configured path"
+    return sorted(merged.values(), key=lambda x: x["mtime"], reverse=True)
+
+
+def _list_account_snapshots():
+    results = []
+    roots = [BACKUP_DIR]
+    configured = _backup_config().get("path")
+    if configured:
+        roots.append(configured)
+    for root in roots:
+        folder = os.path.join(_backup_instance_dir(root), "accounts")
+        try:
+            for uid in os.listdir(folder):
+                account_dir = os.path.join(folder, uid)
+                if not os.path.isdir(account_dir):
+                    continue
+                for name in os.listdir(account_dir):
+                    path = os.path.join(account_dir, name)
+                    if name.startswith("account-") and name.endswith(".json") and re.fullmatch(r"account-\d{8}\.json", name) and os.path.isfile(path):
+                        results.append({"uid": uid, "name": name, "size": os.path.getsize(path),
+                                        "mtime": os.path.getmtime(path), "location": root})
+        except OSError:
+            continue
+    dedup = {}
+    for item in results:
+        key = (item["uid"], item["name"])
+        if key not in dedup or item["mtime"] > dedup[key]["mtime"]:
+            dedup[key] = item
+    return sorted(dedup.values(), key=lambda x: x["mtime"], reverse=True)
 
 
 def set_setting(key, value):
@@ -1473,6 +1615,13 @@ class Handler(BaseHTTPRequestHandler):
             "/api/backup/config": self.api_backup_config,
             "/api/backup/run": self.api_backup_run,
             "/api/backup/restore": self.api_backup_restore,
+            "/api/backup/delete": self.api_backup_delete,
+            "/api/user-backup/config": self.api_user_backup_config,
+            "/api/user-backup/run": self.api_user_backup_run,
+            "/api/user-backup/restore": self.api_user_backup_restore,
+            "/api/announcement": self.api_announcement,
+            "/api/announcement/read": self.api_announcement_read,
+            "/api/admin/announcement": self.api_admin_announcement,
         }
         fn = routes.get(path)
         if fn:
@@ -1563,6 +1712,10 @@ class Handler(BaseHTTPRequestHandler):
         # 完整数据备份（导出）
         if path == "/api/export/mydata":
             return self.api_export_mydata({"token": g("token")})
+        if path == "/api/announcement":
+            return self.api_announcement({"token": g("token")})
+        if path == "/api/user-backup/config":
+            return self.api_user_backup_config({"token": g("token")})
         if path == "/api/bootstrap":
             mods = q_all("SELECT module, COUNT(*) n FROM qdb.questions GROUP BY module ORDER BY n DESC")
             cats = q_all("SELECT module, category, COUNT(*) n FROM qdb.questions GROUP BY module,category ORDER BY n DESC")
@@ -2252,17 +2405,35 @@ class Handler(BaseHTTPRequestHandler):
             need_admin(g("token"))
             cfg = _backup_config()
             return self._send(200, {"ok": True, "path": cfg.get("path", ""),
-                                    "snapshots": _list_user_snapshots()})
+                                    "folder": _backup_instance_dir(cfg.get("path")) if cfg.get("path") else "",
+                                    "snapshots": _list_user_snapshots(),
+                                    "account_snapshots": _list_account_snapshots()})
+
+        if path == "/api/user-backup/download":
+            uid = need_uid(g("token"))
+            name = str(g("name") or "")
+            if not re.fullmatch(r"account-\d{8}\.json", name):
+                return self._send(400, {"error": "快照名称无效"})
+            safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80]
+            roots = [BACKUP_DIR]
+            personal_root = get_user_setting(uid, "personal_backup_path", "") or ""
+            if personal_root:
+                roots.append(personal_root)
+            source = next((os.path.join(_backup_instance_dir(root), "accounts", safe_uid, name)
+                           for root in roots if os.path.isfile(os.path.join(_backup_instance_dir(root), "accounts", safe_uid, name))), None)
+            if not source:
+                return self._send(404, {"error": "找不到本账号快照"})
+            return self._download_file(source, name)
 
         if path == "/api/backup/download":
             need_admin(g("token"))
             name = str(g("name") or "")
             if not name or os.path.basename(name) != name:
                 return self._send(400, {"error": "快照名称无效"})
-            folders = [BACKUP_DIR]
+            folders = [_backup_instance_dir(BACKUP_DIR), BACKUP_DIR]
             local = _backup_config().get("path")
             if local:
-                folders.append(local)
+                folders.extend([_backup_instance_dir(local), local])
             source = next((os.path.join(folder, name) for folder in folders
                            if os.path.isfile(os.path.join(folder, name))), None)
             if not source:
@@ -3029,7 +3200,7 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True})
 
     def api_backup_config(self, p):
-        need_admin(p.get("token"))
+        admin_uid = need_admin(p.get("token"))
         path = str(p.get("path") or "").strip()
         if path:
             path = os.path.abspath(os.path.expanduser(path))
@@ -3037,8 +3208,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == data_dir or path.startswith(data_dir + os.sep):
                 return self._send(400, {"error": "备份目录不能位于用户库目录内"})
             try:
-                os.makedirs(path, exist_ok=True)
-                probe = os.path.join(path, ".kaogong-write-test")
+                folder = _backup_instance_dir(path)
+                os.makedirs(folder, exist_ok=True)
+                probe = os.path.join(folder, ".kaogong-write-test")
                 with open(probe, "wb") as f:
                     f.write(b"ok")
                 os.remove(probe)
@@ -3048,24 +3220,185 @@ class Handler(BaseHTTPRequestHandler):
             set_setting("backup_local_path", path)
             db().commit()
         if path:
-            _snapshot_user_db(force=True, tag="-local")
-        return self._send(200, {"ok": True, "path": path})
+            roots = [BACKUP_DIR, path]
+            snap = _snapshot_user_db(force=True, tag="-manual", roots=roots)
+            accounts = _snapshot_accounts_json(roots) if snap else 0
+            if accounts:
+                for row in db().execute("SELECT id FROM users").fetchall():
+                    personal_path = get_user_setting(row[0], "personal_backup_path", "")
+                    if personal_path:
+                        _snapshot_one_account(row[0], [personal_path])
+            if not snap:
+                return self._send(500, {"error": "备份目录已保存，但立即快照失败"})
+        else:
+            accounts = 0
+        return self._send(200, {"ok": True, "path": path, "account_snapshots": accounts,
+                                "folder": _backup_instance_dir(path) if path else ""})
 
     def api_backup_run(self, p):
         need_admin(p.get("token"))
-        snap = _snapshot_user_db(force=True)
+        ctx = borrow()
+        try:
+            roots = [BACKUP_DIR]
+            configured = _backup_config().get("path")
+            if configured:
+                roots.append(configured)
+            snap = _snapshot_user_db(force=True, tag="-manual", roots=roots)
+            accounts = _snapshot_accounts_json(roots) if snap else 0
+            if accounts:
+                for row in db().execute("SELECT id FROM users").fetchall():
+                    personal_path = get_user_setting(row[0], "personal_backup_path", "")
+                    if personal_path:
+                        _snapshot_one_account(row[0], [personal_path])
+        finally:
+            unborrow()
         return self._send(200 if snap else 500, {"ok": bool(snap), "path": snap or "",
+                                                  "account_snapshots": accounts,
                                                   "error": "快照失败" if not snap else ""})
+
+    def api_user_backup_run(self, p):
+        uid = need_uid(p.get("token"))
+        raw = get_user_setting(uid, "personal_backup_path", "") or ""
+        roots = [BACKUP_DIR]
+        if raw:
+            roots.append(raw)
+        result = _snapshot_one_account(uid, roots)
+        return self._send(200 if result else 500, {"ok": bool(result), "path": result or "",
+                                                  "error": "個人快照失敗" if not result else ""})
+
+    def api_user_backup_restore(self, p):
+        uid = need_uid(p.get("token"))
+        name = str(p.get("name") or "")
+        if not re.fullmatch(r"account-\d{8}\.json", name):
+            return self._send(400, {"error": "快照名称无效"})
+        safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80]
+        roots = [BACKUP_DIR]
+        raw = get_user_setting(uid, "personal_backup_path", "") or ""
+        if raw:
+            roots.append(raw)
+        candidates = [os.path.join(_backup_instance_dir(root), "accounts", safe_uid, name) for root in roots]
+        source = next((p for p in candidates if os.path.isfile(p)), None)
+        if not source:
+            return self._send(404, {"error": "找不到本账号快照"})
+        try:
+            with open(source, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if data.get("user", {}).get("id") != uid:
+                return self._send(403, {"error": "该快照不属于当前账号"})
+            return self.api_import_mydata({"token": p.get("token"), "data": data})
+        except Exception as e:
+            return self._send(400, {"error": "个人快照读取失败：%s" % e})
+
+    def api_user_backup_config(self, p):
+        uid = need_uid(p.get("token"))
+        if "path" in p:
+            path = str(p.get("path") or "").strip()
+            if path:
+                path = os.path.abspath(os.path.expanduser(path))
+                data_dir = os.path.abspath(os.path.dirname(USERS_DB_PATH))
+                if path == data_dir or path.startswith(data_dir + os.sep):
+                    return self._send(400, {"error": "备份目录不能位于用户库目录内"})
+                folder = os.path.join(_backup_instance_dir(path), "accounts", re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80])
+                try:
+                    os.makedirs(folder, exist_ok=True)
+                    probe = os.path.join(folder, ".kaogong-write-test")
+                    with open(probe, "wb") as f:
+                        f.write(b"ok")
+                    os.remove(probe)
+                except Exception as e:
+                    return self._send(400, {"error": "目录不可写：%s" % e})
+                with _LOCK:
+                    set_user_setting(uid, "personal_backup_path", path)
+                    db().commit()
+                _snapshot_one_account(uid, [path])
+            else:
+                with _LOCK:
+                    set_user_setting(uid, "personal_backup_path", "")
+                    db().commit()
+        path = get_user_setting(uid, "personal_backup_path", "") or ""
+        path = os.path.abspath(os.path.expanduser(path)) if path else ""
+        folder = os.path.join(_backup_instance_dir(path), "accounts", re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80]) if path else ""
+        snapshots = []
+        roots = [BACKUP_DIR]
+        if path:
+            roots.append(path)
+        safe_uid = re.sub(r"[^A-Za-z0-9_-]", "_", uid)[:80]
+        for root in roots:
+            source = os.path.join(_backup_instance_dir(root), "accounts", safe_uid)
+            try:
+                for name in os.listdir(source):
+                    full = os.path.join(source, name)
+                    if name.startswith("account-") and name.endswith(".json") and re.fullmatch(r"account-\d{8}\.json", name) and os.path.isfile(full):
+                        snapshots.append({"name": name, "size": os.path.getsize(full), "mtime": os.path.getmtime(full)})
+            except OSError:
+                pass
+        unique = {item["name"]: item for item in snapshots}
+        return self._send(200, {"path": path, "folder": folder,
+                                "snapshots": sorted(unique.values(), key=lambda x: x["mtime"], reverse=True)})
+
+    def api_backup_delete(self, p):
+        need_admin(p.get("token"))
+        name = str(p.get("name") or "")
+        if not name.startswith("users-") or not name.endswith(".db") or os.path.basename(name) != name:
+            return self._send(400, {"error": "快照名称无效"})
+        allowed = {_backup_instance_dir(BACKUP_DIR)}
+        configured = _backup_config().get("path")
+        if configured:
+            allowed.add(_backup_instance_dir(configured))
+        removed = False
+        for folder in allowed:
+            target = os.path.join(folder, name)
+            if os.path.isfile(target):
+                os.remove(target)
+                removed = True
+        return self._send(200 if removed else 404, {"ok": removed,
+                              "error": "找不到该快照" if not removed else ""})
+
+    def api_announcement(self, p):
+        uid = need_uid(p.get("token"))
+        row = q_one("SELECT value FROM settings WHERE key='announcement_current'")
+        announcement = None
+        if row and row["value"]:
+            try:
+                announcement = json.loads(row["value"])
+            except Exception:
+                pass
+        read = q_one("SELECT value FROM user_settings WHERE uid=? AND key='announcement_read_id'", (uid,))
+        return self._send(200, {"announcement": announcement,
+                                "seen": bool(announcement and read and read["value"] == announcement.get("id"))})
+
+    def api_announcement_read(self, p):
+        uid = need_uid(p.get("token"))
+        announcement_id = str(p.get("id") or "")[:80]
+        if not announcement_id:
+            return self._send(400, {"error": "公告 ID 不能为空"})
+        with _LOCK:
+            set_user_setting(uid, "announcement_read_id", announcement_id)
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_admin_announcement(self, p):
+        need_admin(p.get("token"))
+        title = str(p.get("title") or "").strip()[:120]
+        content = str(p.get("content") or "").strip()[:12000]
+        if not title or not content:
+            return self._send(400, {"error": "公告标题和内容不能为空"})
+        announcement = {"id": secrets.token_urlsafe(12), "title": title,
+                        "content": content, "updated": now()}
+        with _LOCK:
+            set_setting("announcement_current", json.dumps(announcement, ensure_ascii=False))
+            db().commit()
+        return self._send(200, {"ok": True, "announcement": announcement})
 
     def api_backup_restore(self, p):
         need_admin(p.get("token"))
         name = str(p.get("name") or "")
         if not name or os.path.basename(name) != name:
             return self._send(400, {"error": "快照名称无效"})
-        folders = [BACKUP_DIR]
+        folders = [_backup_instance_dir(BACKUP_DIR), BACKUP_DIR]
         local = _backup_config().get("path")
         if local:
-            folders.append(local)
+            folders.extend([_backup_instance_dir(local), local])
         src = next((os.path.join(d, name) for d in folders if os.path.isfile(os.path.join(d, name))), None)
         if not src:
             return self._send(404, {"error": "找不到该快照"})
@@ -3528,6 +3861,7 @@ def main():
     try:
         ensure_tables()
         ensure_admin_baseline()   # 一次性基线：清空所有账号，仅留 admin/123456（幂等、带可恢复快照）
+        ensure_release_announcement()
         q_one("SELECT COUNT(*) n FROM qdb.questions")   # 兜底：ATTACH 缺文件会静默建空库
         _warm()      # 预热题库 → OS 页缓存（新账号播种、出题查询首次都更快）
     except Exception as e:
@@ -3538,7 +3872,7 @@ def main():
     print(f"[INFO] vault  = {VAULT_ROOT}")
     print(f"[INFO] images = {IMG_ROOT}  exists={os.path.isdir(IMG_ROOT)}")
     print(f"[INFO] userdb = {USERS_DB_PATH}")
-    threading.Thread(target=_backup_loop, daemon=True).start()   # 每 30 分钟自动快照用户库
+    threading.Thread(target=_backup_loop, daemon=True).start()   # 每日 0 点自动快照用户库
     print(f"[INFO] 打开浏览器访问:  http://127.0.0.1:{PORT}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:

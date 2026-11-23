@@ -4,7 +4,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261123b';
+const APP_VER = '20261123f';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -3324,6 +3324,59 @@ async function viewStats() {
   };
 }
 
+async function initUserBackupSettings() {
+  const pathInput = document.getElementById('user-backup-path');
+  const list = document.getElementById('user-backup-list');
+  if (!pathInput || !list) return;
+  const refresh = async () => {
+    const data = await API('/api/user-backup/config');
+    pathInput.value = data.path || '';
+    list.dataset.folder = data.folder || '';
+    list.innerHTML = (data.snapshots || []).length ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>个人快照</th><th>时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${data.snapshots.map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><button class="btn ghost sm ub-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm ub-restore" data-name="${esc(s.name)}">恢复到我的账号</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="sub">暂无个人快照</p>';
+    list.querySelectorAll('.ub-download').forEach(btn => btn.onclick = () => {
+      location.href = '/api/user-backup/download?token=' + encodeURIComponent(tok()) + '&name=' + encodeURIComponent(btn.dataset.name);
+    });
+    list.querySelectorAll('.ub-restore').forEach(btn => btn.onclick = async () => {
+      if (!confirm(`将 ${btn.dataset.name} 合并恢复到当前账号，不会修改其他账号。继续？`)) return;
+      try { await POST('/api/user-backup/restore', { name: btn.dataset.name }); toast('个人数据已恢复'); }
+      catch (e) { alert('恢复失败：' + (e.message || e)); }
+    });
+  };
+  try {
+    await refresh();
+    document.getElementById('user-backup-save').onclick = async () => {
+      try { await POST('/api/user-backup/config', { path: pathInput.value }); await refresh(); toast('个人备份目录已保存'); }
+      catch (e) { alert('保存失败：' + (e.message || e)); }
+    };
+    document.getElementById('user-backup-now').onclick = async () => {
+      try { await POST('/api/user-backup/run', {}); await refresh(); toast('个人数据快照已完成'); }
+      catch (e) { alert('备份失败：' + (e.message || e)); }
+    };
+  } catch (e) { list.textContent = '个人备份加载失败：' + (e.message || e); }
+}
+
+async function showAnnouncementIfNeeded() {
+  if (!ME || sessionStorage.getItem('kg_announcement_open') === '1') return;
+  try {
+    const data = await API('/api/announcement');
+    const item = data.announcement;
+    if (!item || data.seen) return;
+    const mask = document.createElement('div');
+    mask.className = 'modal-mask';
+    mask.innerHTML = `<div class="modal" role="dialog" aria-modal="true" aria-labelledby="announcement-title">
+      <h2 id="announcement-title">${esc(item.title)}</h2>
+      <div style="white-space:pre-wrap;max-height:55vh;overflow:auto">${esc(item.content)}</div>
+      <div class="row" style="justify-content:flex-end;margin-top:18px"><button class="btn ok" id="announcement-ack">知晓</button></div>
+    </div>`;
+    document.body.appendChild(mask);
+    sessionStorage.setItem('kg_announcement_open', '1');
+    mask.querySelector('#announcement-ack').onclick = async () => {
+      try { await POST('/api/announcement/read', { id: item.id }); mask.remove(); sessionStorage.removeItem('kg_announcement_open'); }
+      catch (e) { alert('确认失败：' + (e.message || e)); }
+    };
+  } catch (e) { console.warn('[announcement]', e); }
+}
+
 async function initAdminSettings() {
   const root = document.getElementById('admin-users');
   const renderUsers = async () => {
@@ -3351,7 +3404,9 @@ async function initAdminSettings() {
     const d = await API('/api/backup/config');
     document.getElementById('admin-backup-path').value = d.path || '';
     const box = document.getElementById('admin-backup-list');
-    box.innerHTML = (d.snapshots || []).length ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照</th><th>时间</th><th>位置</th><th>大小</th><th>操作</th></tr></thead><tbody>${d.snapshots.map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${esc(s.location || '服务端')}</td><td>${(s.size / 1048576).toFixed(2)} MB</td><td><button class="btn ghost sm bk-download" data-name="${esc(s.name)}">下载到本机</button> <button class="btn ghost sm bk-restore" data-name="${esc(s.name)}">恢复</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="sub">暂无全库快照</p>';
+    const fullRows = (d.snapshots || []).map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${esc(s.location || '服务端')}</td><td>${(s.size / 1048576).toFixed(2)} MB</td><td><button class="btn ghost sm bk-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm bk-restore" data-name="${esc(s.name)}">恢复</button> <button class="btn danger sm bk-delete" data-name="${esc(s.name)}">删除</button></td></tr>`).join('');
+    const accountRows = (d.account_snapshots || []).map(s => `<tr><td><code>${esc(s.uid)}</code></td><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><span class="sub">由本人账户管理</span></td></tr>`).join('');
+    box.innerHTML = `<h3>全库快照（最多 7 份）</h3>${fullRows ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照</th><th>时间</th><th>位置</th><th>大小</th><th>操作</th></tr></thead><tbody>${fullRows}</tbody></table></div>` : '<p class="sub">暂无全库快照</p>'}<h3 style="margin-top:18px">按账号独立快照（每账号最多 7 份）</h3>${accountRows ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>账号 ID</th><th>文件</th><th>时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${accountRows}</tbody></table></div>` : '<p class="sub">暂无账号快照</p>'}`;
     box.querySelectorAll('.bk-download').forEach(btn => btn.onclick = () => {
       location.href = '/api/backup/download?token=' + encodeURIComponent(tok()) + '&name=' + encodeURIComponent(btn.dataset.name);
     });
@@ -3359,6 +3414,11 @@ async function initAdminSettings() {
       if (!confirm(`将用快照 ${btn.dataset.name} 替换当前全库；恢复前系统会自动保存当前库。继续？`)) return;
       try { await POST('/api/backup/restore', { name: btn.dataset.name }); alert('全库恢复完成，建议重新登录。'); location.reload(); }
       catch (e) { alert('恢复失败：' + (e.message || e)); }
+    });
+    box.querySelectorAll('.bk-delete').forEach(btn => btn.onclick = async () => {
+      if (!confirm(`永久删除快照 ${btn.dataset.name} 的所有副本？此操作不可撤销。`)) return;
+      try { await POST('/api/backup/delete', { name: btn.dataset.name }); await refreshBackups(); toast('快照已删除'); }
+      catch (e) { alert('删除失败：' + (e.message || e)); }
     });
   };
   try {
@@ -3370,6 +3430,14 @@ async function initAdminSettings() {
     document.getElementById('admin-backup-now').onclick = async () => {
       try { await POST('/api/backup/run', {}); await refreshBackups(); toast('全库备份完成'); }
       catch (e) { alert('备份失败：' + (e.message || e)); }
+    };
+    const title = document.getElementById('admin-announcement-title');
+    const content = document.getElementById('admin-announcement-content');
+    document.getElementById('admin-announcement-publish').onclick = async () => {
+      try {
+        await POST('/api/admin/announcement', { title: title.value, content: content.value });
+        title.value = ''; content.value = ''; toast('公告已发布');
+      } catch (e) { alert('公告发布失败：' + (e.message || e)); }
     };
   } catch (e) { root.textContent = '管理员数据加载失败：' + (e.message || e); }
 }
@@ -3450,13 +3518,19 @@ async function viewSettings() {
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">💾 备份与恢复</h2>
-    <p class="sub" style="margin:0 0 12px">把当前账号的全部学习数据（复习进度、错题、收藏、笔记、弃题、考试记录、学习时长）导出成一个 JSON 文件；换设备、误清空、或换服务器后都能用它一键恢复。服务端同时每 30 分钟自动留一份<b>全库快照</b>，保留最近 20 份。</p>
+    <p class="sub" style="margin:0 0 12px">可导出并恢复当前账号的独立学习数据；管理员全库快照每日 0 点保存，最近 7 份。</p>
     <div class="row">
-      <button class="btn ok" id="st-bk-exp">⬇ 导出完整备份 (.json)</button>
-      <button class="btn ghost" id="st-bk-imp">⬆ 从备份恢复</button>
+      <label class="fld" style="flex:1;min-width:240px">个人备份目录<input id="user-backup-path" type="text" placeholder="服务端可访问路径"></label>
+      <button class="btn" id="user-backup-save">保存路径</button>
+      <button class="btn ok" id="user-backup-now">立即备份</button>
+    </div>
+    <div id="user-backup-list" style="margin-top:12px"></div>
+    <div class="row" style="margin-top:12px">
+      <button class="btn ghost" id="st-bk-exp">导出 JSON 到本机</button>
+      <button class="btn ghost" id="st-bk-imp">从 JSON 恢复</button>
       <input type="file" id="st-bk-file" accept=".json,application/json" style="display:none">
     </div>
-    <p class="sub" id="st-bk-tip" style="margin:10px 0 0">备份只含你本人账号的数据，不含密码与他人信息。</p>
+    <p class="sub" id="st-bk-tip" style="margin:10px 0 0">服务端快照按账号隔离，其他账号无法查看或恢复；JSON 导出只含你本人数据。</p>
   </div>
   ${(ME && ME.role === 'admin') ? `
   <div class="card" style="max-width:900px;margin-top:16px">
@@ -3465,15 +3539,25 @@ async function viewSettings() {
     <div id="admin-users">加载中…</div>
   </div>
   <div class="card" style="max-width:900px;margin-top:16px">
+    <h2 style="margin-top:0">管理员：发布更新公告</h2>
+    <p class="sub">发布后，用户登录时会看到弹窗；点击“知晓”后，同一公告不会再次显示。发布新公告会重新通知所有账号。</p>
+    <div class="grid" style="gap:10px">
+      <label class="fld">标题<input id="admin-announcement-title" maxlength="120" placeholder="例如：本次更新内容"></label>
+      <label class="fld">公告内容<textarea id="admin-announcement-content" rows="5" maxlength="12000" placeholder="填写更新说明或其他通知"></textarea></label>
+      <div><button class="btn ok" id="admin-announcement-publish">发布公告</button></div>
+    </div>
+  </div>
+  <div class="card" style="max-width:900px;margin-top:16px">
     <h2 style="margin-top:0">管理员：全库备份与恢复</h2>
-    <p class="sub">每次服务端快照可同步到运行服务的目录；「下载到本机」会把所选全库快照保存到当前浏览器设备，发布更新前必须先下载并确认文件。</p>
+    <p class="sub">每日 0 点在服务端与配置目录分别创建实例专属文件夹，各保留最近 7 份；可手动备份、下载、恢复或删除快照。配置路径指服务进程可访问的文件系统，不是浏览器本机路径。</p>
     <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
-      <label class="fld" style="flex:1;min-width:280px">本地备份目录<input id="admin-backup-path" type="text" placeholder="例如 D:\\kaogong-backups 或 /home/user/kaogong-backups"></label>
+      <label class="fld" style="flex:1;min-width:280px">全库备份根目录<input id="admin-backup-path" type="text" placeholder="服务运行机器上的路径"></label>
       <button class="btn" id="admin-backup-save">保存目录</button>
       <button class="btn ok" id="admin-backup-now">立即备份</button>
     </div>
     <div id="admin-backup-list" style="margin-top:12px">加载中…</div>
   </div>` : ''}
+  <div id="announcement-root"></div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">📤 数据导出</h2>
     <p class="sub" style="margin:0 0 12px">将错题本 / 笔记导出为 Markdown 文件，可粘贴到 Obsidian、Notion 等笔记软件。导出内容仅含当前账号数据。</p>
@@ -3483,18 +3567,6 @@ async function viewSettings() {
     </div>
   </div>
     <div class="card" style="max-width:640px;margin-top:16px">
-    <h2 style="margin-top:0">🔄 偏好同步（跟随应用账号）</h2>
-    <p class="sub" style="margin:0 0 6px">只需要一个账号。做题进度、错题本、收藏、笔记、统计、每日目标本来就在服务端；本机偏好（主题、字号、答题模式、限时设置、每次做题数、答题区宽度、右键手势、已做题目缓存）也一并存到同一个账号下。</p>
-    <p class="sub" style="margin:0 0 12px">换设备时用同一个用户名 + 密码登录，进度和偏好都会自动恢复，不用再做任何额外授权。</p>
-    <div class="row" style="justify-content:space-between;gap:16px;flex-wrap:wrap">
-      <div>同步到账号：<b id="st-prefs-user">…</b><br><span class="sub" id="st-prefs-status" style="margin:4px 0 0">检查中…</span></div>
-      <div class="row">
-        <button class="btn" id="st-prefs-push">立即上传偏好</button>
-        <button class="btn ghost" id="st-prefs-pull">从账号恢复偏好</button>
-      </div>
-    </div>
-  </div>
-  <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">🤝 陪伴者</h2>
     <p class="sub" style="margin:0 0 12px">陪伴者已经是普通账号的一个功能（不再需要单独开账号）：把你的<b>用户名 + 链接码</b>给对方，或填对方的用户名 + 链接码，就能互相查看学习情况、互相推题。<b>查看始终只读，不能修改对方任何记录，也不能替对方答题</b>。</p>
     <div id="st-teacher-list" class="sub">加载中…</div>
@@ -3503,7 +3575,7 @@ async function viewSettings() {
     </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
-    <h2 style="margin-top:0">👤 账号管理</h2>
+    <h2 style="margin-top:0">👤 账号与同步</h2>
     <div class="row" style="justify-content:space-between;gap:16px;flex-wrap:wrap">
       <div>当前账号：<b id="st-user">—</b>${(ME && ME.username) ? '（用户名 ' + esc(ME.username) + '）' : ''}<br><span class="sub" style="margin:4px 0 0">${(ME && ME.anon) ? '游客模式：这是仅本设备独有的临时身份，和其它设备互不相通。要用手机和电脑同步进度，请点「升级为正式账号」设一个用户名密码，然后在另一台设备用「登录」输入同一个账号。' : '各账号的学习进度、收藏与笔记相互隔离；多台设备用同一个用户名 + 密码登录，看到的就是同一份进度（可同时在线，互不顶替）。'}</span></div>
       <div class="row">
@@ -3516,6 +3588,16 @@ async function viewSettings() {
       </div>
     </div>
     ${(ME && ME.anon) ? '<p class="sub" style="margin:10px 0 0">游客模式无需登录即可使用；如需跨设备同步或在其它浏览器继续学习，可「升级为正式账号」设定用户名与密码。</p>' : ''}
+    <hr style="margin:16px 0;border:0;border-top:1px solid var(--line)">
+    <h3 style="margin:0 0 6px">偏好同步</h3>
+    <p class="sub" style="margin:0 0 12px">主题、字号、答题模式、限时、每次做题数、答题区宽度、右键手势和已做题目缓存会随正式账号同步；学习进度、错题、收藏、笔记和统计本身已保存在账号中。</p>
+    <div class="row" style="justify-content:space-between;gap:16px;flex-wrap:wrap">
+      <div>同步到账号：<b id="st-prefs-user">…</b><br><span class="sub" id="st-prefs-status" style="margin:4px 0 0">检查中…</span></div>
+      <div class="row">
+        <button class="btn" id="st-prefs-push">立即上传偏好</button>
+        <button class="btn ghost" id="st-prefs-pull">从账号恢复偏好</button>
+      </div>
+    </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">关于</h2>
@@ -3540,6 +3622,7 @@ async function viewSettings() {
   };
   syncNavFit(); nfb.onclick = () => { setNavFit(!isNavFit()); syncNavFit(); };
   if (ME && ME.role === 'admin') initAdminSettings();
+  initUserBackupSettings();
   try { renderTeacherBox(); } catch (e) { }   // 陪伴者督导：读我已绑定的陪伴者
   API('/api/streak').then(s => {
     document.getElementById('st-goal').value = s.goal;
@@ -4957,6 +5040,7 @@ async function prefsFlush() {
   const un = document.getElementById('user-name'); if (un) un.onclick = () => openUserMenu();
   syncUserChip();
   renderNav();       // 陪伴者账号只显示「陪读看板 / 鼓励信息」，陪读显示原有导航
+  showAnnouncementIfNeeded();
   if (!isTeacher()) {
     stBoot();          // 学习时长心跳：登录后开始按秒累计（答题 + 看解析）
     liveStart();       // 答题状态心跳：陪伴者端据此实时看进度
