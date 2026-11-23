@@ -3331,7 +3331,9 @@ async function initUserBackupSettings() {
   const refresh = async () => {
     const data = await API('/api/user-backup/config');
     const rows = data.snapshots || [];
-    if (tip) tip.textContent = `保留最近 ${data.keep || 7} 份 · 当前 ${rows.length} 份`;
+    if (tip) tip.textContent = rows.length
+      ? `当前 1 份 · 最近保存 ${new Date(rows[0].mtime * 1000).toLocaleString()}`
+      : '暂无云端快照';
     list.innerHTML = rows.length
       ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照日期</th><th>生成时间</th><th>大小</th><th>操作</th></tr></thead><tbody>${rows.map(s => `<tr><td><code>${esc(String(s.name).replace(/^account-|\.json$/g, ''))}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${(s.size / 1024).toFixed(1)} KB</td><td><button class="btn ghost sm ub-download" data-name="${esc(s.name)}">下载</button> <button class="btn ghost sm ub-restore" data-name="${esc(s.name)}">恢复</button> <button class="btn danger sm ub-delete" data-name="${esc(s.name)}">删除</button></td></tr>`).join('')}</tbody></table></div>`
       : '<p class="sub" style="margin:0">暂无云端快照，点「立即保存到云端」生成第一份。</p>';
@@ -3388,7 +3390,7 @@ async function initAdminSettings() {
   const root = document.getElementById('admin-users');
   const renderUsers = async () => {
     const d = await API('/api/admin/users');
-    root.innerHTML = `<div style="overflow:auto"><table class="tbl"><thead><tr><th>名称</th><th>用户名</th><th>角色</th><th>复习记录</th><th>账号 ID</th><th>操作</th></tr></thead><tbody>${(d.users || []).map(u => `<tr data-uid="${esc(u.id)}"><td><input class="au-name" value="${esc(u.name)}"></td><td><input class="au-username" value="${esc(u.username)}"></td><td>${esc(u.role)}</td><td>${u.reviews || 0}</td><td><code>${esc(u.id)}</code></td><td><input class="au-password" type="password" placeholder="新密码（留空不改）" autocomplete="new-password"><button class="btn sm au-save">保存</button> ${u.role === 'admin' ? '' : '<button class="btn danger sm au-delete">删除</button>'}</td></tr>`).join('')}</tbody></table></div>`;
+    root.innerHTML = `<div style="overflow:auto"><table class="tbl"><thead><tr><th>名称</th><th>用户名</th><th>角色</th><th>复习记录</th><th>账号 ID</th><th>操作</th></tr></thead><tbody>${(d.users || []).map(u => `<tr data-uid="${esc(u.id)}"><td><input class="au-name" value="${esc(u.name)}"></td><td><input class="au-username" value="${esc(u.username)}"></td><td>${u.role === 'admin' ? '管理员（唯一）' : '普通账号'}</td><td>${u.reviews || 0}</td><td><code>${esc(u.id)}</code></td><td><input class="au-password" type="password" placeholder="新密码（留空不改）" autocomplete="new-password"><button class="btn sm au-save">保存</button> ${u.role === 'admin' ? '' : '<button class="btn danger sm au-delete">删除</button>'}</td></tr>`).join('')}</tbody></table></div>`;
     root.querySelectorAll('.au-save').forEach(btn => btn.onclick = async () => {
       const tr = btn.closest('tr');
       try {
@@ -3412,6 +3414,8 @@ async function initAdminSettings() {
     const box = document.getElementById('admin-backup-list');
     const tip = document.getElementById('admin-backup-tip');
     const rows = d.snapshots || [];
+    const who = document.getElementById('admin-current');
+    if (who) who.textContent = d.admin || (ME && ME.username) || '—';
     if (tip) tip.textContent = `保留最近 ${d.keep || 7} 份 · 当前 ${rows.length} 份`;
     const html = rows.map(s => {
       const t = new Date(s.mtime * 1000).toLocaleString();
@@ -3533,7 +3537,7 @@ async function viewSettings() {
     <h2 style="margin-top:0">💾 备份与恢复</h2>
     <p class="sub" style="margin:0">学习数据本身就存在账号里，换设备登录即可看到。这里只提供两种额外备份，各管一件事。</p>
     <h3 style="margin:18px 0 6px">云端快照 · 跟随账号</h3>
-    <p class="sub" style="margin:0 0 10px">服务器每天 0 点自动为你的账号留一份，保留最近 7 份；也可以随时手动保存。只有本账号能看到、下载和恢复。</p>
+    <p class="sub" style="margin:0 0 10px">服务器每天 0 点自动为你的账号保存一份，账号下始终只保留最新这一份；也可以随时手动保存（覆盖上一份）。只有本账号能看到、下载和恢复。</p>
     <div class="row" style="gap:12px;align-items:center">
       <button class="btn ok" id="user-backup-now">立即保存到云端</button>
       <span class="sub" id="user-backup-tip" style="margin:0"></span>
@@ -3552,7 +3556,7 @@ async function viewSettings() {
   ${(ME && ME.role === 'admin') ? `
   <div class="card" style="max-width:900px;margin-top:16px">
     <h2 style="margin-top:0">管理员：账号管理</h2>
-    <p class="sub">可修改名称、用户名和密码。密码留空表示不修改；删除账号会同时删除该账号学习数据。</p>
+    <p class="sub">可修改名称、用户名和密码。密码留空表示不修改；删除账号会同时删除该账号学习数据。管理员账号只有一个（就是当前登录账号），系统不会自动新建管理员。</p>
     <div id="admin-users">加载中…</div>
   </div>
   <div class="card" style="max-width:900px;margin-top:16px">
@@ -3567,6 +3571,7 @@ async function viewSettings() {
   <div class="card" style="max-width:900px;margin-top:16px">
     <h2 style="margin-top:0">管理员：全库快照</h2>
     <p class="sub" style="margin:0 0 12px">每天 0 点自动为整个服务器数据库（所有账号、学习进度、公告）保存一份快照，存在服务端云端目录，保留最近 7 份。服务在 0 点停机也没关系，启动后会补做当天那份。需要本机副本请用「下载」。</p>
+    <p class="sub" style="margin:0 0 10px">当前唯一管理员：<b id="admin-current">—</b>（程序不会自动新建管理员账号）</p>
     <div class="row" style="gap:12px;align-items:center">
       <button class="btn ok" id="admin-backup-now">立即创建快照</button>
       <span class="sub" id="admin-backup-tip" style="margin:0"></span>

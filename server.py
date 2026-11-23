@@ -69,7 +69,8 @@ _prepare_user_db()
 # 旧版本留下的「管理员备份根目录 / 个人备份目录」设置已废弃，升级时由
 # _migrate_backup_layout() 把散落的快照收归这里，然后删掉这些设置。
 BACKUP_DIR = os.path.join(os.path.dirname(USERS_DB_PATH), "backups")
-BACKUP_KEEP = 7
+BACKUP_KEEP = 7                 # 全库快照留 7 份，够回溯一周
+ACCOUNT_SNAPSHOT_KEEP = 1       # 个人云端快照只留最新 1 份（用户明确要求只保存一份）
 _BACKUP_LOCK = threading.RLock()
 
 SNAPSHOT_TAG_LABEL = {"daily": "每日自动", "manual": "手动创建", "import": "导入前保护",
@@ -112,7 +113,7 @@ def _prune_snapshots(folder, prefix="users-"):
 
 
 def _prune_account_folder(folder):
-    """单账号快照按天命名，同样只留最近 BACKUP_KEEP 天。"""
+    """单账号快照只留最新一份：新快照写好后，旧日期的自动删掉。"""
     try:
         names = os.listdir(folder)
     except OSError:
@@ -120,7 +121,7 @@ def _prune_account_folder(folder):
     files = sorted((os.path.join(folder, f) for f in names
                     if re.fullmatch(r"account-\d{8}\.json", f) and os.path.isfile(os.path.join(folder, f))),
                    key=os.path.getmtime, reverse=True)
-    for old in files[BACKUP_KEEP:]:
+    for old in files[ACCOUNT_SNAPSHOT_KEEP:]:
         try:
             os.remove(old)
         except OSError as e:
@@ -174,7 +175,8 @@ def _snapshot_user_db(tag=""):
 def _snapshot_one_account(uid, snapshot_date=None, prune=True):
     """把某个账号的学习数据导出成一份 JSON 快照，存进服务端（个人云端备份）。
 
-    一个账号一天一份（同名覆盖），按账号目录严格隔离：别人既看不到也下载不到。
+    每个账号只保留最新一份（当天重复保存直接覆盖）；按账号目录严格隔离，
+    别人既看不到也下载不到。
     """
     folder = _account_folder(uid)
     date_name = "account-%s.json" % (snapshot_date or datetime.datetime.now().strftime("%Y%m%d"))
@@ -966,112 +968,52 @@ def ensure_tables():
     """)
 
 
-# ---------- 管理员基线：一次性清空所有账号，仅保留 admin/123456 ----------
-# 需求：初始化时清空当前所有账号，仅新增管理员账号（用户名 admin / 密码 123456）。
-# 关键约束（防止其它 agent 误操作导致线上数据被清）：
-#   · 幂等 & 一次性：用 settings 里的标志位 `admin_baseline_done` 记录已执行，之后永不再清；
-#   · 可逆：清空前强制对用户库做一份带标签的快照（data/backups/users-*-prebaseline.db），
-#     万一是误触发，也能从快照恢复；
-#   · 可关闭：设环境变量 KAOGONG_SKIP_BASELINE=1 可整段跳过（迁移/排障时用）。
-# 若后续需要「再次强制重置为仅 admin」，请显式设 KAOGONG_FORCE_BASELINE=1 启动一次。
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "123456"
-_USER_SCOPED_TABLES_UID = ("study_time", "discarded", "user_settings", "sessions",
-                           "practice_items", "practice_groups")
-_USER_SCOPED_TABLES_USERID = ("srs", "reviews", "notes", "favorites",
-                              "doubt_status", "exam_history")
+# ---------- 管理员唯一：只认库里已有的管理员，绝不自动新建 ----------
+# 历史上曾有「一次性基线：清空所有账号、重建 admin/123456」的逻辑：它会凭空多造
+# 一个管理员账号，还带着清空线上数据的风险。现在彻底移除：
+#   · 不再自动创建管理员账号，也不重置任何人的密码；
+#   · 管理员 = 库里 role='admin' 的那个账号，有且仅有一个；
+#   · 若库里意外出现多个管理员，保留最早的真实账号（内置 admin 视为旧版本遗留），
+#     其余降为普通账号，保证唯一；
+#   · 万一一个管理员都没有（例如误删），不造账号，只告警；可用环境变量
+#     KAOGONG_PROMOTE_USER=<已存在的用户名> 显式指定一次。
+BUILTIN_ADMIN_USERNAME = "admin"
 
 
-def _wipe_all_accounts():
-    """清空所有账号及其全部业务数据（题库 kaogong.db 只读、完全不动）。"""
-    c = db()
-    for t in _USER_SCOPED_TABLES_USERID:
-        try:
-            c.execute(f"DELETE FROM {t}")
-        except Exception:
-            pass
-    for t in _USER_SCOPED_TABLES_UID:
-        try:
-            c.execute(f"DELETE FROM {t}")
-        except Exception:
-            pass
-    for t in ("teacher_links", "pushed_questions", "encouragements",
-              "cloud_accounts", "cloud_meta", "cloud_srs", "cloud_reviews",
-              "cloud_notes", "cloud_favorites", "cloud_doubt_status", "cloud_exam_history"):
-        try:
-            c.execute(f"DELETE FROM {t}")
-        except Exception:
-            pass
-    c.execute("DELETE FROM users")
-
-
-def ensure_admin_baseline():
-    """一次性基线初始化：清空当前所有账号，仅新增管理员账号 admin/123456。
-
-    幂等：只在首次（标志位未写）或显式 KAOGONG_FORCE_BASELINE=1 时执行；
-    其余任何启动都只做「确保 admin 存在且为 admin 角色」的温和补齐，绝不清库。"""
-    if os.environ.get("KAOGONG_SKIP_BASELINE") == "1":
-        return
-    done = get_setting("admin_baseline_done")
-    force = os.environ.get("KAOGONG_FORCE_BASELINE") == "1"
-    existing = q_one("SELECT COUNT(*) n FROM users")
-    # Upgrade safety: an unmarked but populated legacy DB is not a fresh install.
-    # Preserve its accounts and records; only add admin and mark baseline complete.
-    if not done and not force and existing and existing["n"] > 0:
-        existing_admin = q_one("SELECT id FROM users WHERE IFNULL(role,'student')='admin' LIMIT 1")
-        if not existing_admin:
+def ensure_single_admin():
+    """确保管理员账号唯一、且不由程序凭空创建（幂等，每次启动执行）。"""
+    promote = (os.environ.get("KAOGONG_PROMOTE_USER") or "").strip()
+    if promote:
+        row = q_one("SELECT id FROM users WHERE username=?", (promote,))
+        if row:
             with _LOCK:
-                db().execute(
-                    "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
-                    "VALUES(?,?,?,?,?,?,0,'admin')",
-                    ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
-                     pw_hash(ADMIN_PASSWORD), "", now()))
+                db().execute("UPDATE users SET role='student' "
+                             "WHERE IFNULL(role,'student')='admin' AND id<>?", (row["id"],))
+                db().execute("UPDATE users SET role='admin' WHERE id=?", (row["id"],))
+                db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_uid',?)", (row["id"],))
                 db().commit()
+            print("[admin] 已按 KAOGONG_PROMOTE_USER 指定唯一管理员:", promote)
         else:
-            with _LOCK:
-                db().execute("UPDATE users SET role='admin' WHERE id=?", (existing_admin["id"],))
-                db().commit()
-        with _LOCK:
-            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_baseline_done',?)", (now(),))
-            db().commit()
-        print("[baseline] 检测到已有账号数据，升级安全模式已保留原账号并补建 admin")
+            print("[admin] KAOGONG_PROMOTE_USER 指定的账号不存在:", promote)
+
+    admins = q_all("SELECT id, username, created FROM users "
+                   "WHERE IFNULL(role,'student')='admin' ORDER BY IFNULL(created,''), id")
+    if not admins:
+        print("[admin] 警告：库中没有管理员账号；程序不会自动创建，"
+              "如需指定请用 KAOGONG_PROMOTE_USER=<已存在的用户名> 启动一次")
         return
-    if done and not force:
-        # 已初始化过：仅兜底保证 admin 账号存在（被误删时自动重建，不动其它账号）
-        if not q_one("SELECT 1 FROM users WHERE username=?", (ADMIN_USERNAME,)):
-            with _LOCK:
-                db().execute(
-                    "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
-                    "VALUES(?,?,?,?,?,?,0,'admin')",
-                    ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
-                     pw_hash(ADMIN_PASSWORD), "", now()))
-                db().commit()
-            print("[baseline] 检测到 admin 缺失，已重建管理员账号（未触碰其它账号）")
-        else:
-            # 确保既有 admin 账号的角色是 admin（历史数据兜底）
-            with _LOCK:
-                db().execute("UPDATE users SET role='admin' WHERE username=?", (ADMIN_USERNAME,))
-                db().commit()
-        return
-    # 首次 / 强制：清空前必须留一份可恢复快照，失败时绝不清库。
-    snap = _snapshot_user_db(tag="prebaseline")
-    if os.path.exists(USERS_DB_PATH) and os.path.getsize(USERS_DB_PATH) > 0 and not snap:
-        raise RuntimeError("管理员基线初始化已取消：无法创建清库前快照")
+    keeper = next((a for a in admins if (a["username"] or "") != BUILTIN_ADMIN_USERNAME), admins[0])
     with _LOCK:
-        try:
-            _wipe_all_accounts()
-            db().execute(
-                "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
-                "VALUES(?,?,?,?,?,?,0,'admin')",
-                ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
-                 pw_hash(ADMIN_PASSWORD), "", now()))
-            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_baseline_done',?)",
-                         (now(),))
-            db().commit()
-        except Exception:
-            db().rollback()
-            raise
-    print(f"[baseline] 已清空所有账号并重建管理员：{ADMIN_USERNAME}/{ADMIN_PASSWORD}")
+        if len(admins) > 1:
+            db().execute("UPDATE users SET role='student' "
+                         "WHERE IFNULL(role,'student')='admin' AND id<>?", (keeper["id"],))
+        db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_uid',?)", (keeper["id"],))
+        db().commit()
+    if len(admins) > 1:
+        extra = "、".join(a["username"] or a["id"] for a in admins if a["id"] != keeper["id"])
+        print("[admin] 检测到多个管理员，已保留 %s，其余降为普通账号：%s" % (keeper["username"], extra))
+    else:
+        print("[admin] 当前管理员：%s（唯一）" % keeper["username"])
 
 
 def get_setting(key, default=None):
@@ -1080,9 +1022,10 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("备份功能重整：备份统一保存在服务端（云端），取消「管理员备份根目录 / 个人备份目录」这类路径配置；"
-                     "个人备份分为「导出到本机 JSON」与「账号云端快照（每日自动，可下载/恢复/删除）」两种，去掉重复入口；"
-                     "管理员全库快照每天 0 点自动一份，保留最近 7 份，可手动创建、下载、恢复、删除。")
+APP_RELEASE_NOTES = ("备份与恢复整理：个人云端快照每天 0 点自动保存，账号下只保留最新一份，也可随时手动保存覆盖；"
+                     "本地文件仍可导出 / 恢复 JSON。管理员全库快照每天 0 点自动一份、保留最近 7 份，"
+                     "可手动创建、下载、恢复、删除；已取消全部备份路径配置，也不再展示按账号快照。"
+                     "管理员账号全库唯一，程序不再自动新建管理员。")
 
 
 def ensure_release_announcement():
@@ -2541,8 +2484,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"users": [u] if u else [], "me": u, "max": 0})
         if path in ("/api/backup/config", "/api/admin/backups"):
             # 管理员全库快照列表（/api/backup/config 保留为旧路径别名）
-            need_admin(g("token"))
+            admin_uid = need_admin(g("token"))
+            row = q_one("SELECT username FROM users WHERE id=?", (admin_uid,))
             return self._send(200, {"ok": True, "storage": "server", "keep": BACKUP_KEEP,
+                                    "admin": (row["username"] if row else ""),
                                     "snapshots": _list_user_snapshots()})
 
         if path == "/api/user-backup/download":
@@ -3147,10 +3092,16 @@ class Handler(BaseHTTPRequestHandler):
         if q_one("SELECT 1 FROM users WHERE username=?", (username,)):
             return self._send(400, {"error": "该用户名已被注册，换一个试试"})
         uid = self._new_uid()
+        # 全新部署（库里的第一个账号）自动成为唯一管理员；之后注册的一律是普通账号。
+        # 程序不会另外造一个 admin 账号，管理员就是真实注册的那个人。
+        first_user = (q_one("SELECT COUNT(*) n FROM users")["n"] == 0)
         with _LOCK:
             try:
-                db().execute("INSERT INTO users(id,name,username,pw_hash,token,created) VALUES(?,?,?,?,?,?)",
-                             (uid, name or username, username, pw_hash(pw), "", now()))
+                db().execute("INSERT INTO users(id,name,username,pw_hash,token,created,role) VALUES(?,?,?,?,?,?,?)",
+                             (uid, name or username, username, pw_hash(pw), "", now(),
+                              "admin" if first_user else "student"))
+                if first_user:
+                    db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_uid',?)", (uid,))
                 init_user_srs(uid)      # 新账号初始化一套空白进度
                 db().commit()
             except Exception:
@@ -3327,17 +3278,18 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True})
 
     def api_backup_run(self, p):
-        """管理员手动创建一份全库快照（每日 0 点之外随时可加一份）。"""
+        """管理员手动创建一份全库快照（每日 0 点之外随时可加一份）。
+
+        全库快照本身已包含所有账号的数据，不再顺带生成按账号的 JSON 副本。
+        """
         need_admin(p.get("token"))
         snap = _snapshot_user_db(tag="manual")
-        accounts = _snapshot_all_accounts() if snap else 0
         return self._send(200 if snap else 500, {"ok": bool(snap),
                                                   "name": os.path.basename(snap) if snap else "",
-                                                  "account_snapshots": accounts,
                                                   "error": "" if snap else "快照失败，请检查服务端磁盘空间与目录权限"})
 
     def api_user_backup_run(self, p):
-        """用户手动保存一份云端快照（与每日自动快照同目录，当天同名覆盖）。"""
+        """用户手动保存一份云端快照（覆盖上一份，账号下始终只有一份）。"""
         uid = need_uid(p.get("token"))
         result = _snapshot_one_account(uid)
         return self._send(200 if result else 500, {"ok": bool(result),
@@ -3364,7 +3316,7 @@ class Handler(BaseHTTPRequestHandler):
     def api_user_backup_config(self, p):
         """个人云端快照列表（GET）；备份不再支持自定义目录，写入分支已删除。"""
         uid = need_uid(p.get("token"))
-        return self._send(200, {"ok": True, "storage": "server", "keep": BACKUP_KEEP,
+        return self._send(200, {"ok": True, "storage": "server", "keep": ACCOUNT_SNAPSHOT_KEEP,
                                 "snapshots": _list_account_snapshots(uid)})
 
     def api_user_backup_delete(self, p):
@@ -3873,6 +3825,8 @@ class Handler(BaseHTTPRequestHandler):
     def api_users_delete(self, p):
         """删除当前登录账号及其全部学习数据（需再次输入密码确认）。"""
         uid = need_uid(p.get("token"))
+        if is_admin(uid) and q_one("SELECT COUNT(*) n FROM users WHERE IFNULL(role,'student')='admin'")["n"] <= 1:
+            return self._send(400, {"error": "当前账号是唯一管理员，不能删除（否则没人能管理系统）"})
         r = q_one("SELECT * FROM users WHERE id=?", (uid,))
         if not pw_verify(p.get("password") or "", r["pw_hash"] or ""):
             return self._send(400, {"error": "密码不正确，删除已取消"})
@@ -3904,7 +3858,7 @@ def main():
     try:
         ensure_tables()
         _migrate_backup_layout()  # 历史备份收归服务端统一目录，并清掉已废弃的路径设置
-        ensure_admin_baseline()   # 一次性基线：清空所有账号，仅留 admin/123456（幂等、带可恢复快照）
+        ensure_single_admin()      # 只校验/收敛已有管理员，绝不自动新建账号
         ensure_release_announcement()
         q_one("SELECT COUNT(*) n FROM qdb.questions")   # 兜底：ATTACH 缺文件会静默建空库
         _warm()      # 预热题库 → OS 页缓存（新账号播种、出题查询首次都更快）
