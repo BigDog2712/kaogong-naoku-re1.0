@@ -3324,6 +3324,56 @@ async function viewStats() {
   };
 }
 
+async function initAdminSettings() {
+  const root = document.getElementById('admin-users');
+  const renderUsers = async () => {
+    const d = await API('/api/admin/users');
+    root.innerHTML = `<div style="overflow:auto"><table class="tbl"><thead><tr><th>名称</th><th>用户名</th><th>角色</th><th>复习记录</th><th>账号 ID</th><th>操作</th></tr></thead><tbody>${(d.users || []).map(u => `<tr data-uid="${esc(u.id)}"><td><input class="au-name" value="${esc(u.name)}"></td><td><input class="au-username" value="${esc(u.username)}"></td><td>${esc(u.role)}</td><td>${u.reviews || 0}</td><td><code>${esc(u.id)}</code></td><td><input class="au-password" type="password" placeholder="新密码（留空不改）" autocomplete="new-password"><button class="btn sm au-save">保存</button> ${u.role === 'admin' ? '' : '<button class="btn danger sm au-delete">删除</button>'}</td></tr>`).join('')}</tbody></table></div>`;
+    root.querySelectorAll('.au-save').forEach(btn => btn.onclick = async () => {
+      const tr = btn.closest('tr');
+      try {
+        await POST('/api/admin/account/update', { uid: tr.dataset.uid,
+          name: tr.querySelector('.au-name').value, username: tr.querySelector('.au-username').value,
+          password: tr.querySelector('.au-password').value });
+        tr.querySelector('.au-password').value = '';
+        toast('账号信息已保存');
+        if (tr.dataset.uid === ME.id) { ME.name = tr.querySelector('.au-name').value; ME.username = tr.querySelector('.au-username').value; }
+      } catch (e) { alert('保存失败：' + (e.message || e)); }
+    });
+    root.querySelectorAll('.au-delete').forEach(btn => btn.onclick = async () => {
+      const tr = btn.closest('tr');
+      if (!confirm(`确定删除账号「${tr.querySelector('.au-username').value}」及其全部学习数据？此操作不可撤销。`)) return;
+      try { await POST('/api/admin/account/delete', { uid: tr.dataset.uid }); await renderUsers(); }
+      catch (e) { alert('删除失败：' + (e.message || e)); }
+    });
+  };
+  const refreshBackups = async () => {
+    const d = await API('/api/backup/config');
+    document.getElementById('admin-backup-path').value = d.path || '';
+    const box = document.getElementById('admin-backup-list');
+    box.innerHTML = (d.snapshots || []).length ? `<div style="overflow:auto"><table class="tbl"><thead><tr><th>快照</th><th>时间</th><th>位置</th><th>大小</th><th>操作</th></tr></thead><tbody>${d.snapshots.map(s => `<tr><td><code>${esc(s.name)}</code></td><td>${new Date(s.mtime * 1000).toLocaleString()}</td><td>${esc(s.location || '服务端')}</td><td>${(s.size / 1048576).toFixed(2)} MB</td><td><button class="btn ghost sm bk-download" data-name="${esc(s.name)}">下载到本机</button> <button class="btn ghost sm bk-restore" data-name="${esc(s.name)}">恢复</button></td></tr>`).join('')}</tbody></table></div>` : '<p class="sub">暂无全库快照</p>';
+    box.querySelectorAll('.bk-download').forEach(btn => btn.onclick = () => {
+      location.href = '/api/backup/download?token=' + encodeURIComponent(tok()) + '&name=' + encodeURIComponent(btn.dataset.name);
+    });
+    box.querySelectorAll('.bk-restore').forEach(btn => btn.onclick = async () => {
+      if (!confirm(`将用快照 ${btn.dataset.name} 替换当前全库；恢复前系统会自动保存当前库。继续？`)) return;
+      try { await POST('/api/backup/restore', { name: btn.dataset.name }); alert('全库恢复完成，建议重新登录。'); location.reload(); }
+      catch (e) { alert('恢复失败：' + (e.message || e)); }
+    });
+  };
+  try {
+    await renderUsers(); await refreshBackups();
+    document.getElementById('admin-backup-save').onclick = async () => {
+      try { await POST('/api/backup/config', { path: document.getElementById('admin-backup-path').value }); await refreshBackups(); toast('备份目录已保存'); }
+      catch (e) { alert('保存失败：' + (e.message || e)); }
+    };
+    document.getElementById('admin-backup-now').onclick = async () => {
+      try { await POST('/api/backup/run', {}); await refreshBackups(); toast('全库备份完成'); }
+      catch (e) { alert('备份失败：' + (e.message || e)); }
+    };
+  } catch (e) { root.textContent = '管理员数据加载失败：' + (e.message || e); }
+}
+
 /* ---------- settings ---------- */
 async function viewSettings() {
   const paceD = await API('/api/review/plan').catch(() => null);
@@ -3408,6 +3458,22 @@ async function viewSettings() {
     </div>
     <p class="sub" id="st-bk-tip" style="margin:10px 0 0">备份只含你本人账号的数据，不含密码与他人信息。</p>
   </div>
+  ${(ME && ME.role === 'admin') ? `
+  <div class="card" style="max-width:900px;margin-top:16px">
+    <h2 style="margin-top:0">管理员：账号管理</h2>
+    <p class="sub">可修改名称、用户名和密码。密码留空表示不修改；删除账号会同时删除该账号学习数据。</p>
+    <div id="admin-users">加载中…</div>
+  </div>
+  <div class="card" style="max-width:900px;margin-top:16px">
+    <h2 style="margin-top:0">管理员：全库备份与恢复</h2>
+    <p class="sub">每次服务端快照可同步到运行服务的目录；「下载到本机」会把所选全库快照保存到当前浏览器设备，发布更新前必须先下载并确认文件。</p>
+    <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
+      <label class="fld" style="flex:1;min-width:280px">本地备份目录<input id="admin-backup-path" type="text" placeholder="例如 D:\\kaogong-backups 或 /home/user/kaogong-backups"></label>
+      <button class="btn" id="admin-backup-save">保存目录</button>
+      <button class="btn ok" id="admin-backup-now">立即备份</button>
+    </div>
+    <div id="admin-backup-list" style="margin-top:12px">加载中…</div>
+  </div>` : ''}
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">📤 数据导出</h2>
     <p class="sub" style="margin:0 0 12px">将错题本 / 笔记导出为 Markdown 文件，可粘贴到 Obsidian、Notion 等笔记软件。导出内容仅含当前账号数据。</p>
@@ -3473,6 +3539,7 @@ async function viewSettings() {
     nfb.className = 'btn ' + (on ? 'ok' : 'ghost');
   };
   syncNavFit(); nfb.onclick = () => { setNavFit(!isNavFit()); syncNavFit(); };
+  if (ME && ME.role === 'admin') initAdminSettings();
   try { renderTeacherBox(); } catch (e) { }   // 陪伴者督导：读我已绑定的陪伴者
   API('/api/streak').then(s => {
     document.getElementById('st-goal').value = s.goal;

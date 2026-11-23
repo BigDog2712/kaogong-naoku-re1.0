@@ -80,7 +80,8 @@ def _snapshot_user_db(force=False, tag=""):
             if (os.path.getsize(latest) == os.path.getsize(USERS_DB_PATH)
                     and os.path.getmtime(USERS_DB_PATH) <= os.path.getmtime(latest)):
                 return None
-        name = "users-%s%s.db" % (datetime.datetime.now().strftime("%Y%m%d-%H%M%S"), tag)
+        stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        name = "users-%s%s.db" % (stamp, tag)
         dst = os.path.join(BACKUP_DIR, name)
         src = sqlite3.connect(USERS_DB_PATH, timeout=10)
         try:
@@ -97,6 +98,22 @@ def _snapshot_user_db(force=False, tag=""):
             except Exception:
                 pass
         print(f"[backup] 用户库快照: {dst}")
+        local_path = get_setting("backup_local_path", "")
+        if local_path:
+            try:
+                os.makedirs(local_path, exist_ok=True)
+                local_dst = os.path.join(local_path, name)
+                local_db = sqlite3.connect(local_dst)
+                try:
+                    check_src = sqlite3.connect(dst, timeout=10)
+                    with local_db:
+                        check_src.backup(local_db)
+                    check_src.close()
+                finally:
+                    local_db.close()
+                print(f"[backup] 本地路径副本: {local_dst}")
+            except Exception as e:
+                print("[backup] 本地路径副本失败:", e)
         return dst
     except Exception as e:
         print("[backup] 快照失败:", e)
@@ -220,6 +237,10 @@ class Unauthorized(Exception):
     """未登录 / token 失效。由 do_GET / do_POST 统一捕获并返回 401。"""
 
 
+class Forbidden(Exception):
+    """已登录但无权限（如非管理员调用管理员接口）。统一捕获并返回 403。"""
+
+
 def auth_uid(token):
     """由 token 反查账号 id；无效或缺失返回 None。
     注意：绝不采信客户端传来的 u= 参数，避免越权访问他人数据。
@@ -255,6 +276,20 @@ def is_teacher_token(token):
     """历史接口保留：陪伴者不再只读，此函数仅供旧调用点判断，不再用于拦截。"""
     uid = auth_uid(token)
     return bool(uid) and user_role(uid) == "teacher"
+
+
+def is_admin(uid):
+    """是否为管理员账号（role='admin'）。管理员在普通功能之外，额外拥有
+    查看并管理其它账号（改名称/用户名/密码、删除）的权限。"""
+    return bool(uid) and user_role(uid) == "admin"
+
+
+def need_admin(token):
+    """解析 token → 管理员账号 id；非管理员抛 Forbidden（上层转 403）。"""
+    uid = need_uid(token)
+    if not is_admin(uid):
+        raise Forbidden()
+    return uid
 
 
 def link_ok(a, b):
@@ -689,9 +724,166 @@ def ensure_tables():
     CREATE INDEX IF NOT EXISTS idx_cloud_rev ON cloud_reviews(uid);
     """)
 
+
+# ---------- 管理员基线：一次性清空所有账号，仅保留 admin/123456 ----------
+# 需求：初始化时清空当前所有账号，仅新增管理员账号（用户名 admin / 密码 123456）。
+# 关键约束（防止其它 agent 误操作导致线上数据被清）：
+#   · 幂等 & 一次性：用 settings 里的标志位 `admin_baseline_done` 记录已执行，之后永不再清；
+#   · 可逆：清空前强制对用户库做一份带标签的快照（data/backups/users-*-prebaseline.db），
+#     万一是误触发，也能从快照恢复；
+#   · 可关闭：设环境变量 KAOGONG_SKIP_BASELINE=1 可整段跳过（迁移/排障时用）。
+# 若后续需要「再次强制重置为仅 admin」，请显式设 KAOGONG_FORCE_BASELINE=1 启动一次。
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "123456"
+_USER_SCOPED_TABLES_UID = ("study_time", "discarded", "user_settings", "sessions",
+                           "practice_items", "practice_groups")
+_USER_SCOPED_TABLES_USERID = ("srs", "reviews", "notes", "favorites",
+                              "doubt_status", "exam_history")
+
+
+def _wipe_all_accounts():
+    """清空所有账号及其全部业务数据（题库 kaogong.db 只读、完全不动）。"""
+    c = db()
+    for t in _USER_SCOPED_TABLES_USERID:
+        try:
+            c.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+    for t in _USER_SCOPED_TABLES_UID:
+        try:
+            c.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+    for t in ("teacher_links", "pushed_questions", "encouragements",
+              "cloud_accounts", "cloud_meta", "cloud_srs", "cloud_reviews",
+              "cloud_notes", "cloud_favorites", "cloud_doubt_status", "cloud_exam_history"):
+        try:
+            c.execute(f"DELETE FROM {t}")
+        except Exception:
+            pass
+    c.execute("DELETE FROM users")
+
+
+def ensure_admin_baseline():
+    """一次性基线初始化：清空当前所有账号，仅新增管理员账号 admin/123456。
+
+    幂等：只在首次（标志位未写）或显式 KAOGONG_FORCE_BASELINE=1 时执行；
+    其余任何启动都只做「确保 admin 存在且为 admin 角色」的温和补齐，绝不清库。"""
+    if os.environ.get("KAOGONG_SKIP_BASELINE") == "1":
+        return
+    done = get_setting("admin_baseline_done")
+    force = os.environ.get("KAOGONG_FORCE_BASELINE") == "1"
+    existing = q_one("SELECT COUNT(*) n FROM users")
+    # Upgrade safety: an unmarked but populated legacy DB is not a fresh install.
+    # Preserve its accounts and records; only add admin and mark baseline complete.
+    if not done and not force and existing and existing["n"] > 0:
+        existing_admin = q_one("SELECT id FROM users WHERE IFNULL(role,'student')='admin' LIMIT 1")
+        if not existing_admin:
+            with _LOCK:
+                db().execute(
+                    "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
+                    "VALUES(?,?,?,?,?,?,0,'admin')",
+                    ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
+                     pw_hash(ADMIN_PASSWORD), "", now()))
+                db().commit()
+        else:
+            with _LOCK:
+                db().execute("UPDATE users SET role='admin' WHERE id=?", (existing_admin["id"],))
+                db().commit()
+        with _LOCK:
+            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_baseline_done',?)", (now(),))
+            db().commit()
+        print("[baseline] 检测到已有账号数据，升级安全模式已保留原账号并补建 admin")
+        return
+    if done and not force:
+        # 已初始化过：仅兜底保证 admin 账号存在（被误删时自动重建，不动其它账号）
+        if not q_one("SELECT 1 FROM users WHERE username=?", (ADMIN_USERNAME,)):
+            with _LOCK:
+                db().execute(
+                    "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
+                    "VALUES(?,?,?,?,?,?,0,'admin')",
+                    ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
+                     pw_hash(ADMIN_PASSWORD), "", now()))
+                db().commit()
+            print("[baseline] 检测到 admin 缺失，已重建管理员账号（未触碰其它账号）")
+        else:
+            # 确保既有 admin 账号的角色是 admin（历史数据兜底）
+            with _LOCK:
+                db().execute("UPDATE users SET role='admin' WHERE username=?", (ADMIN_USERNAME,))
+                db().commit()
+        return
+    # 首次 / 强制：清空前必须留一份可恢复快照，失败时绝不清库。
+    snap = _snapshot_user_db(force=True, tag="-prebaseline")
+    if os.path.exists(USERS_DB_PATH) and os.path.getsize(USERS_DB_PATH) > 0 and not snap:
+        raise RuntimeError("管理员基线初始化已取消：无法创建清库前快照")
+    with _LOCK:
+        try:
+            _wipe_all_accounts()
+            db().execute(
+                "INSERT INTO users(id,name,username,pw_hash,token,created,anon,role) "
+                "VALUES(?,?,?,?,?,?,0,'admin')",
+                ("u" + secrets.token_hex(8), "管理员", ADMIN_USERNAME,
+                 pw_hash(ADMIN_PASSWORD), "", now()))
+            db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_baseline_done',?)",
+                         (now(),))
+            db().commit()
+        except Exception:
+            db().rollback()
+            raise
+    print(f"[baseline] 已清空所有账号并重建管理员：{ADMIN_USERNAME}/{ADMIN_PASSWORD}")
+
+
 def get_setting(key, default=None):
     r = q_one("SELECT value FROM settings WHERE key=?", (key,))
     return r["value"] if r else default
+
+
+def _backup_config():
+    raw = get_setting("backup_local_path", "") or ""
+    return {"path": os.path.abspath(os.path.expanduser(raw)) if raw else ""}
+
+
+def _list_user_snapshots():
+    files = []
+    dirs = [BACKUP_DIR]
+    local = _backup_config().get("path")
+    if local and os.path.isdir(local):
+        dirs.append(local)
+    seen = set()
+    for folder in dirs:
+        try:
+            for name in os.listdir(folder):
+                full = os.path.join(folder, name)
+                if name.startswith("users-") and name.endswith(".db") and os.path.isfile(full):
+                    mtime = os.path.getmtime(full)
+                    location = "local" if folder == local else "server"
+                    if name in seen:
+                        for item in files:
+                            if item["name"] == name and location == "local":
+                                item["location"] = "server + local"
+                                break
+                        continue
+                    seen.add(name)
+                    files.append({"name": name, "size": os.path.getsize(full), "mtime": mtime,
+                                  "location": location})
+        except OSError:
+            continue
+    return sorted(files, key=lambda x: x["mtime"], reverse=True)
+
+
+def set_setting(key, value):
+    db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
+
+
+def _delete_account_data(uid):
+    for table, col in (("srs", "user_id"), ("reviews", "user_id"), ("notes", "user_id"),
+                       ("favorites", "user_id"), ("doubt_status", "user_id"), ("exam_history", "user_id"),
+                       ("practice_items", "uid"), ("practice_groups", "uid"), ("study_time", "uid"),
+                       ("discarded", "uid"), ("user_settings", "uid"), ("sessions", "uid")):
+        db().execute("DELETE FROM %s WHERE %s=?" % (table, col), (uid,))
+    db().execute("DELETE FROM teacher_links WHERE teacher_uid=? OR student_uid=?", (uid, uid))
+    db().execute("DELETE FROM pushed_questions WHERE from_uid=? OR to_uid=?", (uid, uid))
+    db().execute("DELETE FROM encouragements WHERE teacher_uid=? OR student_uid=?", (uid, uid))
 
 
 def get_user_setting(uid, key, default=None):
@@ -1104,6 +1296,28 @@ class Handler(BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
+    def _download_file(self, path, filename):
+        """流式下载受保护的数据库快照，避免大用户库被整体读入内存。"""
+        try:
+            size = os.path.getsize(path)
+            stream = open(path, "rb")
+        except OSError:
+            return self._send(404, {"error": "备份文件不存在"})
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Length", str(size))
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % filename)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        if self.command != "HEAD":
+            try:
+                shutil.copyfileobj(stream, self.wfile, 1024 * 1024)
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+        stream.close()
+
     def _file(self, path, cache=True, max_age=86400, revalidate=False):
         """发送磁盘文件；静态资源/图片默认长缓存(强缓存+ETag+304)，
         避免资料分析材料展开时几十张公式图反复向服务端拉取导致卡顿。
@@ -1193,6 +1407,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.api(path, g)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
+            except Forbidden:
+                return self._send(403, {"error": "无权限：仅管理员可执行此操作"})
             except Exception as e:
                 import traceback; traceback.print_exc()
                 return self._send(500, {"error": str(e)})
@@ -1251,6 +1467,12 @@ class Handler(BaseHTTPRequestHandler):
             "/api/auth/upgrade": self.api_auth_upgrade,
             "/api/auth/password": self.api_auth_password,
             "/api/auth/claim": self.api_auth_claim,
+            # 管理员：管理其它账号（改名称/用户名/密码、删除）
+            "/api/admin/account/update": self.api_admin_account_update,
+            "/api/admin/account/delete": self.api_admin_account_delete,
+            "/api/backup/config": self.api_backup_config,
+            "/api/backup/run": self.api_backup_run,
+            "/api/backup/restore": self.api_backup_restore,
         }
         fn = routes.get(path)
         if fn:
@@ -1259,6 +1481,8 @@ class Handler(BaseHTTPRequestHandler):
                 return fn(payload)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
+            except Forbidden:
+                return self._send(403, {"error": "无权限：仅管理员可执行此操作"})
             except Exception as e:
                 import traceback; traceback.print_exc()
                 return self._send(500, {"error": str(e)})
@@ -2024,6 +2248,27 @@ class Handler(BaseHTTPRequestHandler):
             uid = need_uid(g("token"))
             u = q_one("SELECT id,name,username,anon,created FROM users WHERE id=?", (uid,))
             return self._send(200, {"users": [u] if u else [], "me": u, "max": 0})
+        if path == "/api/backup/config":
+            need_admin(g("token"))
+            cfg = _backup_config()
+            return self._send(200, {"ok": True, "path": cfg.get("path", ""),
+                                    "snapshots": _list_user_snapshots()})
+
+        if path == "/api/backup/download":
+            need_admin(g("token"))
+            name = str(g("name") or "")
+            if not name or os.path.basename(name) != name:
+                return self._send(400, {"error": "快照名称无效"})
+            folders = [BACKUP_DIR]
+            local = _backup_config().get("path")
+            if local:
+                folders.append(local)
+            source = next((os.path.join(folder, name) for folder in folders
+                           if os.path.isfile(os.path.join(folder, name))), None)
+            if not source:
+                return self._send(404, {"error": "找不到该快照"})
+            return self._download_file(source, name)
+
         if path == "/api/auth/me":
             uid = auth_uid(g("token"))
             if not uid:
@@ -2033,6 +2278,25 @@ class Handler(BaseHTTPRequestHandler):
             if u:
                 u["role"] = u["role"] or "student"
             return self._send(200, {"ok": True, "user": u})
+
+        # ---------- 管理员：查看所有账号 ----------
+        if path == "/api/admin/users":
+            need_admin(g("token"))
+            rows = q_all("""SELECT id, IFNULL(name,'') name, IFNULL(username,'') username,
+                                   IFNULL(anon,0) anon, IFNULL(role,'student') role,
+                                   IFNULL(created,'') created,
+                                   (pw_hash IS NOT NULL AND pw_hash<>'') has_pw
+                            FROM users ORDER BY (role='admin') DESC, created""")
+            for r in rows:
+                r["anon"] = bool(r["anon"])
+                r["has_pw"] = bool(r["has_pw"])
+                # 每账号的学习量摘要，便于管理员识别账号活跃度（纯读）
+                try:
+                    r["srs"] = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=?", (r["id"],))["n"]
+                    r["reviews"] = q_one("SELECT COUNT(*) n FROM reviews WHERE user_id=?", (r["id"],))["n"]
+                except Exception:
+                    r["srs"] = r["reviews"] = 0
+            return self._send(200, {"ok": True, "users": rows, "count": len(rows)})
 
         # ---------- 功能1：错题本统计 ----------
         if path == "/api/wrongbook/stats":
@@ -2724,6 +2988,106 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True, "name": name})
 
+    def api_admin_account_update(self, p):
+        need_admin(p.get("token"))
+        uid = str(p.get("uid") or "").strip()
+        row = q_one("SELECT id FROM users WHERE id=?", (uid,))
+        if not row:
+            return self._send(404, {"error": "账号不存在"})
+        name = str(p.get("name") or "").strip()[:40]
+        username = str(p.get("username") or "").strip()[:40]
+        password = str(p.get("password") or "")
+        if not name or not username:
+            return self._send(400, {"error": "名称和用户名不能为空"})
+        if password and len(password) < 6:
+            return self._send(400, {"error": "密码至少需要 6 位"})
+        if q_one("SELECT id FROM users WHERE username=? AND id<>?", (username, uid)):
+            return self._send(409, {"error": "用户名已被使用"})
+        with _LOCK:
+            if password:
+                db().execute("UPDATE users SET name=?,username=?,pw_hash=? WHERE id=?",
+                             (name, username, pw_hash(password), uid))
+            else:
+                db().execute("UPDATE users SET name=?,username=? WHERE id=?", (name, username, uid))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_admin_account_delete(self, p):
+        admin_uid = need_admin(p.get("token"))
+        uid = str(p.get("uid") or "").strip()
+        row = q_one("SELECT id,role FROM users WHERE id=?", (uid,))
+        if not row:
+            return self._send(404, {"error": "账号不存在"})
+        if uid == admin_uid:
+            return self._send(400, {"error": "不能删除当前管理员账号"})
+        if row["role"] == "admin" and q_one("SELECT COUNT(*) n FROM users WHERE role='admin'")["n"] <= 1:
+            return self._send(400, {"error": "不能删除最后一个管理员"})
+        with _LOCK:
+            _delete_account_data(uid)
+            db().execute("DELETE FROM users WHERE id=?", (uid,))
+            db().commit()
+        return self._send(200, {"ok": True})
+
+    def api_backup_config(self, p):
+        need_admin(p.get("token"))
+        path = str(p.get("path") or "").strip()
+        if path:
+            path = os.path.abspath(os.path.expanduser(path))
+            data_dir = os.path.abspath(os.path.dirname(USERS_DB_PATH))
+            if path == data_dir or path.startswith(data_dir + os.sep):
+                return self._send(400, {"error": "备份目录不能位于用户库目录内"})
+            try:
+                os.makedirs(path, exist_ok=True)
+                probe = os.path.join(path, ".kaogong-write-test")
+                with open(probe, "wb") as f:
+                    f.write(b"ok")
+                os.remove(probe)
+            except Exception as e:
+                return self._send(400, {"error": "目录不可写：%s" % e})
+        with _LOCK:
+            set_setting("backup_local_path", path)
+            db().commit()
+        if path:
+            _snapshot_user_db(force=True, tag="-local")
+        return self._send(200, {"ok": True, "path": path})
+
+    def api_backup_run(self, p):
+        need_admin(p.get("token"))
+        snap = _snapshot_user_db(force=True)
+        return self._send(200 if snap else 500, {"ok": bool(snap), "path": snap or "",
+                                                  "error": "快照失败" if not snap else ""})
+
+    def api_backup_restore(self, p):
+        need_admin(p.get("token"))
+        name = str(p.get("name") or "")
+        if not name or os.path.basename(name) != name:
+            return self._send(400, {"error": "快照名称无效"})
+        folders = [BACKUP_DIR]
+        local = _backup_config().get("path")
+        if local:
+            folders.append(local)
+        src = next((os.path.join(d, name) for d in folders if os.path.isfile(os.path.join(d, name))), None)
+        if not src:
+            return self._send(404, {"error": "找不到该快照"})
+        try:
+            check = sqlite3.connect("file:%s?mode=ro" % urllib.parse.quote(os.path.abspath(src)), uri=True)
+            valid = check.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            has_users = check.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='users'").fetchone()
+            check.close()
+            if not valid or not has_users:
+                return self._send(400, {"error": "快照校验失败"})
+            safety = _snapshot_user_db(force=True, tag="-prerestore")
+            if not safety:
+                return self._send(500, {"error": "恢复前快照失败，已取消恢复"})
+            with _LOCK:
+                source = sqlite3.connect(src, timeout=10)
+                source.backup(db())
+                db().commit()
+                source.close()
+            return self._send(200, {"ok": True, "restored": name, "safety_snapshot": safety})
+        except Exception as e:
+            return self._send(500, {"error": "恢复失败：%s" % e})
+
     PREFS_KEYS = ("limits", "limitOn", "theme", "fontscale", "focus", "navfit",
                   "answerMode", "readw", "sessionSize", "rmouse", "seen")
 
@@ -3163,6 +3527,7 @@ def main():
     borrow()   # 启动期整段复用一个连接：建表迁移 → 题库校验
     try:
         ensure_tables()
+        ensure_admin_baseline()   # 一次性基线：清空所有账号，仅留 admin/123456（幂等、带可恢复快照）
         q_one("SELECT COUNT(*) n FROM qdb.questions")   # 兜底：ATTACH 缺文件会静默建空库
         _warm()      # 预热题库 → OS 页缓存（新账号播种、出题查询首次都更快）
     except Exception as e:
