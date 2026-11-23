@@ -152,8 +152,8 @@
 不需要安装。确认本机有 Python 3.8 以上版本，然后：
 
 ```bash
-git clone https://github.com/BigDog2712/kaogong-naoku.git
-cd kaogong-naoku
+git clone https://github.com/BigDog2712/kaogong-naoku-re1.0.git
+cd kaogong-naoku-re1.0
 python3 assemble_db.py   # 合并分卷题库，生成 kaogong.db，约 10 秒
 python3 server.py        # 启动
 ```
@@ -191,7 +191,7 @@ python3 parse.py
 
 对助手说：
 
-> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/kaogong-naoku.git /workspace/kaogong-webapp`
+> 帮我克隆这个仓库到工作区：`git clone https://github.com/BigDog2712/kaogong-naoku-re1.0.git /workspace/kaogong-webapp`
 
 也可以把仓库打包成 zip 直接上传。仓库带 340MB 题库和配图，克隆或上传要几分钟，等它跑完。
 
@@ -285,7 +285,7 @@ WorkBuddy 有内置浏览器预览，先自己刷几题确认正常。
 ## 项目结构
 
 ```
-kaogong-naoku/
+kaogong-naoku-re1.0/
 ├─ server.py              HTTP 服务、JSON API、图片服务（Python 标准库）
 ├─ sm2.py                 SM-2 间隔重复算法
 ├─ parse.py               题库 Vault → SQLite 导入器，只产出题库

@@ -1,5 +1,5 @@
-考公脑库 · kaogong-naoku
-https://github.com/BigDog2712/kaogong-naoku
+考公脑库 · kaogong-naoku-re1.0
+https://github.com/BigDog2712/kaogong-naoku-re1.0
 
 本仓库包含两类内容，许可范围不同。下载、部署或再分发之前，请先看清楚自己
 用的是哪一类。
@@ -25,7 +25,7 @@ https://github.com/BigDog2712/kaogong-naoku
 本仓库的修改：
 
   由 BigDog2712 完成，同样以 Apache License 2.0 提供。
-  修改过的文件在文件头标注了 "Modified for kaogong-naoku (re1.0)"，
+  修改过的文件在文件头标注了 "Modified for kaogong-naoku-re1.0"，
   未标注的文件为上游原样保留，未作改动。
 
 再分发时的两条硬性义务（Apache License 2.0 第 4 条）：

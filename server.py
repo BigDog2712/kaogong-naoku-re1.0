@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Modified for kaogong-naoku (re1.0): 基于 jangviktor-web/GongkaoNaoku 修改，
+# Modified for kaogong-naoku-re1.0: 基于 jangviktor-web/GongkaoNaoku 修改，
 # 增加账号数据隔离、管理员全库快照与恢复、公告确认、画笔标注存取接口。
 # 原项目以 Apache License 2.0 授权；题库与配图不在该许可范围内，见 NOTICE。
 """考公间隔重复系统 - 零依赖后端 (Python 标准库)

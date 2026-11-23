@@ -1,4 +1,4 @@
-/* Modified for kaogong-naoku (re1.0): 基于 jangviktor-web/GongkaoNaoku 修改，
+/* Modified for kaogong-naoku-re1.0: 基于 jangviktor-web/GongkaoNaoku 修改，
    增加画笔划线、双击落点写字与文字标注、学习计时、边做边对、公告与备份界面。
    原项目以 Apache License 2.0 授权；题库与配图不在该许可范围内，见 NOTICE。 */
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# Modified for kaogong-naoku (re1.0): 基于 jangviktor-web/GongkaoNaoku 修改，
+# Modified for kaogong-naoku-re1.0: 基于 jangviktor-web/GongkaoNaoku 修改，
 # 重写了间隔曲线与四档评分的映射关系（首学天数、难度系数按档分叉）。
 # 原项目以 Apache License 2.0 授权，见 LICENSE 与 NOTICE。
 """SM-2 间隔重复引擎 (Anki 风格)。四档评分：忘记(1)/困难(3)/一般(4)/熟悉(5)
