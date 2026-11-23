@@ -3092,16 +3092,24 @@ class Handler(BaseHTTPRequestHandler):
         if q_one("SELECT 1 FROM users WHERE username=?", (username,)):
             return self._send(400, {"error": "该用户名已被注册，换一个试试"})
         uid = self._new_uid()
-        # 全新部署（库里的第一个账号）自动成为唯一管理员；之后注册的一律是普通账号。
-        # 程序不会另外造一个 admin 账号，管理员就是真实注册的那个人。
-        first_user = (q_one("SELECT COUNT(*) n FROM users")["n"] == 0)
+        # 注册只建普通账号：管理员绝不会因为「有人注册」而被创建。
+        # 唯一例外是全新空库（既没有任何账号、也没有任何管理员）时的第一个注册者，
+        # 否则新部署将永远没有人能进入管理面板。只要库中已存在管理员账号，
+        # 之后注册的一律是 role='student'，哪怕是第 2 个、第 100 个账号。
         with _LOCK:
+            has_admin = q_one("SELECT 1 FROM users WHERE IFNULL(role,'student')='admin' LIMIT 1") is not None
+            has_any_user = q_one("SELECT 1 FROM users LIMIT 1") is not None
+            make_admin = (not has_admin) and (not has_any_user)
             try:
                 db().execute("INSERT INTO users(id,name,username,pw_hash,token,created,role) VALUES(?,?,?,?,?,?,?)",
                              (uid, name or username, username, pw_hash(pw), "", now(),
-                              "admin" if first_user else "student"))
-                if first_user:
-                    db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_uid',?)", (uid,))
+                              "admin" if make_admin else "student"))
+                if make_admin:
+                    # 并发兜底：同一瞬间两个注册请求都判断为「空库」时，也只允许一个成为管理员
+                    if q_one("SELECT COUNT(*) n FROM users WHERE IFNULL(role,'student')='admin'")["n"] > 1:
+                        db().execute("UPDATE users SET role='student' WHERE id=?", (uid,))
+                    else:
+                        db().execute("INSERT OR REPLACE INTO settings(key,value) VALUES('admin_uid',?)", (uid,))
                 init_user_srs(uid)      # 新账号初始化一套空白进度
                 db().commit()
             except Exception:
