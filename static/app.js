@@ -4,7 +4,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261122c';
+const APP_VER = '20261123a';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -685,6 +685,7 @@ function renderCard() {
   <div class="progress"><div class="pp-main"><span id="pp-txt">第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; ${ppStat}</span>
     <div class="pbar"><i style="width:${doneN / S.queue.length * 100}%"></i></div></div>
     <div class="pp-side">
+      <button class="pp-home" id="pp-home" type="button" title="返回总览：本组进度已保存，回来可继续">⌂ 总览</button>
       <button class="qtimer" id="qtimer" type="button" title="左键单击这里可暂停计时"><span id="qt-icon" aria-hidden="true">⏱</span><b id="qt-now">0:00</b><small>/ <span id="qt-all">0:00</span></small><span class="qt-hint" id="qt-hint"></span></button>
       <div id="ctime-box"></div>
     </div></div>
@@ -719,6 +720,7 @@ function renderCard() {
     <span class="tag">${esc(c.region || '?')} ${esc(c.year || '')}</span>
     <span class="tag" title="${esc(c.kadian)}">${esc((c.kadian || '').split('/').pop().slice(0, 22))}</span>
     <button class="qtool ${S.marked.has(c.id) ? 'on' : ''}" id="t-mark" title="临时标记本题（仅本组有效，便于复盘）">⚑ ${S.marked.has(c.id) ? '已标记' : '标记'}</button>
+    <button class="qtool qtool-drop" id="t-drop" title="丢弃本题：不再出现在练习中，可在「真题浏览 → 已丢弃」里找回">🚫 丢弃</button>
     <a class="linkback" href="#/detail?id=${c.id}">查看完整标注</a>
     ${c.verified ? `<span class="tag vbadge" title="该题答案已经过联网权威来源核实，可信">✅ 已联网复核</span>` : ''}
   </div>
@@ -734,6 +736,12 @@ function renderCard() {
   </div></div>`;
   const qb = document.getElementById('qtimer');
   if (qb) qb.onclick = (e) => { e.preventDefault(); e.stopPropagation(); toggleClockPause(); };
+  // 功能：返回总览（本组进度已随 saveSession 落盘，总览页可「继续上次刷题」）
+  const homeB = document.getElementById('pp-home');
+  if (homeB) homeB.onclick = () => { try { saveSession(); } catch (e) { } location.hash = '#/'; };
+  // 功能：丢弃本题
+  const dropB = document.getElementById('t-drop');
+  if (dropB) dropB.onclick = () => dropCurrent();
   initAnswerDrawing();
   initUnderline();                    // 框选划线：容器就位后把本次答题里的划线复原
   renderOptions();
@@ -1481,7 +1489,24 @@ function renderAct() {
   const S = state.session; const act = document.getElementById('act'); if (!act) return;
   const answerable = !isRev(S);
   if (S.phase === 'question') {
-    if (answerable) act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>`;
+    if (answerable) { act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>`; return; }
+    // 复习模式：掌握程度直接给出来，不用先揭示选项与解析——凭回忆自评完立刻进下一题。
+    // 想核对答案的，再点上面的「🧠 先回忆…」按钮，自评区仍保留（自评以自评为准）。
+    act.innerHTML = `
+      <div class="rev-rate">
+        <div class="rev-rate-head">
+          <b>这道题现在掌握得怎么样？</b>
+          <span class="sub" style="margin:0">不看选项和解析，凭回忆直接自评，选完自动进入下一题</span>
+        </div>
+        <div class="grade">
+          <button class="g-again" data-g="1">忘记<small>1 · again 完全没印象</small></button>
+          <button class="g-hard" data-g="3">困难<small>2 · hard 想起来一点</small></button>
+          <button class="g-good" data-g="4">一般<small>3 · good 基本记得</small></button>
+          <button class="g-easy" data-g="5">熟悉<small>4 · easy 很稳</small></button>
+        </div>
+        <p class="sub rev-rate-tip">也可以按键盘 1 / 2 / 3 / 4 直接自评。要核对答案，点上方「🧠 先回忆，然后点击显示选项与答案」。</p>
+      </div>`;
+    act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
     return;
   }
   const f = S.full;
@@ -1804,6 +1829,46 @@ function nextCard() {
     moreCards().then(() => { ensureGid(S); renderCard(); });
   } else renderCard();
   saveSession();
+}
+
+/* 丢弃本题：服务端记一笔（所有练习模式都不再抽到它），并从本组队列里拿掉。
+   记录保留在「真题浏览 → 已丢弃」里，随时可以恢复。 */
+async function dropCurrent() {
+  const S = state.session;
+  if (!S || !S.queue || !S.queue.length) return;
+  const c = S.queue[S.idx]; if (!c) return;
+  if (S._dropping) return;
+  const left = S.queue.length - 1;
+  const tip = '· 本题不再出现在任何练习里（新题 / 错题重练 / 复习到期都跳过）；\n'
+    + '· 可在「真题浏览 → 已丢弃」中找到并恢复。';
+  if (!confirm(`丢弃第 ${S.idx + 1} 题？\n\n${tip}${left ? '' : '\n\n这是本组最后一题，丢弃后会抽取下一批题。'}`)) return;
+  S._dropping = true;
+  try { await POST('/api/discard', { id: c.id, on: 1 }); }
+  catch (e) { S._dropping = false; toast('丢弃失败：' + (e.message || e)); return; }
+  S._dropping = false;
+  stopLimitTimer();
+  captureInk();
+  S.queue.splice(S.idx, 1);
+  if (S.answers) delete S.answers[c.id];
+  if (S.spent) delete S.spent[c.id];
+  if (S.fulls) delete S.fulls[c.id];
+  if (S.marked) S.marked.delete(c.id);
+  if (!S.queue.length) {           // 整组丢完：收工回总览
+    clearSession();
+    toast('本组已全部丢弃');
+    location.hash = '#/';
+    return;
+  }
+  if (S.idx >= S.queue.length) {   // 丢的是最后一题：按「做完最后一题」继续抽题或收尾
+    S.idx = S.queue.length - 1;
+    saveSession();
+    nextCard();
+    return;
+  }
+  S.phase = 'question'; S.chosen = null; S.full = null; S.graded = 0;
+  renderCard();
+  saveSession();
+  toast('已丢弃 · 可在「真题浏览 → 已丢弃」里找回');
 }
 
 function renderNextBar(auto) {
@@ -2397,6 +2462,11 @@ document.addEventListener('keydown', (e) => {
       if (!answerable && e.key === '0') {
         e.preventDefault(); doReveal(); return;
       }
+      // 复习模式：1/2/3/4 直接自评掌握度，不必先看选项与解析
+      if (!answerable) {
+        const gq = GRADE_BY_KEY[e.key];
+        if (gq) { e.preventDefault(); doGrade(gq); return; }
+      }
       if (answerable && 'ABCD'.includes(e.key.toUpperCase())) {
         const o = S.queue[S.idx].options.find(x => x.key.toUpperCase() === e.key.toUpperCase());
         if (o) { S.chosen = o.key; doReveal(); }
@@ -2426,10 +2496,12 @@ async function viewBrowse(extra) {
   const f = { module: q.get('module') || '', category: q.get('category') || '', kadian: q.get('kadian') || '', region: q.get('region') || '', year: q.get('year') || '', q: q.get('q') || '', only: q.get('only') || '', page: +(q.get('page') || 1) };
   loading('查询中…');
   const [fac, res] = await Promise.all([API('/api/facets'), API('/api/browse?' + buildQ(f))]);
-  const heading = f.only === 'wrong' ? '错题本' : f.only === 'fav' ? '我的收藏' : '真题浏览';
+  const heading = f.only === 'wrong' ? '错题本' : f.only === 'fav' ? '我的收藏'
+    : f.only === 'discarded' ? '已丢弃的题' : '真题浏览';
   const dFrom = f.only === 'wrong' ? '&from=wrong' : f.only === 'fav' ? '&from=fav' : '';   // 详情页可翻上/下一题
   const actionBtn = f.only === 'wrong' ? `<a class="btn ok" href="#" onclick="startSession({mode:'wrong'});return false;">▶ 只练错题</a>`
     : f.only === 'fav' ? `<a class="btn ok" href="#" onclick="startSession({mode:'fav'});return false;">▶ 只练收藏</a>` : '';
+  const droppedN = res.discarded || 0;
   app.innerHTML = `
   <h1>${heading}</h1><p class="sub">共匹配 ${res.total.toLocaleString()} 题 · 点击查看全部深度标注</p>
   <div class="card" style="margin-bottom:16px">
@@ -2446,6 +2518,12 @@ async function viewBrowse(extra) {
     <div id="search-results"></div>
   </div>
   ${actionBtn ? `<div class="row" style="margin-bottom:14px">${actionBtn}</div>` : ''}
+  <div class="row" style="margin-bottom:14px;gap:8px;flex-wrap:wrap">
+    <a class="btn sm ${f.only === 'discarded' ? 'ok' : 'ghost'}" href="#/browse?only=discarded">🚫 已丢弃${droppedN ? ' ' + droppedN : ''}</a>
+    ${f.only === 'discarded'
+      ? `<a class="btn sm ghost" href="#/browse">← 回到全部真题</a><span class="sub" style="margin:0">丢弃的题不会出现在练习里；点「恢复」即可放回抽题池</span>`
+      : `<span class="sub" style="margin:0">练习时不想再做的题，可在题头点「🚫 丢弃」放进来</span>`}
+  </div>
   <div class="card" style="margin-bottom:16px"><div class="filters">
     <label class="fld">模块<select id="b-mod"><option value="">全部</option>
       ${BOOT.modules.map(m => `<option ${f.module === m.module ? 'selected' : ''}>${esc(m.module)}</option>`).join('')}</select></label>
@@ -2466,12 +2544,20 @@ async function viewBrowse(extra) {
       <td data-inline data-label="地区">${esc(r.region)}</td><td data-inline data-label="年份">${esc(r.year)}</td>
       <td data-inline data-label="答" style="color:var(--ok);font-weight:800">${esc(r.answer)}</td>
       <td data-inline data-label="对错"><span style="color:var(--ok)">${r.correct || 0}</span>/<span style="color:var(--bad)">${r.wrong || 0}</span></td>
-      <td data-inline data-label="状态"><span class="tag ${esc(r.status)}">${{ new: '未学', learning: '学习中', review: '复习中' }[r.status] || r.status}</span></td>
+      <td data-inline data-label="状态"><span class="tag ${esc(r.status)}">${{ new: '未学', learning: '学习中', review: '复习中' }[r.status] || r.status}</span>${r.dropped ? ' <span class="tag dropped">🚫 已丢弃</span>' : ''}</td>
       <td data-inline data-label="复习">${r.status === 'new' ? '—' : esc(r.due) + (r.due <= BOOT.today ? ' ⏰' : '')} ${r.interval ? '<span class="tag">' + r.interval + 'd</span>' : ''}</td>
       <td data-inline data-label="">${r.fav ? '★' : ''}</td>
-      <td data-inline data-label=""><a class="linkback" href="#/detail?id=${r.id}${dFrom}">详情</a></td></tr>`).join('')}
+      <td data-inline data-label=""><div class="row" style="gap:10px;justify-content:flex-end"><a class="linkback" href="#/detail?id=${r.id}${dFrom}">详情</a>${f.only === 'discarded' ? `<button class="btn sm ghost row-restore" type="button" data-id="${r.id}">↺ 恢复</button>` : ''}</div></td></tr>`).join('')}
   </tbody></table></div>
   ${pager(res.total, f.page, f)}`;
+  document.querySelectorAll('.row-restore').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try {
+      await POST('/api/discard', { id: +b.dataset.id, on: 0 });
+      toast('已恢复 · 会重新出现在练习里');
+      viewBrowse();
+    } catch (e) { b.disabled = false; toast('恢复失败：' + (e.message || e)); }
+  });
   document.getElementById('b-go').onclick = () => goBrowse({ module: val('b-mod'), category: val('b-cat'), region: val('b-region'), year: val('b-year'), q: val('b-q'), kadian: val('b-kd'), only: f.only, page: 1 });
   document.getElementById('s-search').onclick = runSearch;
   const sq = document.getElementById('s-q');
@@ -2585,11 +2671,13 @@ async function viewDetail(id, from) {
     <span class="tag">${esc(c.region)} ${esc(c.year)}</span>
     <span class="tag ${esc(s ? s.status : 'new')}">${{ new: '未学', learning: '学习中', review: '复习中' }[s ? s.status : 'new'] || ''}</span>
     <span class="tag">下次复习 ${s ? esc(s.due) : '—'}</span>
+    ${d.dropped ? '<span class="tag dropped">🚫 已丢弃</span>' : ''}
   </div>
   <h1 style="font-size:20px">${esc(c.kadian)}</h1>
   <p class="sub">${esc(c.paper || '')}</p>
   <div class="qtools">
     <button class="qtool ${c.fav ? 'on' : ''}" id="d-fav">${c.fav ? '★ 已收藏' : '☆ 收藏'}</button>
+    <button class="qtool ${d.dropped ? 'on' : ''}" id="d-drop" title="丢弃后不再出现在练习中，可随时恢复">${d.dropped ? '↺ 已丢弃 · 点此恢复' : '🚫 丢弃本题'}</button>
     <button class="qtool ${c.doubt_status === 'resolved' ? 'on' : ''}" id="d-doubt">${c.doubt_status === 'resolved' ? '✓ 疑点已复核' : '⚑ 标记疑点已复核'}</button>
     <button class="qtool" id="d-push">📤 推题</button>
   </div>
@@ -2629,6 +2717,19 @@ async function viewDetail(id, from) {
     const text = document.getElementById('d-note').value.trim();
     await POST('/api/note', { id: c.id, text });
     document.getElementById('d-note-saved').textContent = text ? '已保存 ✓' : '已清空笔记';
+  };
+  const ddb = document.getElementById('d-drop');
+  if (ddb) ddb.onclick = async () => {
+    const on = !d.dropped;
+    if (on && !confirm('丢弃后本题不再出现在练习里，可在「真题浏览 → 已丢弃」找回。确定丢弃？')) return;
+    ddb.disabled = true;
+    try { await POST('/api/discard', { id: c.id, on }); }
+    catch (e) { ddb.disabled = false; toast('操作失败：' + (e.message || e)); return; }
+    d.dropped = on;
+    ddb.disabled = false;
+    ddb.classList.toggle('on', on);
+    ddb.textContent = on ? '↺ 已丢弃 · 点此恢复' : '🚫 丢弃本题';
+    toast(on ? '已丢弃 · 可在「真题浏览 → 已丢弃」找回' : '已恢复 · 会重新出现在练习里');
   };
   document.getElementById('d-doubt').onclick = async () => {
     const resolved = c.doubt_status !== 'resolved';
@@ -3142,12 +3243,25 @@ async function viewStats() {
   const start = new Date(todayD); start.setDate(start.getDate() - (N - 1));
   // align start to Sunday
   start.setDate(start.getDate() - start.getDay());
+  // 8 档分级：按「真正练过的那些天」的分位切刀，颜色跟着自己的节奏走，
+  // 不再被固定阈值（1/5/10/20）压成一大片同色——练 3 题和练 19 题也能看出差别。
+  const activeN = heat.days.map(d => d.n).filter(n => n > 0).sort((a, b) => a - b);
+  const qv = p => activeN.length ? activeN[Math.min(activeN.length - 1, Math.max(0, Math.round(p * (activeN.length - 1))))] : 1;
+  const cuts = [1, qv(.15), qv(.30), qv(.43), qv(.55), qv(.68), qv(.80), qv(.92)];   // 8 刀 → 8 档
+  for (let i = 1; i < cuts.length; i++) if (cuts[i] <= cuts[i - 1]) cuts[i] = cuts[i - 1] + 1;
+  const lvOf = n => { let lv = 0; for (const c of cuts) { if (n >= c) lv++; else break; } return Math.min(8, lv); };
+  const WD = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+  const pad2 = n => String(n).padStart(2, '0');
   for (let d = new Date(start); d <= todayD; d.setDate(d.getDate() + 1)) {
-    const key = d.toISOString().slice(0, 10);
+    // 用本地日期做键：toISOString 是 UTC，东八区凌晨会整体错一天
+    const key = `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
     const n = hm[key] || 0;
-    let lv = 0; if (n >= 20) lv = 4; else if (n >= 10) lv = 3; else if (n >= 5) lv = 2; else if (n >= 1) lv = 1;
-    cells.push(`<div class="heat-cell l${lv}" title="${key}: ${n} 题"></div>`);
+    const lv = lvOf(n);
+    const tip = n ? `${key} ${WD[d.getDay()]} · 练了 ${n} 题` : `${key} ${WD[d.getDay()]} · 没练`;
+    cells.push(`<div class="heat-cell l${lv}" title="${tip}" aria-label="${tip}"></div>`);
   }
+  const heatDays = activeN.length, heatMax = activeN.length ? activeN[activeN.length - 1] : 0;
+  const heatTotal = activeN.reduce((a, b) => a + b, 0);
   const goalPct = sk.goal ? Math.min(100, Math.round(sk.today / sk.goal * 100)) : 0;
   const maxAcc = (a) => { const t = (a.c || 0) + (a.w || 0); return t ? Math.round(a.c / t * 100) : 0; };
   app.innerHTML = `
@@ -3176,8 +3290,13 @@ async function viewStats() {
     </div>
   </div>
   <h2>练习热力图（近半年）</h2>
-  <div class="card"><div class="heat-wrap"><div class="heat-grid">${cells.join('')}</div></div>
-    <div class="heat-legend">少 <span class="heat-cell"></span><span class="heat-cell l1"></span><span class="heat-cell l2"></span><span class="heat-cell l3"></span><span class="heat-cell l4"></span> 多</div></div>
+  <div class="card">
+    <div class="heat-sum">${heatDays} 天有练习 · 共 ${heatTotal.toLocaleString()} 题 · 最猛的一天 ${heatMax} 题</div>
+    <div class="heat-wrap"><div class="heat-grid">${cells.join('')}</div></div>
+    <div class="heat-legend">少
+      <span class="heat-cell"></span><span class="heat-cell l1"></span><span class="heat-cell l2"></span><span class="heat-cell l3"></span><span class="heat-cell l4"></span><span class="heat-cell l5"></span><span class="heat-cell l6"></span><span class="heat-cell l7"></span><span class="heat-cell l8"></span>
+      多 <span class="heat-legend-tip">每格一天，颜色越暖表示当天练得越多</span></div>
+  </div>
   <h2>各模块正确率</h2>
   <div class="card">
     ${acc.module.map(a => { const pc = maxAcc(a); return `<div class="acc-row">

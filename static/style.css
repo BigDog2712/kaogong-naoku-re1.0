@@ -63,8 +63,16 @@
   --material-bg:oklch(96.8% 0.014 88);
   --material-fg:var(--ink-2);
   --ask-bg:oklch(96.5% 0.020 260);
-  --heat-0:oklch(94% 0.010 85); --heat-1:oklch(88% 0.045 150); --heat-2:oklch(78% 0.075 152);
-  --heat-3:oklch(66% 0.100 152); --heat-4:oklch(52% 0.098 152);
+  /* 热力图 8 档：青 → 翠 → 黄绿 → 麦黄，明暗两套各自成梯度（越暖 = 当天越多） */
+  --heat-0:oklch(93.5% 0.008 220);
+  --heat-1:oklch(92% 0.045 205);
+  --heat-2:oklch(88% 0.072 192);
+  --heat-3:oklch(83% 0.098 176);
+  --heat-4:oklch(78% 0.118 160);
+  --heat-5:oklch(74% 0.140 145);
+  --heat-6:oklch(74% 0.150 132);
+  --heat-7:oklch(74% 0.170 92);
+  --heat-8:oklch(72% 0.175 78);
 }
 
 /* ===== 答题区宽度档位（PC 可调，避免只在一小条里做题） ===== */
@@ -105,8 +113,15 @@ html[data-theme="dark"]{
   --material-bg:oklch(19.5% 0.016 70);
   --material-fg:var(--ink-2);
   --ask-bg:oklch(22% 0.022 265);
-  --heat-0:oklch(24% 0.012 75); --heat-1:oklch(32% 0.040 152); --heat-2:oklch(42% 0.070 152);
-  --heat-3:oklch(56% 0.090 152); --heat-4:oklch(72% 0.095 152);
+  --heat-0:oklch(25% 0.012 220);
+  --heat-1:oklch(33% 0.046 205);
+  --heat-2:oklch(39% 0.066 190);
+  --heat-3:oklch(46% 0.086 176);
+  --heat-4:oklch(54% 0.102 159);
+  --heat-5:oklch(62% 0.116 144);
+  --heat-6:oklch(70% 0.126 126);
+  --heat-7:oklch(78% 0.140 104);
+  --heat-8:oklch(84% 0.155 82);
 }
 
 *{box-sizing:border-box}
@@ -225,6 +240,8 @@ tr:hover td{background:var(--surface-2)}
 .tag.learning{background:oklch(94% 0.028 72);color:oklch(45% 0.090 62)}
 .tag.review{background:oklch(94% 0.030 152);color:oklch(42% 0.080 152)}
 .tag.vbadge{background:oklch(94% 0.030 152);color:var(--ok)}
+.tag.dropped{background:oklch(94% 0.038 32);color:oklch(47% 0.125 32)}
+html[data-theme="dark"] .tag.dropped{background:oklch(30% 0.055 32);color:oklch(82% 0.095 40)}
 
 /* ===== 练习页：题面是主角 ===== */
 .progress{display:flex;align-items:center;justify-content:space-between;gap:var(--s4);
@@ -276,6 +293,13 @@ tr:hover td{background:var(--surface-2)}
 .qtimer.paused .qt-hint{display:inline}
 .qtimer b{color:var(--ink);font-weight:700}
 .qtimer small{color:var(--ink-3);font-size:11.5px;margin-left:2px}
+/* 练习页：返回总览（与计时器同款胶囊，弱化处理） */
+.pp-home{display:inline-flex;align-items:center;gap:4px;padding:4px 11px;border-radius:var(--radius-pill);
+  background:transparent;border:1px solid var(--rule);color:var(--ink-3);font-family:inherit;
+  font-size:12.5px;line-height:1.4;white-space:nowrap;cursor:pointer;appearance:none;
+  transition:border-color .15s,color .15s,background .15s}
+.pp-home:hover{border-color:var(--brand);color:var(--brand);background:var(--paper-2)}
+.pp-home:active{transform:translateY(.5px)}
 
 /* ===== 移动端悬浮画笔 / 橡皮 ===== */
 .draw-fab{display:none}
@@ -349,6 +373,17 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
 .grade.nextbar .nx-go{flex:0 0 auto;min-width:160px;min-height:48px;font-size:var(--fs-base)}
 .grade.nextbar .nx-go small{display:inline;margin-left:6px;color:inherit;opacity:.6;font-size:11px}
 .grade.nextbar .nx-go:focus-visible{outline:2px solid var(--brand);outline-offset:3px}
+/* 复习模式：不看选项与解析，直接给掌握程度 */
+.rev-rate{margin-top:var(--s6);padding-top:var(--s4);border-top:1px dashed var(--rule);max-width:var(--measure)}
+.rev-rate-head{display:flex;flex-wrap:wrap;align-items:baseline;gap:4px var(--s3)}
+.rev-rate-head b{font-size:15px;font-weight:700;color:inherit}
+.rev-rate .grade{margin-top:var(--s4)}
+.rev-rate-tip{margin-top:10px;font-size:12.5px}
+.answer-sheet .rev-rate{border-top-color:#d9dee2}
+.answer-sheet .rev-rate-head .sub,.answer-sheet .rev-rate-tip{color:#6b757e}
+html[data-theme="dark"] .answer-sheet .rev-rate{border-top-color:#34373b}
+html[data-theme="dark"] .answer-sheet .rev-rate-head .sub,
+html[data-theme="dark"] .answer-sheet .rev-rate-tip{color:#b9bec5}
 .answer-line{font-size:var(--text-base);font-weight:700;margin:var(--s4) 0;letter-spacing:.02em}
 .answer-line.right{color:var(--ok)}.answer-line.wrong{color:var(--bad)}
 .empty{text-align:center;padding:var(--s12) var(--s5);color:var(--ink-3)}
@@ -384,6 +419,13 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
   font-weight:500;transition:.16s var(--ease)}
 .qtool:hover{border-color:var(--brand);color:var(--brand)}
 .qtool.on{background:oklch(95% 0.035 72);border-color:var(--warn);color:oklch(45% 0.090 62)}
+/* 「丢弃本题」：危险动作，用警示色区分于收藏/笔记 */
+.qtool-drop{color:oklch(50% 0.105 32)}
+.qtool-drop:hover{border-color:var(--bad);color:var(--bad)}
+.answer-sheet .qtool-drop{color:#a8402a}
+.answer-sheet .qtool-drop:hover{border-color:#c0392b;color:#c0392b}
+html[data-theme="dark"] .answer-sheet .qtool-drop{color:#e79b86}
+html[data-theme="dark"] .answer-sheet .qtool-drop:hover{border-color:#d9755c;color:#f0b3a2}
 .note-box{margin:var(--s3) 0;background:var(--surface);border:1px solid var(--rule);
   border-radius:var(--radius-sm);padding:var(--s3) var(--s4);max-width:var(--measure)}
 .note-box h4{margin:0 0 var(--s2);font-family:var(--font-serif);font-size:13.5px;color:var(--ink)}
@@ -410,12 +452,19 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
   font-variant-numeric:tabular-nums}
 
 /* ===== 统计 ===== */
+.heat-sum{font-size:12.5px;color:var(--ink-3);margin-bottom:10px}
 .heat-wrap{overflow:auto;padding-bottom:6px}
 .heat-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,13px);gap:3px;width:max-content}
-.heat-cell{width:13px;height:13px;border-radius:2px;background:var(--heat-0)}
+.heat-cell{width:13px;height:13px;border-radius:3px;background:var(--heat-0);
+  transition:transform .12s var(--ease),box-shadow .12s var(--ease)}
 .heat-cell.l1{background:var(--heat-1)}.heat-cell.l2{background:var(--heat-2)}
 .heat-cell.l3{background:var(--heat-3)}.heat-cell.l4{background:var(--heat-4)}
-.heat-legend{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--ink-3);margin-top:var(--s2)}
+.heat-cell.l5{background:var(--heat-5)}.heat-cell.l6{background:var(--heat-6)}
+.heat-cell.l7{background:var(--heat-7)}.heat-cell.l8{background:var(--heat-8)}
+.heat-grid .heat-cell:hover{transform:scale(1.35);box-shadow:0 0 0 1.5px var(--ink-3);position:relative;z-index:2}
+.heat-legend{display:flex;gap:6px;align-items:center;font-size:12px;color:var(--ink-3);margin-top:var(--s2);flex-wrap:wrap}
+.heat-legend .heat-cell{width:12px;height:12px;border-radius:3px}
+.heat-legend-tip{margin-left:6px;opacity:.85}
 .ring-row{display:flex;gap:var(--s6);align-items:center;flex-wrap:wrap}
 .ring{--v:0;width:132px;height:132px;border-radius:50%;flex-shrink:0;
   background:conic-gradient(var(--brand) calc(var(--v)*1%), var(--paper-2) 0);

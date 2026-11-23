@@ -453,6 +453,11 @@ def ensure_tables():
     CREATE TABLE IF NOT EXISTS study_time(
         uid TEXT NOT NULL, day TEXT NOT NULL, ms INTEGER DEFAULT 0,
         PRIMARY KEY(uid, day));
+    -- 丢弃的题：练习题里「我不想再做这道」的题，抽题时全部排除；
+    -- 记录保留在这里，真题浏览的「已丢弃」列表里随时能找回并恢复。
+    CREATE TABLE IF NOT EXISTS discarded(
+        uid TEXT NOT NULL, qid TEXT NOT NULL, ts TEXT,
+        PRIMARY KEY(uid, qid));
     """)
     if not q_one("SELECT value FROM settings WHERE key='daily_goal'"):
         db().execute("INSERT INTO settings(key,value) VALUES('daily_goal','120')")
@@ -610,6 +615,28 @@ def set_user_setting(uid, key, value):
 def resolve_qid(qid_int):
     r = q_one("SELECT qid FROM qdb.questions WHERE id=?", (qid_int,))
     return r["qid"] if r else None
+
+
+def discarded_qids(uid):
+    """当前账号丢弃过的 qid 列表（qid 是纯数字文本）。"""
+    try:
+        return [str(r["qid"]) for r in q_all("SELECT qid FROM discarded WHERE uid=?", (uid,))]
+    except Exception:
+        return []
+
+
+def discard_filter(uid, alias="q"):
+    """抽题时排除丢弃的题。
+
+    qid 全是数字文本，这里直接内联成字面量：省掉占位符与各分支参数顺序的纠缠，
+    也让这段条件可以安全拼进任意一条已有 SQL（cond 是纯字符串拼接）。
+    alias 传空串即用于没有表别名的查询（FROM qdb.questions 直接写 qid）。
+    """
+    ids = [x for x in discarded_qids(uid) if re.fullmatch(r"\d+", x)]
+    if not ids:
+        return ""
+    col = (alias + ".") if alias else ""
+    return " AND %sqid NOT IN (%s)" % (col, ",".join("'%s'" % x for x in ids))
 
 # 练习阶段对题干/材料做答案剧透清洗，避免直接泄露正确选项字母
 _ANS_LEAK_PATTERNS = [
@@ -1101,6 +1128,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/practice/end": self.api_practice_end,
             "/api/note": self.api_note,
             "/api/fav": self.api_fav,
+            "/api/discard": self.api_discard,
             "/api/goal": self.api_goal,
             "/api/pacing": self.api_pacing,
             "/api/doubt": self.api_doubt,
@@ -1607,7 +1635,9 @@ class Handler(BaseHTTPRequestHandler):
             t = today(); uid = need_uid(g("token"))
             learned = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new'", (uid,))["n"]
             total_q = q_total()
-            due_new = max(0, total_q - learned)   # 没进度行的题都算新题，不必预铺行
+            # 丢弃的题不会再被抽到，不能算进「未学新题」的可做池
+            dropped_n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
+            due_new = max(0, total_q - learned - dropped_n)   # 没进度行的题都算新题，不必预铺行
             due_rev = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
             studied_today = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?", (uid, t))["n"]
             # 学习时长（答题 + 看解析，由前端按秒累计后分批上报）
@@ -1629,7 +1659,7 @@ class Handler(BaseHTTPRequestHandler):
                 "new": due_new, "due_review": due_rev, "learned": learned,
                 "studied_today": studied_today, "by_module": by_mod,
                 "due_by_module": due_by_mod, "mastery": buckets,
-                "wrong": wrong_n, "fav": fav_n,
+                "wrong": wrong_n, "fav": fav_n, "discarded": dropped_n,
                 "today_ms": int((st_today or {}).get("ms") or 0),
                 "total_ms": int((st_total or {}).get("s") or 0),
                 "total": total_q,
@@ -1640,6 +1670,9 @@ class Handler(BaseHTTPRequestHandler):
             size = max(1, min(60, _int(g("size"), 10)))
             uid = need_uid(g("token"))
             cond, args = build_where(g("module"), g("category"), g("kadian"))
+            # 丢弃过的题一律不再出现（任何模式：新题 / 错题重练 / 复习到期 / 收藏 / 材料）
+            cond += discard_filter(uid)
+            dcl_raw = discard_filter(uid, "")           # 下面两个分支的 SQL 没有表别名
             year = g("year")
             if year in {str(y) for y in range(2020, 2027)}:
                 cond += " AND q.year=?"
@@ -1661,11 +1694,11 @@ class Handler(BaseHTTPRequestHandler):
                     rows = []
                 else:
                     ph = ",".join("?" * len(ids))
-                    rows = q_all(f"SELECT * FROM qdb.questions WHERE id IN ({ph})", ids)
+                    rows = q_all(f"SELECT * FROM qdb.questions WHERE id IN ({ph}){dcl_raw}", ids)
                     order = {int(x): i for i, x in enumerate(ids)}
                     rows.sort(key=lambda r: order.get(r["id"], 9999))
             elif mode == "material":
-                rows = q_all("SELECT * FROM qdb.questions WHERE material_ref=? ORDER BY id LIMIT ?", (ref, size))
+                rows = q_all(f"SELECT * FROM qdb.questions WHERE material_ref=?{dcl_raw} ORDER BY id LIMIT ?", (ref, size))
             elif mode == "fav":
                 rows = q_all(f"""SELECT q.* {J}
                                 WHERE q.qid IN (SELECT qid FROM favorites WHERE user_id=?){cond}
@@ -1714,19 +1747,24 @@ class Handler(BaseHTTPRequestHandler):
             if not srs:   # 按需生成：直接看某题也补一条空白进度，详情页/收藏才能正常标状态
                 ensure_srs_rows(uid, [r["qid"]])
                 srs = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (r["qid"], uid))
-            return self._send(200, {"card": clean_card(r, reveal=True, uid=uid), "srs": srs})
+            dropped = bool(q_one("SELECT 1 x FROM discarded WHERE uid=? AND qid=?", (uid, r["qid"])))
+            return self._send(200, {"card": clean_card(r, reveal=True, uid=uid), "srs": srs, "dropped": dropped})
 
         if path == "/api/browse":
             page = max(1, _int(g("page"), 1)); size = max(1, min(100, _int(g("size"), 25)))
             uid = need_uid(g("token"))
             cond, args = build_where(g("module"), g("category"), g("kadian"))
             region = g("region"); year = g("year"); kw = g("q")
-            only = g("only")  # wrong | fav | mastered
+            only = g("only")  # wrong | fav | mastered | discarded
             a2, b2 = list(args), list(args)
             if only == "wrong":
                 cond += " AND s.wrong>0 AND IFNULL(s.wb_status,'active')='active'"
             elif only == "mastered":
                 cond += " AND s.wrong>0 AND s.wb_status='cleared'"
+            elif only == "discarded":
+                # 练习题里丢弃的题集中在这里，可随时恢复
+                cond += " AND q.qid IN (SELECT qid FROM discarded WHERE uid=?)"
+                a2.append(uid); b2.append(uid)
             elif only == "fav":
                 cond += " AND q.qid IN (SELECT qid FROM favorites WHERE user_id=?)"
                 a2.append(uid); b2.append(uid)
@@ -1743,14 +1781,18 @@ class Handler(BaseHTTPRequestHandler):
                             IFNULL(s.status,'new') status,s.due,s.interval,
                             IFNULL(s.correct,0) correct,IFNULL(s.wrong,0) wrong,
                             IFNULL(s.wb_status,'active') wb_status,
-                            CASE WHEN f.qid IS NOT NULL THEN 1 ELSE 0 END fav
+                            CASE WHEN f.qid IS NOT NULL THEN 1 ELSE 0 END fav,
+                            CASE WHEN d.qid IS NOT NULL THEN 1 ELSE 0 END dropped
                             FROM qdb.questions q
                             LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
                             LEFT JOIN favorites f ON f.qid=q.qid AND f.user_id=?
+                            LEFT JOIN discarded d ON d.qid=q.qid AND d.uid=?
                             WHERE 1=1{cond}
                             ORDER BY q.module,q.category,q.year DESC LIMIT ? OFFSET ?""",
-                         (uid, uid, *a2, size, (page - 1) * size))
-            return self._send(200, {"total": total, "page": page, "size": size, "rows": rows})
+                         (uid, uid, uid, *a2, size, (page - 1) * size))
+            dropped_n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
+            return self._send(200, {"total": total, "page": page, "size": size,
+                                    "rows": rows, "discarded": dropped_n})
 
         if path == "/api/kadian":
             cond, args = build_where(g("module"), g("category"), "")
@@ -2189,6 +2231,27 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True, "on": on})
 
+    def api_discard(self, p):
+        """丢弃 / 恢复一道题。
+
+        丢弃 = 这题「我不想再做」，抽题时全部模式都排除；记录留着，真题浏览的「已丢弃」
+        列表里能找回来并一键恢复，所以不需要二次确认弹窗之外的保护。
+        """
+        eqid = resolve_qid(int(p.get("id", 0) or 0))
+        if not eqid:
+            return self._send(404, {"error": "no question"})
+        uid = need_uid(p.get("token"))
+        on = bool(p.get("on", 1))
+        with _LOCK:
+            if on:
+                db().execute("INSERT OR REPLACE INTO discarded(uid,qid,ts) VALUES(?,?,?)",
+                             (uid, eqid, now()))
+            else:
+                db().execute("DELETE FROM discarded WHERE uid=? AND qid=?", (uid, eqid))
+            db().commit()
+        n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
+        return self._send(200, {"ok": True, "on": on, "qid": eqid, "total": n})
+
     def api_goal(self, p):
         uid = need_uid(p.get("token"))
         v = max(1, min(500, int(p.get("value", 120) or 120)))
@@ -2517,6 +2580,7 @@ class Handler(BaseHTTPRequestHandler):
             db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
             db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
             n_time = db().execute("DELETE FROM study_time WHERE uid=?", (uid,)).rowcount
+            n_drop = db().execute("DELETE FROM discarded WHERE uid=?", (uid,)).rowcount
             # 偏好里还存着「已做题目缓存」，不清掉的话换设备登录又会被拉回来
             raw = get_user_setting(uid, "prefs")
             if raw:
@@ -2529,7 +2593,8 @@ class Handler(BaseHTTPRequestHandler):
                     set_user_setting(uid, "prefs", json.dumps(pf, ensure_ascii=False))
                     set_user_setting(uid, "prefs_at", now())
             db().commit()
-        return self._send(200, {"ok": True, "srs": n_srs, "reviews": n_rev, "exams": n_exam, "study_time": n_time})
+        return self._send(200, {"ok": True, "srs": n_srs, "reviews": n_rev, "exams": n_exam,
+                                "study_time": n_time, "discarded": n_drop})
 
     # ---------- 陪伴者（只读督导） ----------
     def _student_brief(self, uid, full=False):
@@ -2850,6 +2915,7 @@ class Handler(BaseHTTPRequestHandler):
             db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
             db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
             db().execute("DELETE FROM study_time WHERE uid=?", (uid,))
+            db().execute("DELETE FROM discarded WHERE uid=?", (uid,))
             db().execute("DELETE FROM user_settings WHERE uid=?", (uid,))
             db().execute("DELETE FROM sessions WHERE uid=?", (uid,))
             # 陪伴者关联、陪伴者发布的鼓励、推题记录：账号没了，关联也不该留着
