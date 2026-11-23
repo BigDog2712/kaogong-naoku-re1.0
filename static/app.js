@@ -4,7 +4,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261123a';
+const APP_VER = '20261123b';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -3399,6 +3399,16 @@ async function viewSettings() {
     </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
+    <h2 style="margin-top:0">💾 备份与恢复</h2>
+    <p class="sub" style="margin:0 0 12px">把当前账号的全部学习数据（复习进度、错题、收藏、笔记、弃题、考试记录、学习时长）导出成一个 JSON 文件；换设备、误清空、或换服务器后都能用它一键恢复。服务端同时每 30 分钟自动留一份<b>全库快照</b>，保留最近 20 份。</p>
+    <div class="row">
+      <button class="btn ok" id="st-bk-exp">⬇ 导出完整备份 (.json)</button>
+      <button class="btn ghost" id="st-bk-imp">⬆ 从备份恢复</button>
+      <input type="file" id="st-bk-file" accept=".json,application/json" style="display:none">
+    </div>
+    <p class="sub" id="st-bk-tip" style="margin:10px 0 0">备份只含你本人账号的数据，不含密码与他人信息。</p>
+  </div>
+  <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">📤 数据导出</h2>
     <p class="sub" style="margin:0 0 12px">将错题本 / 笔记导出为 Markdown 文件，可粘贴到 Obsidian、Notion 等笔记软件。导出内容仅含当前账号数据。</p>
     <div class="row">
@@ -3508,6 +3518,40 @@ async function viewSettings() {
     if (!d.text) { alert('当前账号还没有笔记'); return; }
     downloadMd(d.filename, d.text);
   };
+  /* 完整备份：导出 / 恢复（换设备、误清空、换服务器都能救回来） */
+  const bkExp = document.getElementById('st-bk-exp');
+  if (bkExp) bkExp.onclick = async () => {
+    try {
+      const d = await API('/api/export/mydata');
+      const c = d.counts || {};
+      const blob = new Blob([JSON.stringify(d, null, 1)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'kaogong-backup-' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '.json';
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+      const tip = document.getElementById('st-bk-tip');
+      if (tip) tip.textContent = `已导出：进度 ${c.srs || 0} 题 · 复习历史 ${c.reviews || 0} 条 · 笔记 ${c.notes || 0} 条 · 收藏 ${c.favorites || 0} 题`;
+    } catch (e) { alert('导出失败：' + (e.message || e)); }
+  };
+  const bkImp = document.getElementById('st-bk-imp'), bkFile = document.getElementById('st-bk-file');
+  if (bkImp && bkFile) {
+    bkImp.onclick = () => bkFile.click();
+    bkFile.onchange = async () => {
+      const f = bkFile.files && bkFile.files[0]; if (!f) return;
+      try {
+        const data = JSON.parse(await f.text());
+        const c = data.counts || {};
+        if (!confirm(`将把备份合并到当前账号：进度 ${c.srs || 0} 题 · 复习历史 ${c.reviews || 0} 条 · 笔记 ${c.notes || 0} 条。\n同一题以较新的记录为准，不会覆盖更晚的进度。继续？`)) { bkFile.value = ''; return; }
+        const r = await POST('/api/import/mydata', { data });
+        const im = r.imported || {};
+        const tip = document.getElementById('st-bk-tip');
+        if (tip) tip.textContent = `已恢复 ${r.total || 0} 条：进度 ${im.srs || 0} 题 · 历史 ${im.reviews || 0} 条 · 笔记 ${im.notes || 0} 条`;
+        toast('备份已恢复');
+      } catch (e) { alert('恢复失败：' + (e.message || e)); }
+      bkFile.value = '';
+    };
+  }
   const su = document.getElementById('st-user'); if (su) su.textContent = ME ? (ME.name || ME.username) : '未登录';
   const anon = !!(ME && ME.anon);
   if (document.getElementById('st-switch')) document.getElementById('st-switch').onclick = logoutUser;   // 切换账号 = 退出后用另一账号登录

@@ -39,16 +39,77 @@ def _prepare_user_db():
         return
     if os.path.exists(USERS_DB_PATH):
         # 两份并存（历史遗留：data/ 曾被误上传过）：以最近写入的那份为准，
-        # 避免旧快照盖掉正在使用的新库
-        if os.path.exists(legacy) and os.path.getmtime(legacy) > os.path.getmtime(USERS_DB_PATH):
-            shutil.copy2(legacy, USERS_DB_PATH)
-            print(f"[db] 根目录 users.db 更新，已同步到 {USERS_DB_PATH}")
+        # 避免旧快照盖掉正在使用的新库；被淘汰的那份归档到 backups/，
+        # 不再留在项目目录里——否则哪天 data/users.db 被删，它又会"复活"成线上库。
+        if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
+            if os.path.getmtime(legacy) > os.path.getmtime(USERS_DB_PATH):
+                shutil.copy2(legacy, USERS_DB_PATH)
+                print(f"[db] 根目录 users.db 更新，已同步到 {USERS_DB_PATH}")
+            else:
+                try:
+                    bkdir = os.path.join(os.path.dirname(USERS_DB_PATH), "backups")
+                    os.makedirs(bkdir, exist_ok=True)
+                    bk = os.path.join(bkdir, "legacy-%s.db" % datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+                    shutil.move(legacy, bk)
+                    print(f"[db] 已归档历史用户库: {bk}")
+                except Exception as e:
+                    print("[db] 归档历史用户库失败:", e)
         return
     if os.path.exists(legacy) and os.path.getsize(legacy) > 0:
         shutil.copy2(legacy, USERS_DB_PATH)
         print(f"[db] 用户库已迁移到独立数据文件: {USERS_DB_PATH}")
 
 _prepare_user_db()
+
+# ---------- 用户库自动快照：防止再次被「整目录发布」覆盖 ----------
+# 与 data/users.db 同目录的 backups/ 下，按需留最近 20 份；该目录同样不随发布上传，
+# 所以即使线上库被覆盖，也能从快照里找回上一份。
+BACKUP_DIR = os.path.join(os.path.dirname(USERS_DB_PATH), "backups")
+BACKUP_KEEP = 20
+
+def _snapshot_user_db(force=False, tag=""):
+    """给当前用户库做一致性快照（sqlite backup API，不怕并发写）。
+    仅当库内容有变化时才新增，避免每次重启都堆一份一样的文件。"""
+    try:
+        if not os.path.exists(USERS_DB_PATH) or os.path.getsize(USERS_DB_PATH) == 0:
+            return None
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        snaps = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("users-") and f.endswith(".db"))
+        if snaps and not force:
+            latest = os.path.join(BACKUP_DIR, snaps[-1])
+            if (os.path.getsize(latest) == os.path.getsize(USERS_DB_PATH)
+                    and os.path.getmtime(USERS_DB_PATH) <= os.path.getmtime(latest)):
+                return None
+        name = "users-%s%s.db" % (datetime.datetime.now().strftime("%Y%m%d-%H%M%S"), tag)
+        dst = os.path.join(BACKUP_DIR, name)
+        src = sqlite3.connect(USERS_DB_PATH, timeout=10)
+        try:
+            out = sqlite3.connect(dst)
+            with out:
+                src.backup(out)
+            out.close()
+        finally:
+            src.close()
+        snaps = sorted(f for f in os.listdir(BACKUP_DIR) if f.startswith("users-") and f.endswith(".db"))
+        for old in snaps[:-BACKUP_KEEP]:
+            try:
+                os.remove(os.path.join(BACKUP_DIR, old))
+            except Exception:
+                pass
+        print(f"[backup] 用户库快照: {dst}")
+        return dst
+    except Exception as e:
+        print("[backup] 快照失败:", e)
+        return None
+
+def _backup_loop():
+    """每 30 分钟检查一次，有变化就留一份快照（进程内后台线程）。"""
+    while True:
+        time.sleep(1800)
+        _snapshot_user_db()
+
+_snapshot_user_db()   # 启动即留一份
+
 # 图片优先读本目录内的自包含副本（WebP），没有再回退到原题库
 _LOCAL_IMG = os.path.join(HERE, "90-图片")
 IMG_ROOT = _LOCAL_IMG if os.path.isdir(_LOCAL_IMG) else os.path.join(VAULT_ROOT, "90-图片")
@@ -1160,6 +1221,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/note": self.api_note,
             "/api/fav": self.api_fav,
             "/api/discard": self.api_discard,
+            "/api/import/mydata": self.api_import_mydata,
             "/api/goal": self.api_goal,
             "/api/pacing": self.api_pacing,
             "/api/doubt": self.api_doubt,
@@ -1274,6 +1336,9 @@ class Handler(BaseHTTPRequestHandler):
             unborrow()
 
     def api(self, path, g):
+        # 完整数据备份（导出）
+        if path == "/api/export/mydata":
+            return self.api_export_mydata({"token": g("token")})
         if path == "/api/bootstrap":
             mods = q_all("SELECT module, COUNT(*) n FROM qdb.questions GROUP BY module ORDER BY n DESC")
             cats = q_all("SELECT module, category, COUNT(*) n FROM qdb.questions GROUP BY module,category ORDER BY n DESC")
@@ -2283,6 +2348,138 @@ class Handler(BaseHTTPRequestHandler):
         n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
         return self._send(200, {"ok": True, "on": on, "qid": eqid, "total": n})
 
+    # ---------- 完整学习数据备份（JSON 导出 / 导入恢复） ----------
+    def api_export_mydata(self, p):
+        uid = need_uid(p.get("token"))
+        out = {"format": "kaogong-backup-v1", "exported": now(),
+               "srs": [], "reviews": [], "notes": [], "favorites": [],
+               "doubt": [], "discarded": [], "exam": [], "study_time": [], "errors": []}
+        try:
+            u = q_one("SELECT id,IFNULL(username,'') username,IFNULL(name,'') name FROM users WHERE id=?", (uid,))
+            out["user"] = dict(u) if u else {"id": uid}
+        except Exception:
+            out["user"] = {"id": uid}
+
+        def dump(key, sql):
+            try:
+                out[key] = [dict(r) for r in q_all(sql, (uid,))]
+            except Exception as e:
+                out["errors"].append("%s: %s" % (key, e))
+
+        dump("srs", "SELECT qid,status,ease,interval,repetitions,lapses,due,last_review,"
+                    "correct,wrong,wb_status,wb_streak,last_choice FROM srs WHERE user_id=?")
+        dump("reviews", "SELECT qid,grade,ts,interval_before,interval_after,ease,timeout "
+                        "FROM reviews WHERE user_id=?")
+        dump("notes", "SELECT qid,text,updated FROM notes WHERE user_id=?")
+        dump("favorites", "SELECT qid,added FROM favorites WHERE user_id=?")
+        dump("doubt", "SELECT qid,status,note,updated FROM doubt_status WHERE user_id=?")
+        dump("exam", "SELECT title,total,correct,score,duration,ts FROM exam_history WHERE user_id=?")
+        dump("discarded", "SELECT qid,ts FROM discarded WHERE uid=?")
+        dump("study_time", "SELECT day,ms FROM study_time WHERE uid=?")
+        out["counts"] = {k: len(out[k]) for k in ("srs", "reviews", "notes", "favorites",
+                                                  "doubt", "discarded", "exam", "study_time")}
+        fn = "kaogong-backup-%s.json" % today().replace("-", "")
+        return self._send(200, out, extra={"Content-Disposition": 'attachment; filename="%s"' % fn})
+
+    def api_import_mydata(self, p):
+        """把备份 JSON 合并回当前账号：同一题取更晚的复习状态，计数取较大值，历史去重追加。"""
+        uid = need_uid(p.get("token"))
+        data = p.get("data") or {}
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except Exception:
+                return self._send(400, {"error": "备份内容不是合法 JSON"})
+        if not isinstance(data, dict) or not str(data.get("format", "")).startswith("kaogong-backup"):
+            return self._send(400, {"error": "不是本应用导出的备份文件"})
+        n = {k: 0 for k in ("srs", "reviews", "notes", "favorites", "doubt", "discarded", "exam", "study_time")}
+        cols = ("status", "ease", "interval", "repetitions", "lapses", "due", "last_review",
+                "correct", "wrong", "wb_status", "wb_streak", "last_choice")
+        with _LOCK:
+            c = db()
+            for r in data.get("srs") or []:
+                qid = str(r.get("qid") or "")
+                if not qid:
+                    continue
+                old = c.execute("SELECT correct,wrong,IFNULL(last_review,'') lr FROM srs WHERE qid=? AND user_id=?",
+                                (qid, uid)).fetchone()
+                nr = str(r.get("last_review") or "")
+                if old and str(old["lr"]) > nr:
+                    continue            # 现有进度更新，保留现有
+                vals = [r.get(k) for k in cols]
+                if old:
+                    vals[cols.index("correct")] = max(int(old["correct"] or 0), int(r.get("correct") or 0))
+                    vals[cols.index("wrong")] = max(int(old["wrong"] or 0), int(r.get("wrong") or 0))
+                c.execute("INSERT OR REPLACE INTO srs(qid,user_id,%s) VALUES(?,?,%s)"
+                          % (",".join(cols), ",".join("?" * len(cols))), [qid, uid] + vals)
+                n["srs"] += 1
+            for r in data.get("reviews") or []:
+                qid = str(r.get("qid") or "")
+                if not qid:
+                    continue
+                if c.execute("SELECT 1 FROM reviews WHERE user_id=? AND qid=? AND ts=?",
+                             (uid, qid, r.get("ts"))).fetchone():
+                    continue
+                c.execute("INSERT INTO reviews(qid,user_id,grade,ts,interval_before,interval_after,ease,timeout) "
+                          "VALUES(?,?,?,?,?,?,?,?)",
+                          (qid, uid, r.get("grade"), r.get("ts"), r.get("interval_before"),
+                           r.get("interval_after"), r.get("ease"), r.get("timeout") or 0))
+                n["reviews"] += 1
+            for r in data.get("notes") or []:
+                qid, txt = str(r.get("qid") or ""), (r.get("text") or "")
+                if not qid or not txt.strip():
+                    continue
+                old = c.execute("SELECT IFNULL(updated,'') u FROM notes WHERE qid=? AND user_id=?", (qid, uid)).fetchone()
+                if old and str(old["u"]) > str(r.get("updated") or ""):
+                    continue
+                c.execute("INSERT OR REPLACE INTO notes(qid,user_id,text,updated) VALUES(?,?,?,?)",
+                          (qid, uid, txt, r.get("updated") or now()))
+                n["notes"] += 1
+            for r in data.get("favorites") or []:
+                qid = str(r.get("qid") or "")
+                if not qid:
+                    continue
+                cur = c.execute("INSERT OR IGNORE INTO favorites(qid,user_id,added) VALUES(?,?,?)",
+                                (qid, uid, r.get("added") or now()))
+                n["favorites"] += cur.rowcount
+            for r in data.get("doubt") or []:
+                qid, st = str(r.get("qid") or ""), (r.get("status") or "")
+                if not qid or st not in ("resolved", "open"):
+                    continue
+                c.execute("INSERT OR REPLACE INTO doubt_status(qid,user_id,status,note,updated) VALUES(?,?,?,?,?)",
+                          (qid, uid, st, r.get("note") or "", r.get("updated") or now()))
+                n["doubt"] += 1
+            for r in data.get("discarded") or []:
+                qid = str(r.get("qid") or "")
+                if not qid:
+                    continue
+                cur = c.execute("INSERT OR IGNORE INTO discarded(uid,qid,ts) VALUES(?,?,?)",
+                                (uid, qid, r.get("ts") or now()))
+                n["discarded"] += cur.rowcount
+            for r in data.get("study_time") or []:
+                day = str(r.get("day") or "")
+                if not day:
+                    continue
+                old = c.execute("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, day)).fetchone()
+                ms = max(int(old["ms"] or 0) if old else 0, int(r.get("ms") or 0))
+                c.execute("INSERT OR REPLACE INTO study_time(uid,day,ms) VALUES(?,?,?)", (uid, day, ms))
+                n["study_time"] += 1
+            for r in data.get("exam") or []:
+                if not r.get("ts"):
+                    continue
+                if c.execute("SELECT 1 FROM exam_history WHERE user_id=? AND ts=?", (uid, r["ts"])).fetchone():
+                    continue
+                c.execute("INSERT INTO exam_history(title,total,correct,score,duration,ts,user_id) "
+                          "VALUES(?,?,?,?,?,?,?)",
+                          (r.get("title") or "模拟考试", r.get("total") or 0, r.get("correct") or 0,
+                           r.get("score") or 0, r.get("duration") or 0, r.get("ts"), uid))
+                n["exam"] += 1
+            c.commit()
+        _snapshot_user_db(force=True, tag="-import")
+        return self._send(200, {"ok": True, "imported": n,
+                                "total": sum(n.values()),
+                                "exported_at": data.get("exported") or ""})
+
     def api_goal(self, p):
         uid = need_uid(p.get("token"))
         v = max(1, min(500, int(p.get("value", 120) or 120)))
@@ -2975,6 +3172,8 @@ def main():
         unborrow()
     print(f"[INFO] vault  = {VAULT_ROOT}")
     print(f"[INFO] images = {IMG_ROOT}  exists={os.path.isdir(IMG_ROOT)}")
+    print(f"[INFO] userdb = {USERS_DB_PATH}")
+    threading.Thread(target=_backup_loop, daemon=True).start()   # 每 30 分钟自动快照用户库
     print(f"[INFO] 打开浏览器访问:  http://127.0.0.1:{PORT}")
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     try:
