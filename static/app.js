@@ -697,13 +697,14 @@ function renderCard() {
     </div>
     <button class="btn sm ghost" id="draw-eraser" type="button" aria-pressed="false">橡皮</button>
     <label class="draw-setting" title="橡皮大小（与画笔粗细分开记录）">橡皮大小<input id="draw-erase-size" type="range" min="8" max="72" step="2" value="24"><output id="draw-erase-size-value">24</output></label>
+    <button class="btn sm ghost" id="draw-text" type="button" aria-pressed="false" title="文字标注：点按开启后单击落点；或直接双击答题区">T 文字</button>
     <button class="btn sm ghost" id="draw-undo" type="button" title="撤销">↶</button>
     <button class="btn sm ghost" id="draw-redo" type="button" title="恢复">↷</button>
     <span class="draw-zoom" id="draw-zoom">100%</span>
     <label class="draw-mini" title="PC 端答题区宽度">宽度<select id="draw-width">
       ${READW_ORDER.map(w => `<option value="${w}"${getReadW() === w ? ' selected' : ''}>${READW_LABEL[w]}</option>`).join('')}
     </select></label>
-    <span class="draw-hint" id="draw-hint">框选文字自动划线 · 双击清除 · 右键 画笔/鼠标 · 滚轮 调粗细</span>
+    <span class="draw-hint" id="draw-hint">框选文字自动划线 · 双击写文字 · 右键 画笔/鼠标 · 滚轮 调大小</span>
   </div>
   <div class="draw-fab" id="draw-fab" aria-label="答题画笔">
     <div class="fab-panel" id="fab-panel" hidden></div>
@@ -712,6 +713,9 @@ function renderCard() {
     </button>
     <button class="fab-btn" id="fab-eraser" type="button" aria-pressed="false" aria-label="橡皮：点按切换，长按撤销和回退">
       <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.5 19.5H20"/><path d="M13.8 4.5l5.7 5.7a1.6 1.6 0 0 1 0 2.3l-5.1 5.1a1.6 1.6 0 0 1-2.3 0L6.4 11.9a1.6 1.6 0 0 1 0-2.3l5.1-5.1a1.6 1.6 0 0 1 2.3 0z"/><path d="M9.6 8.7l5.7 5.7"/></svg>
+    </button>
+    <button class="fab-btn" id="fab-text" type="button" aria-pressed="false" aria-label="文字：点按切换，长按调整字号">
+      <svg viewBox="0 0 24 24" width="21" height="21" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 5.6h14"/><path d="M12 5.6v13"/><path d="M9 18.6h6"/></svg>
     </button>
   </div>
   <div class="answer-viewport" id="answer-viewport"><div class="answer-sheet" id="answer-sheet">
@@ -773,8 +777,10 @@ const INK_KEY = 'kg_ink';
 const INK_COLORS = [['#d73535', '红色'], ['#2563eb', '蓝色'], ['#198754', '绿色']];
 const PEN_MIN = 1, PEN_MAX = 8, PEN_DEFAULT = 2;
 const ERASE_MIN = 8, ERASE_MAX = 72, ERASE_DEFAULT = 24;   // 橡皮默认 24px ≈ 旧版的 3 倍
+const TEXT_MIN = 10, TEXT_MAX = 72, TEXT_DEFAULT = 16;     // 标注文字字号（px，画布坐标；默认贴近正文大小）
 const clampPen = v => Math.min(PEN_MAX, Math.max(PEN_MIN, Math.round(+v || PEN_DEFAULT)));
 const clampErase = v => Math.min(ERASE_MAX, Math.max(ERASE_MIN, Math.round((+v || ERASE_DEFAULT) / 2) * 2));
+const clampText = v => Math.min(TEXT_MAX, Math.max(TEXT_MIN, Math.round(+v || TEXT_DEFAULT)));
 function loadInk() {
   try {
     const o = JSON.parse(localStorage.getItem(INK_KEY) || '{}');
@@ -784,8 +790,9 @@ function loadInk() {
       c: INK_COLORS.some(x => x[0].toLowerCase() === c) ? o.c : '#d73535',
       s: clampPen(o.s),
       e: clampErase(o.e),
+      t: clampText(o.t),          // 上次用过的字号：下次双击写字直接沿用它
     };
-  } catch (e) { return { c: '#d73535', s: PEN_DEFAULT, e: ERASE_DEFAULT }; }
+  } catch (e) { return { c: '#d73535', s: PEN_DEFAULT, e: ERASE_DEFAULT, t: TEXT_DEFAULT }; }
 }
 function saveInk(o) { try { localStorage.setItem(INK_KEY, JSON.stringify(o)); } catch (e) { } }
 
@@ -1016,6 +1023,7 @@ function initUnderline() {
   sheet.addEventListener('pointerup', e => {
     const vp = document.getElementById('answer-viewport');
     if (vp && vp.classList.contains('drawing')) return;              // 画笔/橡皮模式不抢框选
+    if (e.target && e.target.closest && e.target.closest('.ink-text-editor')) return;   // 文字框里的拖选不划线
     if (Math.hypot(e.clientX - dx, e.clientY - dy) < 8) return;      // 单击 / 双击不算框选
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount) return;
@@ -1058,6 +1066,7 @@ function initAnswerDrawing() {
   const ctx = canvas.getContext('2d');
   const undo = [], redo = [], pointers = new Map();
   let scale = 1, drawing = false, pinch = null, panPoint = null;
+  let textEdit = null;                                 // 正在编辑的文字标注（同一时刻只允许一个）
   const toggle = document.getElementById('draw-toggle');
   const eraser = document.getElementById('draw-eraser');
   const size = document.getElementById('draw-size');
@@ -1070,14 +1079,16 @@ function initAnswerDrawing() {
   const widthSel = document.getElementById('draw-width');
   const fabPen = document.getElementById('fab-pen');
   const fabEraser = document.getElementById('fab-eraser');
+  const fabText = document.getElementById('fab-text');
+  const textBtn = document.getElementById('draw-text');
   const panel = document.getElementById('fab-panel');
 
   // 画笔状态：颜色 / 粗细 / 当前工具（persist 到本地，下次打开保持）
   const ink = loadInk();
-  let penColor = ink.c, penSize = ink.s, eraseSize = ink.e, tool = 'pen';
+  let penColor = ink.c, penSize = ink.s, eraseSize = ink.e, textSize = ink.t, tool = 'pen';
   const eraseW = () => eraseSize;                      // 橡皮尺寸独立记录，与画笔粗细互不影响
   const strokeW = () => (tool === 'eraser' ? eraseW() : penSize);
-  const saveInkState = () => saveInk({ c: penColor, s: penSize, e: eraseSize });
+  const saveInkState = () => saveInk({ c: penColor, s: penSize, e: eraseSize, t: textSize });
 
   const setPressed = (el, on) => { if (el) el.setAttribute('aria-pressed', String(!!on)); };
   const syncUi = () => {
@@ -1086,6 +1097,9 @@ function initAnswerDrawing() {
     setPressed(eraser, on && tool === 'eraser');
     setPressed(fabPen, on && tool === 'pen');
     setPressed(fabEraser, on && tool === 'eraser');
+    setPressed(textBtn, on && tool === 'text');
+    setPressed(fabText, on && tool === 'text');
+    viewport.classList.toggle('tool-text', on && tool === 'text');
     if (size && +size.value !== penSize) size.value = penSize;
     if (sizeVal) sizeVal.value = penSize;
     if (esize && +esize.value !== eraseSize) esize.value = eraseSize;
@@ -1093,6 +1107,7 @@ function initAnswerDrawing() {
   };
   const setDrawing = (on, nextTool) => {
     if (nextTool) tool = nextTool;
+    if (!on) closeTextEditor(false);                   // 收起画笔顺带把正在写的文字落笔
     viewport.classList.toggle('drawing', on);
     viewport.classList.toggle('zoom-enabled', on);
     if (!on) { pointers.clear(); drawing = false; pinch = null; panPoint = null; ctx.globalCompositeOperation = 'source-over'; }
@@ -1146,6 +1161,10 @@ function initAnswerDrawing() {
     if (viewport.classList.contains('drawing') && tool === 'eraser') setDrawing(false);
     else setDrawing(true, 'eraser');
   };
+  if (textBtn) textBtn.onclick = () => {
+    if (viewport.classList.contains('drawing') && tool === 'text') setDrawing(false);
+    else { setDrawing(true, 'text'); flashHint(`文字 ${textSize}px · 单击落点 · Enter 确认 · 滚轮 调字号`); }
+  };
   if (widthSel) {
     widthSel.value = getReadW();
     widthSel.onchange = () => setReadW(widthSel.value);
@@ -1158,10 +1177,13 @@ function initAnswerDrawing() {
   };
   const bindSwatches = root => {
     (root || document).querySelectorAll('.draw-color-swatch').forEach(btn => {
+      // 正在写文字时点颜色：不要把输入框「点丢」，直接换掉文字颜色（落笔时同色）
+      btn.addEventListener('mousedown', e => { if (textEdit) e.preventDefault(); });
       btn.onclick = () => {
         penColor = btn.dataset.color; saveInkState();
         paintSwatches();
-        if (!viewport.classList.contains('drawing') || tool === 'eraser') setDrawing(true, 'pen');
+        if (textEdit) { textEdit.el.style.color = penColor; return; }
+        if (!viewport.classList.contains('drawing') || tool === 'eraser' || tool === 'text') setDrawing(true, 'pen');
       };
     });
   };
@@ -1179,6 +1201,12 @@ function initAnswerDrawing() {
     if (esize) esize.value = eraseSize;
     if (esizeVal) esizeVal.value = eraseSize;
     saveInkState();
+  };
+  const applyTextSize = v => {
+    textSize = clampText(v);
+    saveInkState();
+    if (textEdit) textEdit.el.style.fontSize = textSize + 'px';
+    syncUi();
   };
   if (size) size.oninput = () => { applySize(size.value); syncUi(); };
   if (esize) esize.oninput = () => { applyErase(esize.value); syncUi(); };
@@ -1205,7 +1233,7 @@ function initAnswerDrawing() {
   if (redoBtn) redoBtn.onclick = doRedo;
   refreshUndoBtns();
 
-  /* 移动端长按浮层：画笔 → 颜色/粗细；橡皮 → 撤销/回退 */
+  /* 移动端长按浮层：画笔 → 颜色/粗细；橡皮 → 撤销/回退；文字 → 字号 */
   let panelKind = '';
   const panelHtml = kind => kind === 'pen'
     ? `<div class="fab-title">画笔 · 颜色与粗细</div>
@@ -1213,6 +1241,13 @@ function initAnswerDrawing() {
          ${INK_COLORS.map(([c, n]) => `<button class="draw-color-swatch${c.toLowerCase() === penColor.toLowerCase() ? ' selected' : ''}" type="button" data-color="${c}" style="background:${c}" aria-label="${n}" title="${n}"></button>`).join('')}
        </div>
        <label class="draw-setting">粗细<input id="fab-size" type="range" min="${PEN_MIN}" max="${PEN_MAX}" value="${penSize}"><output id="fab-size-v">${penSize}</output></label>`
+    : kind === 'text'
+    ? `<div class="fab-title">文字 · 字号</div>
+       <label class="draw-setting">字号<input id="fab-text-size" type="range" min="${TEXT_MIN}" max="${TEXT_MAX}" step="2" value="${textSize}"><output id="fab-text-size-v">${textSize}</output></label>
+       <div class="draw-colors" role="group" aria-label="文字颜色（与画笔同色）">
+         ${INK_COLORS.map(([c, n]) => `<button class="draw-color-swatch${c.toLowerCase() === penColor.toLowerCase() ? ' selected' : ''}" type="button" data-color="${c}" style="background:${c}" aria-label="${n}" title="${n}"></button>`).join('')}
+       </div>
+       <p class="sub" style="margin:0">点按答题区落点写字，颜色与画笔一致，字号默认沿用上一次</p>`
     : `<div class="fab-title">橡皮 · 大小与笔迹操作</div>
        <label class="draw-setting">橡皮大小<input id="fab-erase" type="range" min="${ERASE_MIN}" max="${ERASE_MAX}" step="2" value="${eraseSize}"><output id="fab-erase-v">${eraseSize}</output></label>
        <div class="fab-row">
@@ -1236,6 +1271,10 @@ function initAnswerDrawing() {
       bindSwatches(panel); paintSwatches();
       const fs = document.getElementById('fab-size'), fv = document.getElementById('fab-size-v');
       if (fs) fs.oninput = () => { applySize(fs.value); if (fv) fv.value = penSize; };
+    } else if (kind === 'text') {
+      bindSwatches(panel); paintSwatches();
+      const ts = document.getElementById('fab-text-size'), tv = document.getElementById('fab-text-size-v');
+      if (ts) ts.oninput = () => { applyTextSize(ts.value); if (tv) tv.value = textSize; };
     } else {
       const u = document.getElementById('fab-undo'), r = document.getElementById('fab-redo');
       if (u) u.onclick = doUndo;
@@ -1273,6 +1312,9 @@ function initAnswerDrawing() {
   bindHold(fabEraser,
     () => { if (viewport.classList.contains('drawing') && tool === 'eraser') setDrawing(false); else setDrawing(true, 'eraser'); },
     () => { setDrawing(true, 'eraser'); openPanel('eraser'); });
+  bindHold(fabText,
+    () => { if (viewport.classList.contains('drawing') && tool === 'text') setDrawing(false); else setDrawing(true, 'text'); },
+    () => { setDrawing(true, 'text'); openPanel('text'); });
 
   /* 绘制 */
   const point = e => { const r = canvas.getBoundingClientRect(); return { x: (e.clientX - r.left) * canvas.width / r.width, y: (e.clientY - r.top) * canvas.height / r.height }; };
@@ -1281,11 +1323,119 @@ function initAnswerDrawing() {
     if (undo.length > 30) undo.shift();
     redo.length = 0; refreshUndoBtns();
   };
-  const paint = p => { ctx.lineTo(p.x, p.y); ctx.stroke(); };
+  let lastStrokeTs = 0, strokeLive = false;
+  const paint = p => { ctx.lineTo(p.x, p.y); ctx.stroke(); lastStrokeTs = Date.now(); };
+
+  /* ---------- 文字标注 ----------
+     左键双击答题区（或「T 文字」后单击）在落点唤出一个带光标的输入框；
+     字号跟画笔一样记在本地，下次默认沿用上一次的大小；编辑时滚轮直接调字号；
+     文字颜色始终跟随当前画笔颜色，确认（Enter / 点别处）后真正画进画布，可撤销。 */
+  const inkFont = () => `600 ${textSize}px ${getComputedStyle(sheet).fontFamily || 'system-ui,sans-serif'}`;
+  const wrapInkText = (txt, x) => {
+    const limit = Math.max(60, sheet.clientWidth - 8 - x);     // 写到纸边自动折行，别画到画布外面
+    const out = [];
+    String(txt).split('\n').forEach(par => {
+      let line = '';
+      for (const ch of par) {
+        const test = line + ch;
+        if (line && ctx.measureText(test).width > limit) { out.push(line); line = ch === ' ' ? '' : ch; }
+        else line = test;
+      }
+      out.push(line);
+    });
+    return out;
+  };
+  const drawInkText = (txt, x, y) => {
+    ctx.save();
+    ctx.globalCompositeOperation = 'source-over';
+    ctx.fillStyle = penColor;
+    ctx.textBaseline = 'top';
+    ctx.font = inkFont();
+    const lh = Math.round(textSize * 1.35);
+    wrapInkText(txt, x).forEach((line, i) => { if (line) ctx.fillText(line, x, y + i * lh); });
+    ctx.restore();
+    inked = true; kgMarkInk();
+  };
+
+  function closeTextEditor(cancel) {
+    const cur = textEdit;
+    if (!cur) return;
+    textEdit = null;
+    const raw = String(cur.el.innerText || '').replace(/\u200b/g, '').replace(/\r/g, '');
+    const txt = raw.split('\n').map(s => s.replace(/[ \t]+$/g, '')).join('\n').replace(/^\n+|\n+$/g, '');
+    try { cur.el.remove(); } catch (e) { }
+    viewport.classList.remove('text-editing');
+    if (cancel || !txt.trim()) return;
+    snapshot();
+    drawInkText(txt, cur.x, cur.y);
+    captureInk();                        // 立刻落进本题笔迹表，切题 / 刷新都不丢
+    refreshUndoBtns();
+  }
+
+  const openTextEditor = p => {
+    if (!p) return;
+    closeTextEditor(false);              // 上一个框先落笔，别把两段文字叠在一起
+    const r = canvas.getBoundingClientRect();
+    const kx = r.width ? canvas.width / r.width : 1, ky = r.height ? canvas.height / r.height : 1;
+    const el = document.createElement('div');
+    el.className = 'ink-text-editor';
+    el.contentEditable = 'true';
+    el.spellcheck = false;
+    el.setAttribute('role', 'textbox');
+    el.setAttribute('aria-label', '文字标注：输入内容，回车确认，Esc 取消，滚轮调字号');
+    el.style.left = (p.x / kx) + 'px';
+    el.style.top = (p.y / ky) + 'px';
+    el.style.maxWidth = Math.max(48, sheet.clientWidth - (p.x / kx) - 8) + 'px';
+    el.style.fontSize = textSize + 'px';
+    el.style.color = penColor;
+    sheet.appendChild(el);
+    textEdit = { el, x: p.x, y: p.y };
+    viewport.classList.add('text-editing');
+    try { el.focus({ preventScroll: true }); } catch (x) { el.focus(); }
+    el.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); closeTextEditor(true); }
+      else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); closeTextEditor(false); }
+    });
+    el.addEventListener('wheel', e => {          // 滚轮调字号：不缩放页面，记进本地
+      e.preventDefault(); e.stopPropagation();
+      applyTextSize(textSize + (e.deltaY < 0 ? 2 : -2));
+      flashHint(`字号 ${textSize}px · Enter 确认`);
+    }, { passive: false });
+    el.addEventListener('blur', () => closeTextEditor(false));
+    el.addEventListener('paste', e => {          // 只收纯文本，别把外部样式带进画布
+      e.preventDefault();
+      const t = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
+      if (t) { try { document.execCommand('insertText', false, t.replace(/\r/g, '')); } catch (x) { } }
+    });
+    flashHint(`字号 ${textSize}px · Enter 确认 · Esc 取消 · 滚轮 调字号`);
+  };
+
+  /* 左键双击画布落点写字（刚画完一笔时不抢，避免连笔误触） */
+  canvas.addEventListener('dblclick', e => {
+    if (!viewport.classList.contains('drawing')) return;
+    if (Date.now() - lastStrokeTs < 600) return;
+    e.preventDefault();
+    openTextEditor(point(e));
+  });
+  /* 鼠标模式（没开画笔）下双击答题纸空白处也能写字；双击正文/材料仍按浏览器选词处理 */
+  sheet.addEventListener('dblclick', e => {
+    if (viewport.classList.contains('drawing')) return;              // 画笔模式交给画布
+    const t = e.target;
+    if (!t || !t.closest) return;
+    if (t.closest('.ink-text-editor') || t.closest('span.kg-ul')) return;
+    if (t.closest('button, a, input, select, textarea, .opt, .grade, .rev-rate, .qtool')) return;
+    if (t.closest('.stem, .material, .askmodel, .qhead')) return;    // 正文里的双击 = 选词
+    if (!t.closest('.answer-sheet')) return;
+    e.preventDefault();
+    const sel = window.getSelection();
+    if (sel) { try { sel.removeAllRanges(); } catch (x) { } }
+    openTextEditor(point(e));
+  });
 
   /* 工具条提示条：右键快捷操作后短暂反馈 */
   const hintEl = document.getElementById('draw-hint');
-  const HINT_DEFAULT = '框选文字自动划线 · 双击清除 · 右键 画笔/鼠标 · 滚轮 调粗细';
+  const HINT_DEFAULT = '框选文字自动划线 · 双击写文字 · 右键 画笔/鼠标 · 滚轮 调大小';
   let hintTimer = null;
   const flashHint = txt => {
     if (!hintEl) return;
@@ -1331,12 +1481,15 @@ function initAnswerDrawing() {
   viewport.addEventListener('pointerdown', e => {
     if (!viewport.classList.contains('zoom-enabled')) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;   // 右键/中键不落笔
+    if (e.target && e.target.closest && e.target.closest('.ink-text-editor')) return;   // 文字框内点选/挪光标
     if (panel && !panel.hidden) closePanel();
+    if (textEdit) closeTextEditor(false);                      // 点画布别处：先把上一段文字落笔
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) { drawing = false; const a = [...pointers.values()]; pinch = { dist: Math.hypot(a[1].x - a[0].x, a[1].y - a[0].y), scale }; return; }
     // 鼠标在非画笔模式下拖动 = 框选文字（用于自动划线），不要顺带滚动页面
     if (!viewport.classList.contains('drawing')) { if (e.pointerType !== 'mouse') panPoint = { x: e.clientX, y: e.clientY, left: viewport.scrollLeft, top: viewport.scrollTop }; return; }
-    e.preventDefault(); snapshot(); const p = point(e); ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    if (tool === 'text') { e.preventDefault(); openTextEditor(point(e)); return; }   // 文字模式：单击落点写字
+    e.preventDefault(); const p = point(e); strokeLive = false; ctx.beginPath(); ctx.moveTo(p.x, p.y);
     ctx.lineWidth = strokeW(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
     ctx.strokeStyle = penColor;
@@ -1348,11 +1501,15 @@ function initAnswerDrawing() {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) { const a = [...pointers.values()], d = Math.hypot(a[1].x - a[0].x, a[1].y - a[0].y); if (pinch) { const r = viewport.getBoundingClientRect(); setZoom(pinch.scale * d / pinch.dist, (a[0].x + a[1].x) / 2 - r.left, (a[0].y + a[1].y) / 2 - r.top); } return; }
     if (panPoint && !drawing) { viewport.scrollLeft = panPoint.left - (e.clientX - panPoint.x); viewport.scrollTop = panPoint.top - (e.clientY - panPoint.y); return; }
-    if (drawing) { e.preventDefault(); paint(point(e)); }
+    if (drawing) {
+      e.preventDefault();
+      if (!strokeLive) { snapshot(); strokeLive = true; }     // 真正落墨时才记撤销点，双击写字不污染撤销栈
+      paint(point(e));
+    }
   });
   const end = e => {
     pointers.delete(e.pointerId);
-    if (drawing) { ctx.closePath(); ctx.globalCompositeOperation = 'source-over'; drawing = false; kgMarkInk(); }
+    if (drawing) { ctx.closePath(); ctx.globalCompositeOperation = 'source-over'; drawing = false; strokeLive = false; kgMarkInk(); }
     if (!pointers.size) panPoint = null;
     if (pointers.size < 2) pinch = null;
   };
@@ -2439,7 +2596,8 @@ document.addEventListener('keydown', (e) => {
   // 而且选完还会自动跳下一题，看起来完全像「划线把选项选上了」。Ctrl+A / Ctrl+D / Ctrl+1~4 同理。
   if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.keyCode === 229) return;
   const S = state.session;
-  const typing = !!(e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT'));
+  const typing = !!(e.target && (e.target.tagName === 'TEXTAREA' || e.target.tagName === 'INPUT'
+    || e.target.isContentEditable || (e.target.closest && e.target.closest('.ink-text-editor'))));
   // 先答后对复盘页：1/2/3/4 自评记忆强度
   if (!typing && state.gradeCtx) {
     const g = GRADE_BY_KEY[e.key];

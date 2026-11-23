@@ -318,6 +318,17 @@ html[data-theme="dark"] .tag.dropped{background:oklch(30% 0.055 32);color:oklch(
 .answer-sheet .answer-line{padding:10px 0;border-top:1px solid #d9dee2}
 .answer-sheet-content{position:relative;z-index:1}
 .answer-ink{position:absolute;inset:0;width:100%;height:100%;z-index:2;pointer-events:none}
+/* 文字标注输入框：贴在答题纸上，随缩放 / 滚动一起走；颜色 = 当前画笔颜色 */
+.ink-text-editor{position:absolute;z-index:3;min-width:4px;min-height:1.35em;max-width:100%;
+  padding:0 1px;margin:0;border:0;border-radius:3px;background:transparent;
+  outline:1px dashed currentColor;outline-offset:2px;font-weight:600;line-height:1.35;
+  letter-spacing:.01em;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+  caret-color:currentColor;cursor:text;-webkit-user-select:text;user-select:text}
+.ink-text-editor:focus{outline-style:solid}
+@supports (background:color-mix(in srgb,red 10%,transparent)){
+  .ink-text-editor{background:color-mix(in srgb,currentColor 9%,transparent)}
+}
+.answer-viewport.tool-text,.answer-viewport.tool-text .answer-ink{cursor:text}
 .answer-viewport.drawing{cursor:crosshair;touch-action:none}
 .answer-viewport.drawing .answer-ink{pointer-events:auto}
 .answer-sheet .reveal .sec{color:#18212a}
