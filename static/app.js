@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261124a';
+const APP_VER = '20261124c';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -727,7 +727,7 @@ function renderCard() {
   <div class="qhead">
     <span class="tag">${esc(c.module)}/${esc(c.category)}</span>
     <span class="tag">${esc(c.region || '?')} ${esc(c.year || '')}</span>
-    <span class="tag" title="${esc(c.kadian)}">${esc((c.kadian || '').split('/').pop().slice(0, 22))}</span>
+    <span class="tag" title="${esc(c.kadian || c.bank_label || '')}">${esc(((c.kadian || c.bank_label || '')).split('/').pop().slice(0, 22))}</span>
     <button class="qtool ${S.marked.has(c.id) ? 'on' : ''}" id="t-mark" title="临时标记本题（仅本组有效，便于复盘）">⚑ ${S.marked.has(c.id) ? '已标记' : '标记'}</button>
     <button class="qtool qtool-drop" id="t-drop" title="丢弃本题：不再出现在练习中，可在「真题浏览 → 已丢弃」里找回">🚫 丢弃</button>
     <a class="linkback" href="#/detail?id=${c.id}">查看完整标注</a>
@@ -1730,6 +1730,16 @@ function kgMarkInk() {
   window.__kgInkTs = Date.now();
 }
 
+/* 当前选中的文字是否落在输入框 / 笔记框里：那里的选字是编辑行为，
+   不能算「划线」，否则选一段笔记再点选项会被当成误触吞掉。 */
+function kgSelInField() {
+  const sel = window.getSelection();
+  if (!sel || !sel.anchorNode) return false;
+  const n = sel.anchorNode;
+  const el = n.nodeType === 3 ? n.parentNode : n;
+  return !!(el && el.closest && el.closest('textarea, input, [contenteditable="true"], .ink-text-editor'));
+}
+
 /* 本次手势是否「不可信」（拖拽过 / 选过字 / 划过线） */
 function kgSuspect() {
   const g = KG_GEST;
@@ -1741,7 +1751,7 @@ function kgSuspect() {
   // 看着像「没选中文字的正常点击」，实则是选字手势的收尾，拦一次。
   if (g.selTs > (g.selClearedTs || 0) && Date.now() - g.selTs < 900) return true;
   const sel = window.getSelection();
-  if (sel && !sel.isCollapsed && String(sel).trim()) return true;   // 选区还端着
+  if (sel && !sel.isCollapsed && String(sel).trim() && !kgSelInField()) return true;   // 选区还端着
   return false;
 }
 
@@ -1759,7 +1769,7 @@ function initGestureGuard() {
     // 按下瞬间先看一眼选区：浏览器会在 mousedown 的默认动作里把选区折叠掉，
     // 等 click 阶段再查就查不到了，于是「划完线点一下选项」会被误当成作答。
     const s0 = window.getSelection();
-    KG_GEST.hadSel = !!(s0 && !s0.isCollapsed && String(s0).trim());
+    KG_GEST.hadSel = !!(s0 && !s0.isCollapsed && String(s0).trim()) && !kgSelInField();
   };
   const move = (x, y) => {
     if (!KG_GEST.active) return;
@@ -1776,7 +1786,9 @@ function initGestureGuard() {
   // 选区一旦变成「非空」，立刻记时间：这是划线的第一信号，比划线上屏更早
   document.addEventListener('selectionchange', () => {
     const sel = window.getSelection();
-    if (sel && !sel.isCollapsed && String(sel).trim()) KG_GEST.selTs = Date.now();
+    if (!sel || sel.isCollapsed || !String(sel).trim()) return;
+    if (kgSelInField()) return;          // 备注框 / 输入框里的选字是编辑，不是划线
+    KG_GEST.selTs = Date.now();
   });
 }
 
@@ -1841,9 +1853,15 @@ function renderOptions() {
 
 function renderAct() {
   const S = state.session; const act = document.getElementById('act'); if (!act) return;
+  const c = S.queue[S.idx];
   const answerable = !isRev(S);
   if (S.phase === 'question') {
-    if (answerable) { act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>`; return; }
+    if (answerable) {
+      // 笔记常驻：做题时就能看到/补写本题笔记，不用先点按钮
+      act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>${noteBox(c)}`;
+      bindNoteBox(act, c);
+      return;
+    }
     // 复习模式：掌握程度直接给出来，不用先揭示选项与解析——凭回忆自评完立刻进下一题。
     // 想核对答案的，再点上面的「🧠 先回忆…」按钮，自评区仍保留（自评以自评为准）。
     act.innerHTML = `
@@ -1859,8 +1877,9 @@ function renderAct() {
           <button class="g-easy" data-g="5">熟悉<small>4 · easy 很稳</small></button>
         </div>
         <p class="sub rev-rate-tip">也可以按键盘 1 / 2 / 3 / 4 直接自评。要核对答案，点上方「🧠 先回忆，然后点击显示选项与答案」。</p>
-      </div>`;
+      </div>${noteBox(c)}`;
     act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
+    bindNoteBox(act, c);
     return;
   }
   const f = S.full;
@@ -1879,12 +1898,11 @@ function renderAct() {
   act.innerHTML = `
     <div class="qtools">
       <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
-      <button class="qtool" id="t-note">📝 笔记</button>
       <button class="qtool" id="t-detail">🔍 完整标注</button>
       <button class="qtool" id="t-push">📤 推题</button>
     </div>
     ${ansBlock}
-    <div id="note-area"></div>
+    ${noteBox(f)}
     ${answerable ? revealHtml(f) : ''}
     <div class="grade">
       <button class="g-again" data-g="1">忘记<small>1 · again 马上重来</small></button>
@@ -1897,6 +1915,7 @@ function renderAct() {
       : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；自评后自动进入下一题。'}</p>`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
   if (!answerable) bindAnsToggle();
+  bindNoteBox(act, f);            // 笔记常驻：与「完整标注 / 看解析」同一份数据
   document.getElementById('t-fav').onclick = async (e) => {
     const on = !f.fav;
     await POST('/api/fav', { id: c2id(), on });
@@ -1905,7 +1924,6 @@ function renderAct() {
     btn.classList.toggle('on', !!on); btn.textContent = on ? '★ 已收藏' : '☆ 收藏';
     refreshSide();
   };
-  document.getElementById('t-note').onclick = () => toggleNote();
   document.getElementById('t-detail').onclick = () => { location.hash = '#/detail?id=' + c2id(); };
   document.getElementById('t-push').onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
 }
@@ -2006,7 +2024,8 @@ function renderDeferredAct() {
         ${last ? '' : `<button class="btn" id="dq-next">下一题 →</button>`}
         <button class="btn ok" id="dq-submit">✅ 交卷并查看报告</button>
       </div>
-    </div>`;
+    </div>${noteBox(S.queue[S.idx])}`;
+  bindNoteBox(act, S.queue[S.idx]);
   act.querySelectorAll('.exam-dot').forEach(b => b.onclick = () => deferredGoto(+b.dataset.i));
   document.getElementById('dq-prev').onclick = () => deferredGoto(S.idx - 1);
   const nx = document.getElementById('dq-next'); if (nx) nx.onclick = () => deferredGoto(S.idx + 1);
@@ -2113,22 +2132,177 @@ function flushReportGrades(useBeacon) {
   });
 }
 
-function toggleNote() {
-  const area = document.getElementById('note-area'); if (!area) return;
-  if (area.dataset.open === '1') { area.innerHTML = ''; area.dataset.open = '0'; return; }
-  const f = state.session.full;
-  area.dataset.open = '1';
-  area.innerHTML = `<div class="note-box"><h4>📝 我的笔记</h4>
-    <textarea id="note-ta" placeholder="写下你的思路、易错提醒、秒杀技巧…">${esc(f.note || '')}</textarea>
-    <div class="row"><span class="note-saved" id="note-saved">${f.note_updated ? '上次保存 ' + esc(f.note_updated) : ''}</span>
-    <button class="btn sm ok" id="note-save">保存笔记</button></div></div>`;
-  document.getElementById('note-save').onclick = async () => {
-    const text = document.getElementById('note-ta').value.trim();
-    await POST('/api/note', { id: c2id(), text });
-    f.note = text;
-    document.getElementById('note-saved').textContent = text ? '已保存 ✓' : '已清空笔记';
-  };
+/* ---------- 我的笔记（练习 / 看解析 / 完整标注 三处共用同一个模块）----------
+   三处读写的都是服务端 notes 表里同一份数据（按「题 + 账号」存），任一处改动，
+   另外两处重新打开就是最新内容，不需要各自维护。
+
+   没有「保存」按钮：停笔 NOTE_IDLE 毫秒后自动落盘，失焦立刻落盘；
+   切后台 / 关页面时把还没落盘的草稿用 sendBeacon 送出去，不丢字。
+   没落盘的文本放在 NOTE_DRAFT，重渲染 / 切题 / 翻页都不会丢。 */
+const NOTE_DRAFT = Object.create(null);     // 还没写进服务端的文本（按题目 id）
+const NOTE_TIMER = Object.create(null);     // 防抖定时器
+const NOTE_BUSY = Object.create(null);      // 正在保存中
+const NOTE_AGAIN = Object.create(null);     // 保存期间又改了 → 存完再补一笔
+const NOTE_RETRY = Object.create(null);     // 连续失败次数（网络抖动时有限次重试）
+const NOTE_IDLE = 700;                      // 停笔多久算「写完了」
+
+function noteText(card) {
+  if (!card) return '';
+  return (card.id in NOTE_DRAFT) ? NOTE_DRAFT[card.id] : (card.note || '');
 }
+
+/* "2026-11-24T10:32:11" → "11-24 10:32" */
+function noteTime(s) {
+  const t = String(s || '').replace('T', ' ');
+  return t.length >= 16 ? t.slice(5, 16) : t;
+}
+
+function noteSavedTip(card) {
+  return card && card.note_updated ? '已自动保存 · ' + noteTime(card.note_updated) : '输入即自动保存';
+}
+
+function noteBox(card) {
+  if (!card || !card.id) return '';
+  const draft = NOTE_DRAFT[card.id];
+  const dirty = draft !== undefined && draft.trim() !== String(card.note || '').trim();
+  return `<div class="note-box" data-note-id="${card.id}">
+    <h4>📝 我的笔记 <small class="note-auto">自动保存</small></h4>
+    <textarea class="note-ta" rows="3" spellcheck="false"
+      placeholder="写下你的思路、易错提醒、秒杀技巧…（边写边存，不用点保存）">${esc(noteText(card))}</textarea>
+    <div class="row"><span class="note-saved">${esc(dirty ? '自动保存中…' : noteSavedTip(card))}</span></div></div>`;
+}
+
+/* 同一道题在页面上可能有多份笔记框：状态提示与文本都要跟着一起变 */
+function noteSetStatus(id, text) {
+  document.querySelectorAll('.note-box[data-note-id="' + id + '"] .note-saved')
+    .forEach(el => { el.textContent = text; });
+}
+function noteSyncDom(id, text) {
+  document.querySelectorAll('.note-box[data-note-id="' + id + '"] .note-ta')
+    .forEach(ta => { if (ta.value !== text) ta.value = text; });
+}
+
+/* 自动保存后把新内容同步到当前内存里的所有副本（答题队列 / 已揭示的完整卡片 / 报告），
+   这样「练习 → 看解析 → 完整标注」来回切换时不会再出现旧文本。 */
+function syncNoteEverywhere(id, text, updated) {
+  const S = state.session;
+  const hit = x => x && String(x.id) === String(id);
+  const put = o => { if (hit(o)) { o.note = text; o.note_updated = updated || ''; } };
+  if (!S) return;
+  (S.queue || []).forEach(put);
+  put(S.full);
+  if (S.fulls) Object.keys(S.fulls).forEach(k => put(S.fulls[k]));
+  const R = S.report;
+  if (R && R.results) R.results.forEach(r => { put(r.card); put(r.full); });
+}
+
+/* 落盘一道题的笔记。force=true 时内容没变也存一次（失焦 / Ctrl+Enter 用）。 */
+function noteSave(card, force) {
+  if (!card || !card.id) return;
+  const id = card.id;
+  if (NOTE_TIMER[id]) { clearTimeout(NOTE_TIMER[id]); delete NOTE_TIMER[id]; }
+  const pending = (id in NOTE_DRAFT) ? NOTE_DRAFT[id] : String(card.note || '');
+  const text = pending.trim();
+  const base = String(card.note || '').trim();
+  if (NOTE_BUSY[id]) { NOTE_AGAIN[id] = true; return; }     // 上一笔还在飞，存完再补
+  if (!force && text === base) { delete NOTE_DRAFT[id]; noteSetStatus(id, noteSavedTip(card)); return; }
+
+  NOTE_BUSY[id] = true;
+  NOTE_AGAIN[id] = false;
+  noteSetStatus(id, '保存中…');
+  POST('/api/note', { id: card.id, text }).then(r => {
+    NOTE_BUSY[id] = false;
+    NOTE_RETRY[id] = 0;
+    card.note = text;
+    card.note_updated = (r && r.updated) || '';
+    if (NOTE_DRAFT[id] === pending || NOTE_DRAFT[id] === undefined) delete NOTE_DRAFT[id];
+    syncNoteEverywhere(id, text, card.note_updated);
+    noteSetStatus(id, noteSavedTip(card));
+    if (NOTE_AGAIN[id] || (id in NOTE_DRAFT)) noteSave(card);   // 写的时候又改了
+  }).catch(() => {
+    NOTE_BUSY[id] = false;
+    const n = (NOTE_RETRY[id] || 0) + 1;
+    NOTE_RETRY[id] = n;
+    if (n <= 2) {
+      noteSetStatus(id, '暂时没存上 · 文字还在，稍后自动重试');
+      if (!NOTE_TIMER[id]) NOTE_TIMER[id] = setTimeout(() => noteSave(card), 3000 * n);
+    } else {
+      noteSetStatus(id, '暂时没存上 · 文字还在，离开本页时会再试一次');
+    }
+  });
+}
+
+function bindNoteBox(root, card) {
+  if (!root || !card || !card.id) return;
+  root.querySelectorAll('.note-box[data-note-id="' + card.id + '"]').forEach(box => {
+    if (box.dataset.noteBound === '1') return;
+    box.dataset.noteBound = '1';
+    const ta = box.querySelector('.note-ta');
+    if (!ta) return;
+    const schedule = () => {
+      if (NOTE_TIMER[card.id]) clearTimeout(NOTE_TIMER[card.id]);
+      NOTE_TIMER[card.id] = setTimeout(() => noteSave(card), NOTE_IDLE);
+    };
+    ta.addEventListener('input', e => {
+      NOTE_DRAFT[card.id] = ta.value;
+      noteSyncDom(card.id, ta.value);
+      const same = ta.value.trim() === String(card.note || '').trim();
+      noteSetStatus(card.id, same ? noteSavedTip(card) : '自动保存中…');
+      if (e.isComposing) return;      // 拼音还在候选框里，等上屏了再存
+      schedule();
+    });
+    ta.addEventListener('compositionend', schedule);   // 中文输入法上屏
+    ta.addEventListener('blur', () => noteSave(card));      // 切走就算写完，立刻存
+    ta.addEventListener('keydown', e => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); noteSave(card, true); }
+    });
+  });
+}
+
+/* 关页面 / 切到后台：把还没落盘的草稿直接发出去（sendBeacon 在 unload 时也能发）。
+   beacon 读不到返回值，所以本地乐观记下时间戳，免得回到页面时渲染出旧笔记。 */
+function noteStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' +
+    p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+}
+function noteCardOf(id) {
+  const S = state.session;
+  if (!S) return null;
+  const hit = x => x && String(x.id) === String(id);
+  let found = null;
+  (S.queue || []).forEach(c => { if (!found && hit(c)) found = c; });
+  if (!found && hit(S.full)) found = S.full;
+  if (!found && S.fulls) Object.keys(S.fulls).forEach(k => { if (!found && hit(S.fulls[k])) found = S.fulls[k]; });
+  const R = S.report;
+  if (!found && R && R.results) R.results.forEach(r => {
+    if (!found && hit(r.card)) found = r.card;
+    if (!found && hit(r.full)) found = r.full;
+  });
+  return found;
+}
+function noteFlushBeacon() {
+  const tokv = tok();
+  Object.keys(NOTE_DRAFT).forEach(id => {
+    const text = String(NOTE_DRAFT[id] || '').trim();
+    try {
+      if (navigator.sendBeacon) {
+        const blob = new Blob([JSON.stringify({ id: +id, text, token: tokv })], { type: 'application/json' });
+        if (!navigator.sendBeacon('/api/note', blob)) return;   // 队列满 / 发不出去：草稿留着，下次再发
+      } else {
+        POST('/api/note', { id: +id, text }).catch(() => { });
+      }
+      const stamp = text ? noteStamp() : '';
+      const card = noteCardOf(id);
+      if (card) { card.note = text; card.note_updated = stamp; }
+      syncNoteEverywhere(id, text, stamp);
+      delete NOTE_DRAFT[id];
+      noteSetStatus(id, noteSavedTip({ note_updated: stamp }));
+    } catch (e) { }
+  });
+}
+window.addEventListener('pagehide', noteFlushBeacon);
+document.addEventListener('visibilitychange', () => { if (document.hidden) noteFlushBeacon(); });
 
 async function doReveal() {
   const S = state.session, c = S.queue[S.idx];
@@ -2783,6 +2957,7 @@ function analysisPage(rows, filter, pos, ctx) {
         ${GRADE_DEF.map((g, k) => `<button type="button" class="gbtn ${r.rated && r.grade === g.v ? 'on' : ''}" data-g="${g.v}" ${r.rated ? 'disabled' : ''}>${k + 1} ${g.n}</button>`).join('')}
         <span class="g-tip" id="ra-grade-tip">${r.rated ? '已写入复习计划' : `自评后写入复习计划（键盘 1/2/3/4）· 不自评则按「${r.right ? '一般' : '忘记'}」记录`}</span>
       </div>`}
+      ${noteBox(c)}
       ${revealHtml(c)}
     </article>
     <div class="row deferred-nav">
@@ -2806,6 +2981,7 @@ function analysisPage(rows, filter, pos, ctx) {
   };
   const rap = document.querySelector('.ra-push');
   if (rap) rap.onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
+  bindNoteBox(app, c);        // 看解析时直接看到 / 编辑本题笔记（与练习、完整标注同一份）
   // 记忆强度自评：点按钮或按 1/2/3/4
   const gbox = document.getElementById('ra-grade');
   if (gbox) {
@@ -2975,19 +3151,52 @@ document.addEventListener('keydown', (e) => {
 });
 
 /* ---------- browse ---------- */
+/* 题库切换条：全部题库 / 内置真题库 / 各导入题库（导入题库有自己的分类，如「题集」） */
+function bankBarHtml(f) {
+  const banks = BOOT.qbanks || [];
+  const cur = f.bank || '';
+  const link = (bk) => '#/browse?' + buildQ({ bank: bk, only: f.only });
+  const btn = (bk, label, n) => `<a class="btn sm ${cur === bk ? 'ok' : 'ghost'}" href="${link(bk)}">${label}${n !== null && n !== undefined ? ` <span style="opacity:.7">${n.toLocaleString()}</span>` : ''}</a>`;
+  if (!banks.length) return '';
+  return `<div class="row" style="margin-bottom:12px;gap:8px;flex-wrap:wrap;align-items:center">
+    <span class="sub" style="margin:0">题库</span>
+    ${btn('', '全部题库', BOOT.total)}
+    ${btn('builtin', '内置真题库', BOOT.builtin)}
+    ${banks.map(b => btn(b.id, esc(b.name), b.total)).join('')}
+  </div>`;
+}
+
 async function viewBrowse(extra) {
   const q = new URLSearchParams(location.hash.split('?')[1] || '');
-  const f = { module: q.get('module') || '', category: q.get('category') || '', kadian: q.get('kadian') || '', region: q.get('region') || '', year: q.get('year') || '', q: q.get('q') || '', only: q.get('only') || '', page: +(q.get('page') || 1) };
+  const f = {
+    module: q.get('module') || '', category: q.get('category') || '', kadian: q.get('kadian') || '',
+    region: q.get('region') || '', year: q.get('year') || '', q: q.get('q') || '',
+    only: q.get('only') || '', page: +(q.get('page') || 1),
+    bank: q.get('bank') || '', group: q.get('group') || '',
+  };
   loading('查询中…');
   const [fac, res] = await Promise.all([API('/api/facets'), API('/api/browse?' + buildQ(f))]);
+  const banks = BOOT.qbanks || [];
+  const bankView = !!(f.bank && f.bank !== 'builtin');
+  const bankInfo = bankView ? banks.find(b => b.id === f.bank) : null;
   const heading = f.only === 'wrong' ? '错题本' : f.only === 'fav' ? '我的收藏'
-    : f.only === 'discarded' ? '已丢弃的题' : '真题浏览';
+    : f.only === 'discarded' ? '已丢弃的题'
+      : bankInfo ? bankInfo.name : f.bank === 'builtin' ? '真题浏览 · 内置真题库' : '真题浏览';
   const dFrom = f.only === 'wrong' ? '&from=wrong' : f.only === 'fav' ? '&from=fav' : '';   // 详情页可翻上/下一题
   const actionBtn = f.only === 'wrong' ? `<a class="btn ok" href="#" onclick="startSession({mode:'wrong'});return false;">▶ 只练错题</a>`
     : f.only === 'fav' ? `<a class="btn ok" href="#" onclick="startSession({mode:'fav'});return false;">▶ 只练收藏</a>` : '';
   const droppedN = res.discarded || 0;
+  const groupLabel = (bankInfo && bankInfo.group_label) || '分类';
+  const go = () => goBrowse({
+    module: bankView ? '' : val('b-mod'), category: bankView ? '' : val('b-cat'),
+    region: bankView ? '' : val('b-region'), year: bankView ? '' : val('b-year'),
+    q: val('b-q'), kadian: bankView ? '' : val('b-kd'),
+    bank: f.bank, group: bankView ? val('b-group') : '', only: f.only, page: 1,
+  });
   app.innerHTML = `
-  <h1>${heading}</h1><p class="sub">共匹配 ${res.total.toLocaleString()} 题 · 点击查看全部深度标注</p>
+  <h1>${esc(heading)}</h1><p class="sub">共匹配 ${res.total.toLocaleString()} 题 · 点击查看全部深度标注
+    ${bankInfo ? `· 本页按该题库自己的${esc(groupLabel)}分类浏览` : ''}</p>
+  ${bankBarHtml(f)}
   <div class="card" style="margin-bottom:16px">
     <h2 style="margin-top:0">🔍 题干关键词搜题</h2>
     <div class="filters">
@@ -3009,6 +3218,10 @@ async function viewBrowse(extra) {
       : `<span class="sub" style="margin:0">练习时不想再做的题，可在题头点「🚫 丢弃」放进来</span>`}
   </div>
   <div class="card" style="margin-bottom:16px"><div class="filters">
+    ${bankView ? `
+    <label class="fld">${esc(groupLabel)}<select id="b-group"><option value="">全部${esc(groupLabel)}</option>
+      ${((bankInfo && bankInfo.groups) || []).map(g => `<option ${f.group === g.key ? 'selected' : ''} value="${esc(g.key)}">${esc(g.key)}（${g.n}）</option>`).join('')}</select></label>
+    ` : `
     <label class="fld">模块<select id="b-mod"><option value="">全部</option>
       ${BOOT.modules.map(m => `<option ${f.module === m.module ? 'selected' : ''}>${esc(m.module)}</option>`).join('')}</select></label>
     <label class="fld">大类<select id="b-cat"><option value="">全部</option>
@@ -3017,15 +3230,18 @@ async function viewBrowse(extra) {
       ${fac.regions.map(r => `<option ${f.region === r ? 'selected' : ''}>${esc(r)}</option>`).join('')}</select></label>
     <label class="fld">年份<select id="b-year"><option value="">全部</option>
       ${fac.years.map(y => `<option ${f.year === y ? 'selected' : ''}>${esc(y)}</option>`).join('')}</select></label>
-    <label class="fld">考点/题干<input id="b-q" size="18" placeholder="关键字" value="${esc(f.q)}"></label>
-    <label class="fld">考点名<input id="b-kd" size="16" value="${esc(f.kadian)}"></label>
+    <label class="fld">考点名<input id="b-kd" size="16" value="${esc(f.kadian)}"></label>`}
+    <label class="fld">关键词<input id="b-q" size="18" placeholder="关键字" value="${esc(f.q)}"></label>
     <button class="btn" id="b-go">筛选</button>
   </div></div>
   <div class="card tbl-wrap cards" style="padding:0;overflow:auto"><table><thead><tr>
-    <th>考点 / 大类</th><th>地区</th><th>年份</th><th>答</th><th>对错</th><th>状态</th><th>下次复习</th><th>★</th><th></th></tr></thead><tbody>
+    <th>${bankView ? groupLabel + ' / 题号' : '考点 / 大类'}</th>
+    ${bankView ? '' : '<th>地区</th><th>年份</th>'}<th>答</th><th>对错</th><th>状态</th><th>下次复习</th><th>★</th><th></th></tr></thead><tbody>
     ${res.rows.map(r => `<tr>
-      <td data-label="考点"><b>${esc((r.kadian || '').split('/').pop().slice(0, 30))}</b><br><span class="tag">${esc(r.module)}/${esc(r.category)}</span></td>
-      <td data-inline data-label="地区">${esc(r.region)}</td><td data-inline data-label="年份">${esc(r.year)}</td>
+      ${bankView
+      ? `<td data-label="题目"><b>${esc(r.bgroup || '')}${r.bno ? ' · 第 ' + r.bno + ' 题' : ''}</b><br><span class="tag">${esc(r.module)}/${esc(r.category)}</span></td>`
+      : `<td data-label="考点"><b>${esc((r.kadian || '').split('/').pop().slice(0, 30))}</b><br><span class="tag">${esc(r.module)}/${esc(r.category)}</span></td>`}
+      ${bankView ? '' : `<td data-inline data-label="地区">${esc(r.region)}</td><td data-inline data-label="年份">${esc(r.year)}</td>`}
       <td data-inline data-label="答" style="color:var(--ok);font-weight:800">${esc(r.answer)}</td>
       <td data-inline data-label="对错"><span style="color:var(--ok)">${r.correct || 0}</span>/<span style="color:var(--bad)">${r.wrong || 0}</span></td>
       <td data-inline data-label="状态"><span class="tag ${esc(r.status)}">${{ new: '未学', learning: '学习中', review: '复习中' }[r.status] || r.status}</span>${r.dropped ? ' <span class="tag dropped">🚫 已丢弃</span>' : ''}</td>
@@ -3042,7 +3258,7 @@ async function viewBrowse(extra) {
       viewBrowse();
     } catch (e) { b.disabled = false; toast('恢复失败：' + (e.message || e)); }
   });
-  document.getElementById('b-go').onclick = () => goBrowse({ module: val('b-mod'), category: val('b-cat'), region: val('b-region'), year: val('b-year'), q: val('b-q'), kadian: val('b-kd'), only: f.only, page: 1 });
+  document.getElementById('b-go').onclick = go;
   document.getElementById('s-search').onclick = runSearch;
   const sq = document.getElementById('s-q');
   if (sq) sq.addEventListener('keydown', e => { if (e.key === 'Enter') runSearch(); });
@@ -3157,7 +3373,7 @@ async function viewDetail(id, from) {
     <span class="tag">下次复习 ${s ? esc(s.due) : '—'}</span>
     ${d.dropped ? '<span class="tag dropped">🚫 已丢弃</span>' : ''}
   </div>
-  <h1 style="font-size:20px">${esc(c.kadian)}</h1>
+  <h1 style="font-size:20px">${esc(c.kadian || c.bank_label || '')}</h1>
   <p class="sub">${esc(c.paper || '')}</p>
   <div class="qtools">
     <button class="qtool ${c.fav ? 'on' : ''}" id="d-fav">${c.fav ? '★ 已收藏' : '☆ 收藏'}</button>
@@ -3172,10 +3388,7 @@ async function viewDetail(id, from) {
     <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
     ${o.is_answer ? '<span style="color:var(--ok);font-weight:800">✔</span>' : ''}</div>`).join('')}</div>
   <div class="answer-line right">正确答案：${esc(c.answer)}</div>
-  <div class="note-box"><h4>📝 我的笔记</h4>
-    <textarea id="d-note">${esc(c.note || '')}</textarea>
-    <div class="row"><span class="note-saved" id="d-note-saved">${c.note_updated ? '上次保存 ' + esc(c.note_updated) : ''}</span>
-    <button class="btn sm ok" id="d-note-save">保存笔记</button></div></div>
+  ${noteBox(c)}
   <div class="reveal">
     ${c.mother ? `<div class="sec mother"><h4>🧩 母题抽象</h4>${inlineMd(c.mother)}</div>` : ''}
     ${c.reasoning ? `<div class="sec"><h4>🔗 推理链</h4>${inlineMd(c.reasoning)}</div>` : ''}
@@ -3197,11 +3410,7 @@ async function viewDetail(id, from) {
     const on = !c.fav; await POST('/api/fav', { id: c.id, on }); c.fav = on ? 1 : 0;
     const b = document.getElementById('d-fav'); b.classList.toggle('on', !!on); b.textContent = on ? '★ 已收藏' : '☆ 收藏'; refreshSide();
   };
-  document.getElementById('d-note-save').onclick = async () => {
-    const text = document.getElementById('d-note').value.trim();
-    await POST('/api/note', { id: c.id, text });
-    document.getElementById('d-note-saved').textContent = text ? '已保存 ✓' : '已清空笔记';
-  };
+  bindNoteBox(app, c);     // 与「练习 / 看解析」同一份笔记
   const ddb = document.getElementById('d-drop');
   if (ddb) ddb.onclick = async () => {
     const on = !d.dropped;

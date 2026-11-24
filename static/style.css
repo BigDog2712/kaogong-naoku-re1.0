@@ -494,10 +494,14 @@ html[data-theme="dark"] .answer-sheet .qtool-drop{color:#e79b86}
 html[data-theme="dark"] .answer-sheet .qtool-drop:hover{border-color:#d9755c;color:#f0b3a2}
 .note-box{margin:var(--s3) 0;background:var(--surface);border:1px solid var(--rule);
   border-radius:var(--radius-sm);padding:var(--s3) var(--s4);max-width:var(--measure)}
-.note-box h4{margin:0 0 var(--s2);font-family:var(--font-serif);font-size:13.5px;color:var(--ink)}
+.note-box h4{margin:0 0 var(--s2);font-family:var(--font-serif);font-size:13.5px;color:var(--ink);
+  display:flex;align-items:baseline;gap:var(--s2)}
+.note-auto{font-family:var(--font-sans);font-size:11px;font-weight:400;letter-spacing:.02em;
+  color:var(--muted);border:1px solid var(--rule);border-radius:999px;padding:1px 7px}
 .note-box textarea{width:100%;min-height:64px;resize:vertical;font-size:14px}
-.note-box .row{margin-top:var(--s2);justify-content:space-between}
+.note-box .row{margin-top:var(--s2);justify-content:flex-start}
 .note-saved{font-size:12px;color:var(--ok)}
+.note-saved:empty{display:none}
 
 /* ===== 模拟考试 ===== */
 .exam-timer{position:sticky;top:0;z-index:5;background:var(--surface);border:1px solid var(--rule);
@@ -746,6 +750,13 @@ html[data-theme="dark"] .announce-badge{background:color-mix(in oklch,var(--bran
 .answer-sheet .answer-line.right{color:#2f7d4a} .answer-sheet .answer-line.wrong{color:#b23b3b}
 .answer-sheet .reveal .sec h4{color:#18212a}
 .answer-sheet .material{background:#f6f7f8;color:#2b343c;border-color:#d9dee2}
+/* 白卷面里的「我的笔记」：固定浅色配色，暗色主题下也不会变成一块黑底 */
+.answer-sheet .note-box{background:#f7f8f9;border-color:#d9dee2}
+.answer-sheet .note-box h4{color:#18212a}
+.answer-sheet .note-box textarea{background:#fff;color:#1d262e;border-color:#cfd5da}
+.answer-sheet .note-box textarea::placeholder{color:#8b949c}
+.answer-sheet .note-saved{color:#2f7d4a}
+.answer-sheet .note-auto{color:#6b757e;border-color:#d9dee2}
 /* ===== 练习报告（先答后对） ===== */
 .report{max-width:860px;margin:0 auto}
 .rp-top{display:flex;align-items:center;gap:var(--s3);margin-bottom:var(--s4)}

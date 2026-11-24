@@ -659,6 +659,102 @@ def q_total():
     return _Q_TOTAL
 
 
+# ============ 导入题库（qbanks.json）============
+# 合并进 kaogong.db 的导入题库原本只留下 questions.source / path，合并后「这题属于哪个题库、
+# 在该题库第几套第几题」就丢了，真题浏览无法按导入题库分类。qbanks.json 由 build_qbanks.py
+# 生成（题库 → 自有分类 → 成员 qid），这里只读它，不碰题库本体。
+QBANKS_PATH = os.path.join(HERE, "qbanks.json")
+_QBANKS = None            # [{"id","name",...,"groups":[{"key","items":[{"qid","no"}],"n"}]}]
+_QBANK_BY_ID = {}
+_QBANK_OF_QID = {}        # qid -> {"id","name","group","no"}
+_QBANK_ORDER = {}         # bank id -> {qid: 排序下标}
+
+
+def _chunks(seq, n=400):
+    for i in range(0, len(seq), n):
+        yield seq[i:i + n]
+
+
+def load_qbanks():
+    """读 qbanks.json；题库里已经不存在的题自动剔除（重新合并题库后不会点开 404）。"""
+    global _QBANKS
+    banks = []
+    try:
+        with open(QBANKS_PATH, encoding="utf-8") as f:
+            raw = json.load(f)
+    except FileNotFoundError:
+        raw = {"banks": []}
+    except Exception as e:
+        print("[qbank] qbanks.json 读取失败，按无导入题库运行:", e)
+        raw = {"banks": []}
+    for b in raw.get("banks") or []:
+        groups, total, order = [], 0, {}
+        for g in b.get("groups") or []:
+            items = [{"qid": str(x.get("qid") or ""), "no": int(x.get("no") or 0)}
+                     for x in (g.get("items") or []) if str(x.get("qid") or "").strip()]
+            if not items:
+                continue
+            for x in items:
+                x["group"] = g.get("key") or ""
+            groups.append({"key": g.get("key") or "", "n": len(items), "items": items})
+            total += len(items)
+        if not groups:
+            continue
+        bank = {"id": str(b.get("id") or ""), "name": b.get("name") or b.get("id") or "导入题库",
+                "book": b.get("book") or "", "group_label": b.get("group_label") or "题集",
+                "total": total, "groups": groups}
+        banks.append(bank)
+    _QBANKS = banks
+    _QBANK_BY_ID.clear()
+    _QBANK_OF_QID.clear()
+    _QBANK_ORDER.clear()
+    for b in banks:
+        _QBANK_BY_ID[b["id"]] = b
+        order = {}
+        for g in b["groups"]:
+            for x in g["items"]:
+                if x["qid"] in order:      # 同一题在多个题集里：以第一次出现为准
+                    continue
+                order[x["qid"]] = len(order)
+                _QBANK_OF_QID.setdefault(x["qid"], {"id": b["id"], "name": b["name"],
+                                                    "group": g["key"], "no": x["no"],
+                                                    "group_label": b["group_label"]})
+        _QBANK_ORDER[b["id"]] = order
+    if banks:
+        print("[qbank] 导入题库 %d 个：%s" % (len(banks), "、".join(
+            "%s(%d)" % (b["name"], b["total"]) for b in banks)))
+    return banks
+
+
+def qbanks_meta():
+    """给前端的题库清单（不含成员 qid，避免每次登录拖 40KB）。"""
+    return [{"id": b["id"], "name": b["name"], "book": b["book"], "total": b["total"],
+             "group_label": b["group_label"],
+             "groups": [{"key": g["key"], "n": g["n"]} for g in b["groups"]]}
+            for b in (_QBANKS or [])]
+
+
+def bank_ids_of(bank):
+    """某题库（或某题库的一个题集）的成员 qid，按题库内顺序排好。"""
+    if bank not in _QBANK_BY_ID:
+        return []
+    order = _QBANK_ORDER.get(bank) or {}
+    return sorted(order, key=order.get)
+
+
+def bank_of(qid):
+    return _QBANK_OF_QID.get(str(qid or ""))
+
+
+def qbank_display(qid):
+    """导入题库的题没有 kadian/地区/年份，列表与题头用「题集 第 N 题」兜底显示。"""
+    bi = bank_of(qid)
+    if not bi:
+        return ""
+    return "%s · %s 第 %d 题" % (bi["name"], bi["group"], bi["no"]) if bi["no"] \
+        else "%s · %s" % (bi["name"], bi["group"])
+
+
 # ============ 云端账号：密码哈希 / token 鉴权 ============
 def pw_hash(pw):
     salt = secrets.token_bytes(16)
@@ -1068,13 +1164,13 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("「今日已练习」和「今日回溯」终于对得上数了：两处都改成「今天完成（已判分）的题数」，"
-                     "同一道题在不同组各做一次算两题，和回溯里逐组的已答题数逐行一致。"
-                     "练习顶栏是两个按钮：「⏸ 暂时退出」保住进度回总览，随时点「继续上次刷题」接着做；"
-                     "「✕ 放弃」结束本组、不再继续，已作答的题留在回溯（标「已放弃」），统计不会倒退。"
-                     "丢弃题目时自动补一道同类题（同模块同大类），本组题数不变。"
-                     "学习时长拆成三段：做题 / 看解析 / 复习，总览卡片与「数据统计 → 学习时长构成」都能看到今天的时间花在哪。"
-                     "复习排期仍是「今日题目今日不复习」：当天做过的题到期日排到明天。")
+APP_RELEASE_NOTES = ("「我的笔记」不再藏在按钮后面：练习（边答边对 / 先答后对 / 复习）、交卷后看解析、"
+                     "完整标注三处都直接显示笔记框，边做题边写，不用先点「📝 笔记」。"
+                     "而且不用再点保存——边写边自动存，停笔约 0.7 秒就落盘，切题、翻页、关掉浏览器都不丢；"
+                     "框下会显示「已自动保存 · 时间」，网络不好时先留住文字再自动重试。"
+                     "三处是同一份数据，任一处改动，另外两处立刻同步。"
+                     "真题浏览顶部新增题库切换：全部题库 / 内置真题库 / 导入题库。"
+                     "选中导入题库（如「四海公考 · 逻辑填空600题」）后按它自己的题集分类翻阅，每套 20 题，顺序与题本一致。")
 
 
 def ensure_release_announcement():
@@ -1272,6 +1368,11 @@ def clean_card(row, reveal=False, uid=DEFAULT_UID):
         "material": safe_material(row["material"]) if not reveal else row["material"],
         "material_ref": row.get("material_ref", ""),
     }
+    # 导入题库的题没有 kadian / 地区 / 年份：给一个「题库 · 题集 · 第 N 题」的显示用标签
+    bi = bank_of(row["qid"])
+    if bi:
+        d["bank"], d["bank_group"], d["bank_no"] = bi["name"], bi["group"], bi["no"]
+        d["bank_label"] = qbank_display(row["qid"])
     if not reveal:
         for o in d["options"]:
             o["is_answer"] = False
@@ -1853,7 +1954,11 @@ class Handler(BaseHTTPRequestHandler):
             mods = q_all("SELECT module, COUNT(*) n FROM qdb.questions GROUP BY module ORDER BY n DESC")
             cats = q_all("SELECT module, category, COUNT(*) n FROM qdb.questions GROUP BY module,category ORDER BY n DESC")
             total = q_one("SELECT COUNT(*) n FROM qdb.questions")["n"]
-            return self._send(200, {"total": total, "modules": mods, "categories": cats, "today": today()})
+            banks = qbanks_meta()
+            banked = len(_QBANK_OF_QID)
+            return self._send(200, {"total": total, "modules": mods, "categories": cats, "today": today(),
+                                    "qbanks": banks, "banked": banked,
+                                    "builtin": max(0, total - banked)})
 
         # ---------- 复习计划：未来逐日到期题数 ----------
         if path == "/api/review/plan":
@@ -2359,8 +2464,19 @@ class Handler(BaseHTTPRequestHandler):
                                 WHERE {NEW}{cond}{excl_clause} ORDER BY RANDOM() LIMIT ?""", (uid, *ea, size))
             if rows:
                 ensure_srs_rows(uid, [r["qid"] for r in rows])   # 抽到的题补齐进度行（一次事务）
-            return self._send(200, {"mode": mode, "count": len(rows),
-                                    "cards": [clean_card(r, reveal=False) for r in rows]})
+            cards = [clean_card(r, reveal=False) for r in rows]
+            # 笔记随卡带到答题页：做题时也能直接看到 / 编辑本题的笔记（与「完整标注」「看解析」同一份）
+            if cards:
+                memo = {}
+                for ch in _chunks([c["qid"] for c in cards]):
+                    for nt in q_all("SELECT qid,text,updated FROM notes WHERE user_id=? AND qid IN (%s)"
+                                    % ",".join("?" * len(ch)), (uid, *ch)):
+                        memo[nt["qid"]] = nt
+                for c in cards:
+                    nt = memo.get(c["qid"])
+                    c["note"] = nt["text"] if nt else ""
+                    c["note_updated"] = nt["updated"] if nt else ""
+            return self._send(200, {"mode": mode, "count": len(rows), "cards": cards})
 
         if path == "/api/question":
             uid = need_uid(g("token"))
@@ -2398,10 +2514,36 @@ class Handler(BaseHTTPRequestHandler):
                 cond += " AND q.year=?"; a2.append(year); b2.append(year)
             if kw:
                 cond += " AND (q.stem LIKE ? OR q.kadian LIKE ?)"; a2 += ["%" + kw + "%"] * 2; b2 += ["%" + kw + "%"] * 2
-            # LEFT JOIN：没进度行的题也列出（空白进度 = 新题），不再依赖预铺行
-            total = q_one(f"""SELECT COUNT(*) n FROM qdb.questions q LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
-                              WHERE 1=1{cond}""", (uid, *b2))["n"]
-            rows = q_all(f"""SELECT q.id,q.qid,q.module,q.category,q.kadian,q.region,q.year,q.answer,q.has_image,q.ask_model,
+            # 题库维度：all（默认，全部题）/ builtin（只看内置真题）/ <导入题库 id>（按该题库自有分类看）
+            bank_id = (g("bank") or "").strip()
+            bank_group = (g("group") or "").strip()
+            bank_order = None
+            if bank_id and bank_id not in ("all", "builtin"):
+                if bank_id not in _QBANK_BY_ID:
+                    return self._send(404, {"error": "没有这个题库"})
+                b = _QBANK_BY_ID[bank_id]
+                if bank_group:
+                    seq = [x["qid"] for gg in b["groups"] if gg["key"] == bank_group for x in gg["items"]]
+                else:
+                    seq = bank_ids_of(bank_id)
+                if not seq:
+                    return self._send(200, {"total": 0, "page": page, "size": size, "rows": [],
+                                            "discarded": q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?",
+                                                               (uid,))["n"],
+                                            "bank": bank_id, "group": bank_group})
+                bank_order = {q: i for i, q in enumerate(seq)}
+                # 分块之间必须是 OR（并集）；写成 AND 等于取交集，结果恒为空
+                parts = []
+                for ch in _chunks(seq):
+                    parts.append("q.qid IN (%s)" % ",".join("?" * len(ch)))
+                    a2.extend(ch); b2.extend(ch)
+                cond += " AND (" + " OR ".join(parts) + ")"
+            elif bank_id == "builtin":
+                banked = list(_QBANK_OF_QID)
+                for ch in _chunks(banked):
+                    cond += " AND q.qid NOT IN (%s)" % ",".join("?" * len(ch))
+                    a2.extend(ch); b2.extend(ch)
+            SEL = f"""SELECT q.id,q.qid,q.module,q.category,q.kadian,q.region,q.year,q.answer,q.has_image,q.ask_model,
                             IFNULL(s.status,'new') status,s.due,s.interval,
                             IFNULL(s.correct,0) correct,IFNULL(s.wrong,0) wrong,
                             IFNULL(s.wb_status,'active') wb_status,
@@ -2411,12 +2553,29 @@ class Handler(BaseHTTPRequestHandler):
                             LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
                             LEFT JOIN favorites f ON f.qid=q.qid AND f.user_id=?
                             LEFT JOIN discarded d ON d.qid=q.qid AND d.uid=?
-                            WHERE 1=1{cond}
-                            ORDER BY q.module,q.category,q.year DESC LIMIT ? OFFSET ?""",
-                         (uid, uid, uid, *a2, size, (page - 1) * size))
+                            WHERE 1=1{cond}"""
+            if bank_order is not None:
+                # 题库视图按「题集 → 题号」排，分页在内存里切（题库都是几百到几千题，代价可接受）
+                allrows = q_all(SEL, (uid, uid, uid, *a2))
+                allrows.sort(key=lambda r: bank_order.get(r["qid"], 1 << 30))
+                total = len(allrows)
+                rows = allrows[(page - 1) * size: page * size]
+            else:
+                # LEFT JOIN：没进度行的题也列出（空白进度 = 新题），不再依赖预铺行
+                total = q_one(f"""SELECT COUNT(*) n FROM qdb.questions q LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
+                                  WHERE 1=1{cond}""", (uid, *b2))["n"]
+                rows = q_all(SEL + " ORDER BY q.module,q.category,q.year DESC LIMIT ? OFFSET ?",
+                             (uid, uid, uid, *a2, size, (page - 1) * size))
+            for r in rows:      # 导入题库的题没有考点/地区/年份，用题库分类兜底，列表才不空
+                bi = bank_of(r["qid"])
+                if bi:
+                    r["bname"], r["bgroup"], r["bno"] = bi["name"], bi["group"], bi["no"]
+                    if not (r["kadian"] or "").strip():
+                        r["kadian"] = qbank_display(r["qid"])
             dropped_n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
             return self._send(200, {"total": total, "page": page, "size": size,
-                                    "rows": rows, "discarded": dropped_n})
+                                    "rows": rows, "discarded": dropped_n,
+                                    "bank": bank_id, "group": bank_group})
 
         if path == "/api/kadian":
             cond, args = build_where(g("module"), g("category"), "")
@@ -2706,6 +2865,11 @@ class Handler(BaseHTTPRequestHandler):
                 d = {k: r[k] for k in ("id", "qid", "module", "category", "kadian",
                                        "region", "year", "answer", "wrong", "status", "fav")}
                 d["snippet"] = plain_text(r["stem"], 20)      # 题干前 20 字摘要
+                bi = bank_of(r["qid"])
+                if bi:                                        # 导入题库的题没有考点名，用题库分类兜底
+                    d["bname"], d["bgroup"], d["bno"] = bi["name"], bi["group"], bi["no"]
+                    if not (d["kadian"] or "").strip():
+                        d["kadian"] = qbank_display(r["qid"])
                 out.append(d)
             return self._send(200, {"total": total, "rows": out})
 
@@ -3011,14 +3175,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "no question"})
         uid = need_uid(p.get("token"))
         text = (p.get("text") or "").strip()
+        ts = now()          # 前端自动保存要用这个时间显示「已保存 · 11-24 10:32」
         with _LOCK:
             if text:
                 db().execute("INSERT OR REPLACE INTO notes(qid,user_id,text,updated) VALUES(?,?,?,?)",
-                             (eqid, uid, text, now()))
+                             (eqid, uid, text, ts))
             else:
                 db().execute("DELETE FROM notes WHERE qid=? AND user_id=?", (eqid, uid))
             db().commit()
-        return self._send(200, {"ok": True, "text": text})
+        return self._send(200, {"ok": True, "text": text, "updated": ts if text else ""})
 
     def api_fav(self, p):
         eqid = resolve_qid(int(p.get("id", 0)))
@@ -4113,6 +4278,7 @@ def main():
         ensure_release_announcement()
         q_one("SELECT COUNT(*) n FROM qdb.questions")   # 兜底：ATTACH 缺文件会静默建空库
         _warm()      # 预热题库 → OS 页缓存（新账号播种、出题查询首次都更快）
+        load_qbanks()   # 导入题库元数据（没有 qbanks.json 就当作没有导入题库）
     except Exception as e:
         print(f"[ERR] 题库 kaogong.db 不可读: {e}")
         sys.exit(1)
