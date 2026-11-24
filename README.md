@@ -155,6 +155,70 @@
 
 问法模型、推理链、最快解法、易错点、母题抽象、给定材料、官方解析、疑点待复核、个人笔记、收藏。
 
+**AI解析**（`ai_json` 字段）是最上面那一块，成表格展示：题干骨架 → 逐项判定（每个选项为什么选 / 为什么排除，✓ 入选绿、✗ 排除红）→ 可迁移方法 → 避坑提醒 → 可直接抄进错题本的笔记。它存在数据库里而不是图片里，所以能全文搜索、能复制文字、手机上自动折行。没生成过 AI 解析的题，这一块不出现，不影响原有解析。
+
+本次随版本已为本地题库批量生成 **17,132 题** AI 解析，覆盖全部无配图题；含图题按约定跳过。这份数据只写题库、不碰用户库，且属于题库内容改动，按许可不进 GitHub 仓库（详见下方生成方法与[许可](#许可)）。
+
+## AI 解析怎么生成
+
+AI 解析不是随题库附带的，要自己跑一次（或分批跑）。脚本是 `build_ai_analysis.py`，走任意兼容 OpenAI 协议的接口（DeepSeek / 通义 / 智谱 / OpenAI 都行）。
+
+```bash
+# 1. 配好 key（只在当前终端生效，不写进任何文件）
+export AI_API_KEY=sk-xxxxxxxx
+export AI_BASE_URL=https://api.deepseek.com/v1   # 可选，默认就是这个
+export AI_MODEL=deepseek-chat                    # 可选
+
+# 2. 先看各模块覆盖率
+python build_ai_analysis.py --stats
+
+# 3. 试跑一题，只打印不写库，确认效果和费用
+python build_ai_analysis.py --limit 1 --dry
+
+# 4. 小批量试点
+python build_ai_analysis.py --module 言语理解与表达 --limit 30
+
+# 5. 全量（断点续跑：已生成的自动跳过，中断了重跑同一条命令即可）
+python build_ai_analysis.py --all --workers 6
+
+# 想重做已经生成过的
+python build_ai_analysis.py --module 言语理解与表达 --force --limit 30
+
+# 顺带导出一份 JSON 备份
+python build_ai_analysis.py --all --workers 6 --out ai_analysis_backup.json
+```
+
+也可以不走 API：按 `ai_analysis_试点.json` 的格式自己写（或从别处生成），再导入。
+
+```bash
+python import_ai_analysis.py 你的文件.json --model manual-v1
+python import_ai_analysis.py 你的文件.json --dry     # 只校验不写库
+```
+
+JSON 结构：
+
+```json
+[{"qid": "2047698", "ai": {
+  "v": 1, "answer": "C", "summary": "一句话考点与结论",
+  "blocks": [
+    {"t": "题干骨架", "type": "text",  "x": "把题干翻译成逻辑式或解题纲领"},
+    {"t": "逐项判定", "type": "table", "head": ["选项","判断","依据"],
+     "rows": [["A","✗ 排除","引用原词的理由"],["C","✓ 入选","…"]]},
+    {"t": "可迁移方法", "type": "steps", "x": ["第1步 …","第2步 …"]},
+    {"t": "避坑提醒",   "type": "warn",  "x": ["坑一 …"]},
+    {"t": "笔记",       "type": "note",  "x": "可直接抄写的一段"}
+  ]}}]
+```
+
+`type` 支持 `text` / `table` / `steps` / `warn` / `note`，前端 `aiAnalysisHtml()` 负责渲染，改样式不用重新生成内容。
+
+几点提醒：
+
+- 跑脚本前先停掉 `server.py`，SQLite 同一时刻只允许一个写者。
+- 含图的题（图形推理、资料分析选图）模型看不到图，脚本会让它依据题干文字与官方解析反推思路，结果里会注明「图形细节以原题为准」，这类题的 AI 解析只当辅助。
+- 全量约 2.8 万题，按每篇 2–3 千 token 估，费用取决于你选的模型单价，先用 `--limit 30` 跑一批看账单再放量。
+- 生成结果写进题库 `kaogong.db` 的 `ai_json` 列，**不动用户库**，学习进度和笔记不受影响。
+
 ## 安装
 
 不需要安装。确认本机有 Python 3.8 以上版本，然后：
@@ -301,6 +365,8 @@ kaogong-naoku-re1.0/
 ├─ migrate_v2/v3.py       数据库结构迁移
 ├─ assemble_db.py         分卷题库合并器
 ├─ build_qbanks.py        导入题库元数据生成器（题库 → 分类 → 成员题号）
+├─ build_ai_analysis.py   AI 解析生成器（调模型 → ai_json，断点续跑）
+├─ import_ai_analysis.py  手工/离线 AI 解析导入器（JSON → ai_json）
 ├─ qbanks.json            导入题库清单（真题浏览按题库分类用，不含题目内容）
 ├─ start.sh               Linux / macOS 启动脚本
 ├─ 启动考公系统.bat         Windows 一键启动

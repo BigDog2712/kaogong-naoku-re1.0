@@ -1223,16 +1223,10 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("设置里新增「左侧功能栏排序」：用 ↑ ↓ 把常用的功能挪到最上面，电脑端竖栏和手机端横条"
-                     "用同一份顺序，并跟着账号同步到其它设备，随时可恢复默认。"
-                     "陪伴者现在能看陪读的「今日回溯」：在陪读详情页点「今日已练习」直接展开今天每一组练习，"
-                     "逐题看当时选了什么、对没对、用时多久，陪读写过的笔记也显示在题干下面（仍然只读）。"
-                     "修好了陪伴者「最近作答」看不到最新记录的问题：以前只读复习历史，先答后对里没自评的题根本不出现，"
-                     "于是在刚练完时会一直停在几小时前；现在「最近作答」「累计作答」「正确率」「今日已练习」"
-                     "统一按同一份作答流水统计，数字互相对得上。"
-                     "做题（含复习）揭晓答案后，「正确答案」右边会多出一行极小的「历史 C·B·A」："
-                     "这道题以前每次选的是什么、对没对一眼可见，鼠标停上去看具体时间；"
-                     "复习模式里答案没揭晓前不显示，不会提前提示。")
+APP_RELEASE_NOTES = ("每道题的解析区最上方新增「🤖 AI解析」卡片：按「题干骨架 → 逐项判定 → 可迁移方法 → 避坑提醒 → 笔记」"
+                     "的顺序展开，每个选项为什么选、为什么排除都用表格列清楚，绿色 ✓ 入选、红色 ✗ 排除。"
+                     "答题页、交卷报告、完整标注页三处都能看到。"
+                     "还没有 AI 解析的题整块不显示，其余解析和原有功能不变。")
 
 
 def ensure_release_announcement():
@@ -1444,6 +1438,8 @@ def clean_card(row, reveal=False, uid=DEFAULT_UID):
             "fastest": row["fastest"], "pitfalls": row["pitfalls"],
             "mother": row["mother"], "analysis": row["analysis"],
             "doubt": clean_doubt(row["doubt"]), "related": row["related"],
+            # AI解析（build_ai_analysis.py 写入 ai_json）；老题库没有该列时给空值
+            "ai": (row["ai_json"] if "ai_json" in row.keys() else ""),
         })
         eqid = row["qid"]
         nt = q_one("SELECT text,updated FROM notes WHERE qid=? AND user_id=?", (eqid, uid))

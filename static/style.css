@@ -419,6 +419,46 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
 .reveal .sec.doubt{border-left-color:var(--accent)} .reveal .sec.doubt h4{color:var(--accent)}
 .reveal .sec.verified{border-left-color:var(--ok)} .reveal .sec.verified h4{color:var(--ok)}
 .reveal .sec.verified .vsrc{margin-top:var(--s2);font-size:12px;color:var(--ink-3)}
+
+/* ===== AI解析区块（ai_json 结构化表格）===== */
+.reveal .sec.ai{border-left-color:var(--brand)}
+.reveal .sec.ai h4{color:var(--brand)}
+.ai-sum{margin:0 0 var(--s3);padding:var(--s2) var(--s3);background:var(--surface-2);
+  border:1px solid var(--rule);border-radius:var(--radius-sm);
+  font-size:14px;line-height:1.7;color:var(--ink-2)}
+.ai-block{margin:0 0 var(--s4)}
+.ai-block:last-child{margin-bottom:0}
+.ai-h{margin:0 0 var(--s2);font-size:13.5px;font-weight:600;color:var(--ink);
+  letter-spacing:.02em;font-family:var(--font-sans)}
+.ai-p{margin:0;font-size:14.5px;line-height:1.75;color:var(--ink-2)}
+.reveal .ai-ol,.reveal .ai-warn{margin:0;font-size:14.5px;line-height:1.75;color:var(--ink-2)}
+.reveal .ai-ol{padding-left:20px;list-style:decimal}
+.reveal .ai-ol li{margin:5px 0}
+.reveal .ai-warn{padding-left:0;list-style:none}
+.reveal .ai-warn li{margin:5px 0;padding-left:17px;position:relative}
+.reveal .ai-warn li::before{content:"⚠";position:absolute;left:0;top:0;font-size:12px;
+  line-height:1.75;color:var(--warn)}
+.ai-note{margin:0;padding:var(--s3);background:var(--surface-2);border:1px solid var(--rule);
+  border-radius:var(--radius-sm);font-size:13.5px;line-height:1.8;color:var(--ink-2)}
+.ai-tw{margin:0;overflow-x:auto;-webkit-overflow-scrolling:touch;
+  border:1px solid var(--rule);border-radius:var(--radius-sm);background:var(--surface)}
+.ai-tb{width:100%;border-collapse:collapse;font-size:13.5px;min-width:300px}
+.ai-tb th{background:var(--paper-2);color:var(--ink-2);font-weight:600;text-align:left;
+  padding:7px 10px;border-bottom:1px solid var(--rule-2);white-space:nowrap;
+  font-family:var(--font-sans);font-size:13px}
+.ai-tb td{padding:7px 10px;border-bottom:1px solid var(--rule);color:var(--ink-2);
+  vertical-align:top;line-height:1.65}
+.ai-tb tbody tr:last-child td{border-bottom:0}
+.ai-tb td:first-child{color:var(--ink);font-weight:600;white-space:nowrap}
+/* 判断列（含勾/叉的单元格）不折行，整格上色，扫一眼就知道哪个选项入选 */
+.ai-tb td:has(.ai-ok),.ai-tb td:has(.ai-bad){white-space:nowrap}
+.ai-tb .ai-ok{color:var(--ok);font-weight:600}
+.ai-tb .ai-bad{color:var(--bad);font-weight:600}
+@media (max-width:640px){
+  .ai-tb{font-size:13px;min-width:260px}
+  .ai-tb th,.ai-tb td{padding:6px 8px}
+  .ai-p,.reveal .ai-ol,.reveal .ai-warn{font-size:14px}
+}
 .reveal ol,.reveal ul{margin:var(--s1) 0;padding-left:22px}
 .reveal li{margin:4px 0}
 
@@ -445,6 +485,9 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
 .rev-rate-head b{font-size:15px;font-weight:700;color:inherit}
 .rev-rate .grade{margin-top:var(--s4)}
 .rev-rate-tip{margin-top:10px;font-size:12.5px}
+/* 复习模式：选项可直接点选，答对自动进入下一题 */
+.rev-pick-tip{margin:10px 0 0;font-size:12.5px}
+.rev-opts .opt:active{background:var(--surface-2)}
 .answer-sheet .rev-rate{border-top-color:#d9dee2}
 .answer-sheet .rev-rate-head .sub,.answer-sheet .rev-rate-tip{color:#6b757e}
 html[data-theme="dark"] .answer-sheet .rev-rate{border-top-color:#34373b}

@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261124c';
+const APP_VER = '20261124g';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -173,6 +173,10 @@ const MODE_LABEL = { new: '新题', mix: '智能复习', review: '复习', wrong
 /* 记忆曲线四档：值对应 SM2 评分（1 again / 3 hard / 4 good / 5 easy），顺序对应键盘 1/2/3/4 */
 const GRADE_DEF = [{ v: 1, n: '忘记' }, { v: 3, n: '困难' }, { v: 4, n: '一般' }, { v: 5, n: '熟悉' }];
 const GRADE_BY_KEY = { '1': 1, '2': 3, '3': 4, '4': 5 };
+/* 复习模式点选项答对时，自动写进记忆曲线的档位：熟悉程度 3 =「一般」(good)，即 SM2 的 grade 4。
+   想改成答对记「困难」就把这里换成 3，记「熟悉」换成 5。 */
+const REV_AUTO_GRADE = 4;
+const REV_AUTO_GRADE_NAME = (GRADE_DEF.find(x => x.v === REV_AUTO_GRADE) || {}).n || '一般';
 
 /* ---------- 练习 session 本地快照（继续上次刷题） ---------- */
 const SS_KEY = 'kg_session_v1';
@@ -186,7 +190,7 @@ function setAnswerMode(m) {
   prefsPushNow().catch(e => console.warn('答题模式偏好同步失败：', e));
 }
 function isDeferred(S) { return !!(S && S.answerMode === 'deferred' && !isRev(S)); }
-/* 复习态：mode=review，或通过「再复习今天做过的题」等入口进入的 ids 组 —— 无选项作答、自评驱动 */
+/* 复习态：mode=review，或通过「再复习今天做过的题」等入口进入的 ids 组 —— 可点选项作答（答对即跳题），也可凭回忆直接自评 */
 function isRev(S) { return !!S && (S.mode === 'review' || !!S.revMode); }
 const ANSWER_MODE_TIP = {
   instant: '边答边对：选完选项立即显示对错与解析，再按记忆强度自评。',
@@ -481,7 +485,7 @@ function viewStudy() {
       </div>
     </div>
     <div class="row"><button class="btn big ok" id="s-go">开始练习 →</button></div>
-    <p class="sub" style="margin:14px 0 0">答错/忘记的题目会按记忆曲线更频繁地回来。答题模式也可在「设置」中修改，复习到期模式始终为回忆自评。</p>
+    <p class="sub" style="margin:14px 0 0">答错/忘记的题目会按记忆曲线更频繁地回来。答题模式也可在「设置」中修改；复习到期模式可以直接点选项作答（答对自动进入下一题并记为「一般」），也可以凭回忆直接自评。</p>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">⏱ 单题限时训练（可选）</h2>
@@ -1822,14 +1826,26 @@ function renderOptions() {
   }
   if (!opts || !opts.length) { box.innerHTML = ''; }
   else if (!answerable && S.phase === 'question') {
-    box.innerHTML = `<div class="row"><button class="btn" id="btn-reveal">🧠 先回忆，然后点击显示选项与答案</button></div>`;
-    document.getElementById('btn-reveal').onclick = doReveal;
-  } else if (!answerable && S.phase === 'answer') {
-    // 复习模式：先自己回忆，答案默认不点亮；悬停答案行 / 按 0 / 点按钮才揭示
-    box.innerHTML = `<div class="opts">` + opts.map(o => `<div class="opt${o.is_answer ? ' ans-key' : ''}">
+    // 复习模式也允许直接点选项作答：答对自动记「熟悉程度 3（一般）」并进入下一题，
+    // 答错留在本题看解析、不跳转。不愿作答的，下面自评区仍可凭回忆直接自评。
+    box.innerHTML = `<div class="opts rev-opts">` + opts.map(o => `
+      <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
         <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
-        ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>' : ''}
-      </div>`).join('') + `</div>`;
+      </div>`).join('') + `</div>
+      <p class="sub rev-pick-tip">点击选项作答 · 答对自动进入下一题（记为「一般」），答错留在本题看解析</p>`;
+    box.querySelectorAll('.opt').forEach(el => bindPick(el, () => revPick(el.dataset.key)));
+  } else if (!answerable && S.phase === 'answer') {
+    // 复习模式：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪
+    box.innerHTML = `<div class="opts">` + opts.map(o => {
+      let cls = 'opt';
+      if (o.is_answer) cls += ' ans-key' + (S.chosen === o.key ? ' correct' : '');
+      else if (S.chosen === o.key) cls += ' wrong';
+      return `<div class="${cls}">
+        <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
+        ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>'
+          : (S.chosen === o.key ? '<span style="color:var(--bad);font-weight:800">✗ 你选</span>' : '')}
+      </div>`;
+    }).join('') + `</div>`;
   } else {
     box.innerHTML = `<div class="opts">` + opts.map(o => {
       let cls = 'opt';
@@ -1862,13 +1878,12 @@ function renderAct() {
       bindNoteBox(act, c);
       return;
     }
-    // 复习模式：掌握程度直接给出来，不用先揭示选项与解析——凭回忆自评完立刻进下一题。
-    // 想核对答案的，再点上面的「🧠 先回忆…」按钮，自评区仍保留（自评以自评为准）。
+    // 复习模式：选项已在上面列出（可直接点选），掌握程度也仍然可以凭回忆直接给。
     act.innerHTML = `
       <div class="rev-rate">
         <div class="rev-rate-head">
           <b>这道题现在掌握得怎么样？</b>
-          <span class="sub" style="margin:0">不看选项和解析，凭回忆直接自评，选完自动进入下一题</span>
+          <span class="sub" style="margin:0">不点选项也可以直接自评，选完自动进入下一题</span>
         </div>
         <div class="grade">
           <button class="g-again" data-g="1">忘记<small>1 · again 完全没印象</small></button>
@@ -1876,17 +1891,24 @@ function renderAct() {
           <button class="g-good" data-g="4">一般<small>3 · good 基本记得</small></button>
           <button class="g-easy" data-g="5">熟悉<small>4 · easy 很稳</small></button>
         </div>
-        <p class="sub rev-rate-tip">也可以按键盘 1 / 2 / 3 / 4 直接自评。要核对答案，点上方「🧠 先回忆，然后点击显示选项与答案」。</p>
+        <p class="sub rev-rate-tip">也可以按键盘 1 / 2 / 3 / 4 直接自评。想先核对答案，点下面的「直接看答案与解析」。</p>
+        <div class="row" style="margin-top:10px"><button class="btn ghost sm" id="btn-reveal" type="button">🙈 直接看答案与解析</button></div>
       </div>${noteBox(c)}`;
     act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
+    const rv = document.getElementById('btn-reveal');
+    if (rv) rv.onclick = doReveal;
     bindNoteBox(act, c);
     return;
   }
   const f = S.full;
-  const isRight = answerable ? (S.chosen === f.answer) : null;
+  // 复习模式点了选项（picked）：按客观作答展示，正确答案不再打码；纯揭晓答案仍走打码那条路
+  const picked = !answerable && !!S.chosen;
+  const isRight = (answerable || picked)
+    ? (String(S.chosen || '').toUpperCase() === String(f.answer || '').toUpperCase())
+    : null;
   if (answerable) { S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++; }
   // 复习模式：解析直接展开可见，正确答案放在解析末尾且默认打码——看解析不影响先自评
-  const ansBlock = answerable
+  const ansBlock = (answerable || picked)
     ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}${ansHistHtml(f, S.gid)}</div>`
     : `<div class="ans-open">
         ${revealHtml(f)}
@@ -1903,7 +1925,7 @@ function renderAct() {
     </div>
     ${ansBlock}
     ${noteBox(f)}
-    ${answerable ? revealHtml(f) : ''}
+    ${(answerable || picked) ? revealHtml(f) : ''}
     <div class="grade">
       <button class="g-again" data-g="1">忘记<small>1 · again 马上重来</small></button>
       <button class="g-hard" data-g="3">困难<small>2 · hard 有点卡</small></button>
@@ -1912,9 +1934,11 @@ function renderAct() {
     </div>
     <p class="sub" style="margin-top:10px">${answerable
       ? '按你的真实记忆强度自评（直接按键盘 1 / 2 / 3 / 4）。系统将据此计算下次复习间隔。'
-      : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；自评后自动进入下一题。'}</p>`;
+      : (picked
+        ? (isRight ? '答对了，已记为「一般」（熟悉程度 3）。' : '答错了，先看完解析再自评（键盘 1 / 2 / 3 / 4）；自评后进入下一题。')
+        : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；自评后自动进入下一题。')}</p>`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
-  if (!answerable) bindAnsToggle();
+  if (!answerable && !picked) bindAnsToggle();
   bindNoteBox(act, f);            // 笔记常驻：与「完整标注 / 看解析」同一份数据
   document.getElementById('t-fav').onclick = async (e) => {
     const on = !f.fav;
@@ -1966,10 +1990,60 @@ function pickPeekTip(line) {
 }
 function c2id() { return state.session.queue[state.session.idx].id; }
 
+/* ---------- AI解析：结构化 JSON → 表格卡片 ----------
+   数据来自 qdb.questions.ai_json，由 build_ai_analysis.py 生成。
+   没有 ai_json 的题整块不出现，不影响旧题库。
+   结构：{v, answer, summary, blocks:[{t,type,x|head+rows}]}
+   type: text（默认） / table / steps / warn / note */
+function aiCell(s) {
+  const t = String(s == null ? '' : s);
+  const body = esc(t).replace(/\n/g, '<br>');
+  // 判断列首字符为勾/叉时整格上色，扫一眼就能看出哪个选项入选
+  if (/^[✓✔]/.test(t)) return `<span class="ai-ok">${body}</span>`;
+  if (/^[✗✘×]/.test(t)) return `<span class="ai-bad">${body}</span>`;
+  return body;
+}
+function aiAnalysisHtml(ai) {
+  if (!ai) return '';
+  let o = ai;
+  if (typeof ai === 'string') { try { o = JSON.parse(ai); } catch (e) { return ''; } }
+  if (!o || typeof o !== 'object' || !Array.isArray(o.blocks) || !o.blocks.length) return '';
+  const blocks = o.blocks.map(b => {
+    if (!b || typeof b !== 'object') return '';
+    const t = b.t ? `<h5 class="ai-h">${esc(b.t)}</h5>` : '';
+    const type = b.type || 'text';
+    if (type === 'table') {
+      if (!Array.isArray(b.rows) || !b.rows.length) return '';
+      const head = (b.head || []).map(h => `<th>${esc(h)}</th>`).join('');
+      const rows = b.rows.map(r =>
+        `<tr>${(r || []).map(c => `<td>${aiCell(c)}</td>`).join('')}</tr>`).join('');
+      return `<div class="ai-block">${t}<div class="ai-tw"><table class="ai-tb"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div></div>`;
+    }
+    if (type === 'steps' || type === 'warn') {
+      const arr = Array.isArray(b.x) ? b.x : (b.x ? [b.x] : []);
+      if (!arr.length) return '';
+      const li = arr.map(s => `<li>${aiCell(s)}</li>`).join('');
+      const cls = type === 'steps' ? 'ai-ol' : 'ai-warn';
+      const tag = type === 'steps' ? 'ol' : 'ul';
+      return `<div class="ai-block">${t}<${tag} class="${cls}">${li}</${tag}></div>`;
+    }
+    if (type === 'note') {
+      if (!b.x) return '';
+      return `<div class="ai-block">${t}<div class="ai-note">${aiCell(b.x)}</div></div>`;
+    }
+    if (!b.x) return '';
+    return `<div class="ai-block">${t}<p class="ai-p">${aiCell(b.x)}</p></div>`;
+  }).filter(Boolean).join('');
+  if (!blocks) return '';
+  const sum = o.summary ? `<div class="ai-sum">${aiCell(o.summary)}</div>` : '';
+  return `<div class="sec ai"><h4>🤖 AI解析</h4>${sum}${blocks}</div>`;
+}
+
 /* 解析区块：答题页与练习报告共用，保证两处展示一致 */
 function revealHtml(f) {
   if (!f) return '';
   return `<div class="reveal">
+      ${aiAnalysisHtml(f.ai)}
       ${f.mother ? `<div class="sec mother"><h4>🧩 母题抽象</h4>${inlineMd(f.mother)}</div>` : ''}
       ${f.reasoning ? `<div class="sec"><h4>🔗 推理链</h4>${inlineMd(f.reasoning)}</div>` : ''}
       ${f.fastest ? `<div class="sec fastest"><h4>⚡ 最快解法</h4>${inlineMd(f.fastest)}</div>` : ''}
@@ -2323,12 +2397,40 @@ async function doReveal() {
   stopLimitTimer();
   try { const d = await API('/api/question?id=' + c.id); S.full = d.card; } catch (e) { return fatal(e); }
   S.phase = 'answer'; renderOptions();
-  // 看到答案这一刻也落一条：万一没点自评就离开，回溯里仍能看到当时选了什么
+  // 只有真的选了选项才落一条作答流水：复习模式里「直接看答案与解析」不算作答，
+  // 否则单纯核对答案会被记成一次答错，拖累今日正确率与历史答案。
   const ans = (S.full && S.full.answer) || '';
-  markPractice(S, [{
-    qid: c.qid, choice: S.chosen || '', timeout: 0, pos: S.idx + 1, ms: Math.round(qElapsed(S)),
-    correct: (S.chosen && String(S.chosen).toUpperCase() === String(ans).toUpperCase()) ? 1 : 0,
-  }]);
+  if (S.chosen) {
+    markPractice(S, [{
+      qid: c.qid, choice: S.chosen, timeout: 0, pos: S.idx + 1, ms: Math.round(qElapsed(S)),
+      correct: (String(S.chosen).toUpperCase() === String(ans).toUpperCase()) ? 1 : 0,
+    }]);
+  }
+}
+
+/* 复习模式点选项作答：答对立刻记「熟悉程度 3（一般）」并进入下一题；答错留在本题看解析（不跳转）。
+   两种结果都会经 doReveal / doGrade 落进 practice_items，因此能在「历史答案」和今日回溯里看到。 */
+async function revPick(key) {
+  const S = state.session;
+  if (!S || S._revPicking || S._grading) return;
+  if (S.phase !== 'question' || !isRev(S)) return;
+  S._revPicking = true;
+  S.chosen = key;
+  await doReveal();                       // 取回带答案的完整卡片（顺带落一条作答流水）
+  if (!S.full || S.phase !== 'answer') { S._revPicking = false; return; }
+  const ok = String(key).toUpperCase() === String(S.full.answer || '').toUpperCase();
+  S._revPicking = false;
+  if (!ok) {                              // 答错：留在本题，答案解析已展开，等用户自评
+    toast('✗ 没答对 · 看完解析再自评');
+    return;
+  }
+  toast('✓ 答对 · 记为「' + REV_AUTO_GRADE_NAME + '」（熟悉程度 3）');
+  // 留 350ms 让对勾与绿色高亮看得清，再跳；这期间用户若已自己自评过就不再重复
+  const qid = S.queue[S.idx] && S.queue[S.idx].qid;
+  await new Promise(r => setTimeout(r, 350));
+  if (state.session !== S || S.phase !== 'answer' || S.graded) return;
+  if (!S.queue[S.idx] || S.queue[S.idx].qid !== qid) return;
+  await doGrade(REV_AUTO_GRADE);           // 内部会按复习模式直接 nextCard()
 }
 
 async function doGrade(g) {
@@ -3140,6 +3242,10 @@ document.addEventListener('keydown', (e) => {
       if (!answerable) {
         const gq = GRADE_BY_KEY[e.key];
         if (gq) { e.preventDefault(); doGrade(gq); return; }
+        // 复习模式：A/B/C/D 等同点选项，答对自动进入下一题
+        const k2 = e.key.toUpperCase();
+        const o2 = 'ABCDEF'.includes(k2) && (S.queue[S.idx].options || []).find(x => String(x.key).toUpperCase() === k2);
+        if (o2) { e.preventDefault(); revPick(o2.key); return; }
       }
       if (answerable && 'ABCD'.includes(e.key.toUpperCase())) {
         const o = S.queue[S.idx].options.find(x => x.key.toUpperCase() === e.key.toUpperCase());
@@ -3404,6 +3510,7 @@ async function viewDetail(id, from) {
   <div class="answer-line right">正确答案：${esc(c.answer)}${ansHistHtml(c, '')}</div>
   ${noteBox(c)}
   <div class="reveal">
+    ${aiAnalysisHtml(c.ai)}
     ${c.mother ? `<div class="sec mother"><h4>🧩 母题抽象</h4>${inlineMd(c.mother)}</div>` : ''}
     ${c.reasoning ? `<div class="sec"><h4>🔗 推理链</h4>${inlineMd(c.reasoning)}</div>` : ''}
     ${c.fastest ? `<div class="sec fastest"><h4>⚡ 最快解法</h4>${inlineMd(c.fastest)}</div>` : ''}
@@ -3809,7 +3916,7 @@ function rvGroupCard(g) {
         <div class="rv-g-title">
           <b>${esc(g.title || RV_MODE[g.mode] || '练习')}</b>
           ${g.legacy ? '' : (g.mode === 'review'
-      ? '<span class="mode-badge">回忆自评</span>'
+      ? '<span class="mode-badge">复习作答</span>'
       : g.answer_mode === 'deferred'
         ? '<span class="mode-badge deferred">先答后对</span>'
         : '<span class="mode-badge">边答边对</span>')}
@@ -3841,7 +3948,7 @@ function rvItemsHtml(g, items) {
   const wrongN = items.filter(it => it.choice && !it.correct).length;
   return `<div class="rv-acts">
       <button type="button" class="btn ok sm rv-ana" data-filter="all">📖 看这组解析</button>
-      ${(!review && wrongN) ? `<button type="button" class="btn ghost sm rv-ana" data-filter="wrong">错题解析（${wrongN}）</button>` : ''}
+      ${wrongN ? `<button type="button" class="btn ghost sm rv-ana" data-filter="wrong">错题解析（${wrongN}）</button>` : ''}
       <button type="button" class="btn ghost sm rv-redo" data-gid="${esc(g.gid)}">↻ 重做这组（${items.length} 题）</button>
       <span class="sub" style="margin:0">与交卷后看到的解析界面一致，可逐题翻看</span>
     </div>
@@ -4791,7 +4898,7 @@ function coachRvCard(g) {
       : aborted ? '<span class="tag" style="color:var(--bad)">已放弃</span>'
         : '<span class="tag" style="color:var(--warn)">未完成</span>';
   const modeTag = g.legacy ? ''
-    : g.mode === 'review' ? '<span class="mode-badge">回忆自评</span>'
+    : g.mode === 'review' ? '<span class="mode-badge">复习作答</span>'
       : g.answer_mode === 'deferred' ? '<span class="mode-badge deferred">先答后对</span>'
         : '<span class="mode-badge">边答边对</span>';
   return `<section class="card rv-g" data-gid="${esc(g.gid)}">
