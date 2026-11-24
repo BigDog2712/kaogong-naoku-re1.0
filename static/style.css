@@ -192,6 +192,35 @@ h2:first-child{margin-top:0}
 .kpi.warn .n{color:var(--warn)} .kpi.purple .n{color:var(--purple)}
 .kpi.bad .n{color:var(--bad)}
 
+/* ===== 学习时长构成：做题 / 看解析 / 复习 =====
+   卡片里是一行小字，统计页是一根堆叠条 + 近 14 天柱状图；三段之和恒等于总时长。 */
+.tp-line{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:7px;font-size:11.5px;color:var(--ink-3)}
+.tp-line span{display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.tp-dot{width:7px;height:7px;border-radius:50%;display:inline-block;flex:none}
+.tp-dot.a,.tp-bar i.a,.tp-stack i.a{background:var(--brand)}
+.tp-dot.n,.tp-bar i.n,.tp-stack i.n{background:var(--ok)}
+.tp-dot.r,.tp-bar i.r,.tp-stack i.r{background:var(--purple)}
+.tp-dot.o,.tp-bar i.o,.tp-stack i.o{background:var(--ink-3);opacity:.38}
+.tp-bar{display:flex;height:10px;margin:9px 0 2px;border-radius:99px;overflow:hidden;background:var(--surface-2)}
+.tp-bar i{display:block;height:100%;min-width:2px}
+.tp-bar.empty{opacity:.5}
+.tp-head{display:flex;gap:var(--s6);flex-wrap:wrap}
+.tp-legend{display:flex;flex-wrap:wrap;gap:4px 16px;margin-top:8px;font-size:12px;color:var(--ink-3)}
+.tp-legend span{display:inline-flex;align-items:center;gap:5px}
+.tp-legend b{color:var(--ink);font-size:13px;font-variant-numeric:tabular-nums}
+.tp-cols{display:flex;align-items:flex-end;gap:5px;height:168px;margin-top:16px;
+  padding-bottom:20px;overflow-x:auto;overflow-y:hidden;scrollbar-width:thin}
+.tp-col{flex:1;min-width:14px;height:100%;display:flex;flex-direction:column;justify-content:flex-end;position:relative}
+.tp-stack{width:100%;display:flex;flex-direction:column-reverse;border-radius:3px 3px 0 0;overflow:hidden;
+  min-height:3px;background:var(--surface-2)}
+/* 段高由 flex-grow 按毫秒分配：父级只给「当天总量占最高那天的比例」，不需要百分比高度链 */
+.tp-stack i{display:block;width:100%;min-height:1px;flex:0 0 auto}
+.tp-col>span{position:absolute;left:50%;bottom:-18px;transform:translateX(-50%);
+  font-size:10px;color:var(--ink-3);white-space:nowrap;line-height:1}
+.tp-col:hover .tp-stack{outline:1px solid var(--brand);outline-offset:1px}
+.rv-row.is-dropped td{color:var(--ink-3)}
+.rv-row.is-dropped td b{color:var(--ink-3)!important}
+
 /* ===== 按钮：墨蓝实心，去掉通用渐变与发光 ===== */
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:var(--s2);border:none;cursor:pointer;
   background:var(--brand);color:var(--on-brand);
@@ -304,6 +333,8 @@ html[data-theme="dark"] .tag.dropped{background:oklch(30% 0.055 32);color:oklch(
   transition:border-color .15s,color .15s,background .15s}
 .pp-home:hover{border-color:var(--brand);color:var(--brand);background:var(--paper-2)}
 .pp-home:active{transform:translateY(.5px)}
+/* 「放弃」是破坏性操作：默认同样弱化，悬停才转为警示色 */
+.pp-quit:hover{border-color:var(--bad);color:var(--bad);background:var(--paper-2)}
 
 /* ===== 移动端悬浮画笔 / 橡皮 ===== */
 .draw-fab{display:none}
@@ -321,13 +352,31 @@ html[data-theme="dark"] .tag.dropped{background:oklch(30% 0.055 32);color:oklch(
 .answer-sheet .opt .k{color:#263b50}
 .answer-sheet .answer-line{padding:10px 0;border-top:1px solid #d9dee2}
 .answer-sheet-content{position:relative;z-index:1}
-.answer-ink{position:absolute;inset:0;width:100%;height:100%;z-index:2;pointer-events:none}
+/* 笔迹在上、文字在下：手写线划过文字时能盖住文字，看起来像真的写在纸上 */
+.answer-ink{position:absolute;inset:0;width:100%;height:100%;z-index:3;pointer-events:none}
+/* 已落笔的文字标注：纸张上的 DOM 对象（不是位图像素），所以能重新选中、改写、单独删除。
+   「T 文字」模式下点一下即选中，再点一次改内容，Delete / × 删除。 */
+.ink-text-item{position:absolute;z-index:2;padding:0 1px;line-height:1.35;letter-spacing:.01em;
+  font-weight:400;font-synthesis:none;-webkit-font-smoothing:antialiased;
+  white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
+  pointer-events:none;cursor:text;outline:1px dashed transparent;outline-offset:2px}
+.answer-viewport.tool-text .ink-text-item{pointer-events:auto}
+.ink-text-item.selected{outline-color:currentColor}
+.ink-text-del{position:absolute;top:-11px;right:-13px;width:18px;height:18px;padding:0;
+  display:none;align-items:center;justify-content:center;border-radius:50%;
+  border:1px solid rgba(0,0,0,.18);background:#fff;color:#b23b3b;font:600 12px/1 system-ui,sans-serif;
+  cursor:pointer;box-shadow:0 1px 4px rgba(0,0,0,.22)}
+.ink-text-item.selected .ink-text-del{display:flex}
+@supports (background:color-mix(in srgb,red 10%,transparent)){
+  .ink-text-item.selected{background:color-mix(in srgb,currentColor 7%,transparent)}
+}
 /* 文字标注输入框：贴在答题纸上，随缩放 / 滚动一起走；颜色 = 当前画笔颜色 */
-.ink-text-editor{position:absolute;z-index:3;min-width:4px;min-height:1.35em;max-width:100%;
+.ink-text-editor{position:absolute;z-index:4;min-width:4px;min-height:1.35em;max-width:100%;
   padding:0 1px;margin:0;border:0;border-radius:3px;background:transparent;
-  outline:1px dashed currentColor;outline-offset:2px;font-weight:600;line-height:1.35;
+  outline:1px dashed currentColor;outline-offset:2px;font-weight:400;line-height:1.35;
   letter-spacing:.01em;white-space:pre-wrap;overflow-wrap:anywhere;word-break:break-word;
-  caret-color:currentColor;cursor:text;-webkit-user-select:text;user-select:text}
+  caret-color:currentColor;cursor:text;-webkit-user-select:text;user-select:text;
+  font-synthesis:none;-webkit-font-smoothing:antialiased}
 .ink-text-editor:focus{outline-style:solid}
 @supports (background:color-mix(in srgb,red 10%,transparent)){
   .ink-text-editor{background:color-mix(in srgb,currentColor 9%,transparent)}
@@ -335,6 +384,8 @@ html[data-theme="dark"] .tag.dropped{background:oklch(30% 0.055 32);color:oklch(
 .answer-viewport.tool-text,.answer-viewport.tool-text .answer-ink{cursor:text}
 .answer-viewport.drawing{cursor:crosshair;touch-action:none}
 .answer-viewport.drawing .answer-ink{pointer-events:auto}
+/* 文字模式下画布让开指针：点在旧文字上是选中/编辑，点在空白处才是新落笔 */
+.answer-viewport.tool-text .answer-ink{pointer-events:none}
 .answer-sheet .reveal .sec{color:#18212a}
 @media(max-width:560px){.answer-sheet{padding:18px 14px;min-height:360px}.draw-toolbar{gap:6px}.draw-setting input[type="range"]{width:68px}}
 .stem{font-size:1.0625rem;line-height:1.85;margin-bottom:var(--s5);
@@ -787,6 +838,10 @@ html[data-theme="dark"] .tag.wrong-tag{background:oklch(29% 0.055 27);color:oklc
   .progress{align-items:flex-start;gap:var(--s2)}
   .progress #pp-txt{font-size:12px;line-height:1.6}
   .qtimer{font-size:12px;padding:3px 8px}
+  /* 窄屏：两个退出按钮只留图标，给计时胶囊腾地方 */
+  .pp-side{gap:6px}
+  .pp-home{padding:4px 8px}
+  .pp-home .pp-lbl{display:none}
   .answer-viewport{max-height:calc(100dvh - 156px)}
   .answer-sheet{overflow-wrap:anywhere}
   .deferred-nav>.row{width:100%;display:grid;grid-template-columns:1fr 1fr}
@@ -1038,6 +1093,12 @@ tr.qrow:hover td{background:var(--surface-2)}
 .rv-g-acc b{display:block;font-family:var(--font-serif);font-size:1.45rem;line-height:1.1}
 .rv-g-acc span{font-size:11.5px;color:var(--ink-3)}
 .rv-caret{color:var(--ink-3);transition:transform .2s var(--ease);flex:none}
+/* 未完成记录：组头右侧的删除按钮（点它不会展开本组） */
+.rv-del{flex:none;display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:var(--radius-pill);border:1px solid var(--rule);
+  background:transparent;color:var(--ink-3);font:inherit;font-size:12px;line-height:1.4;
+  cursor:pointer;appearance:none;white-space:nowrap;transition:border-color .15s,color .15s,background .15s}
+.rv-del:hover{border-color:var(--bad);color:var(--bad);background:var(--paper-2)}
+.rv-del:disabled{opacity:.6;cursor:default}
 .rv-g.open .rv-caret{transform:rotate(180deg)}
 .rv-g-body{border-top:1px solid var(--rule);padding:6px 14px 12px;background:var(--surface)}
 .rv-hint{margin:10px 2px 0;font-size:12px}
@@ -1073,6 +1134,7 @@ tr.qrow:hover td{background:var(--surface-2)}
   .rv-g-acc b{font-size:1.2rem}
   .rv-g-acc span{font-size:10.5px}
   .rv-caret{font-size:11px;opacity:.75}
+  .rv-del{font-size:11px;padding:3px 7px}
   .rv-g-meta{gap:8px;font-size:12px}
   .rv-g-body{padding:4px 8px 10px}
   .rv-tbl table{min-width:0}

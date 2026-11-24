@@ -448,6 +448,35 @@ def today():
 def now():
     return datetime.datetime.now().isoformat(timespec="seconds")
 
+def done_by_day(uid, since=None):
+    """按天统计「完成题数」，全站统一口径（总览 / 今日回溯 / 热力图 / 打卡 / 陪伴者看板）。
+
+    一次判分算一题：practice_items 里 graded_at 非空的那些行，按所属组的开始日期归到某天。
+    同一道题在不同组里各做一次就算两题——这样和「今日回溯」里逐组的 已答 N 题 逐行对得上
+    （旧口径用 reviews 的 COUNT(DISTINCT qid)，同一题重做会被并成一题，所以永远对不上）。
+    丢弃掉的题（dropped=1）不计入。
+
+    分组功能上线前的旧作答没有 practice_items，退回到 reviews 里那些「当天不在任何组内」的记录，
+    历史热力图才不会一上线就被清零。
+    """
+    w1 = " AND date(gp.started)>=?" if since else ""
+    w2 = " AND date(r.ts)>=?" if since else ""
+    args = [uid] + ([since] if since else []) + [uid] + ([since] if since else []) + [uid]
+    rows = q_all(f"""
+        SELECT d, SUM(n) n FROM (
+            SELECT date(gp.started) d, COUNT(*) n
+              FROM practice_items it JOIN practice_groups gp ON gp.gid=it.gid
+             WHERE gp.uid=? AND it.graded_at IS NOT NULL AND IFNULL(it.dropped,0)=0{w1}
+             GROUP BY d
+            UNION ALL
+            SELECT date(r.ts) d, COUNT(*) n FROM reviews r
+             WHERE r.user_id=?{w2}
+               AND NOT EXISTS (SELECT 1 FROM practice_items it JOIN practice_groups gp ON gp.gid=it.gid
+                                WHERE gp.uid=? AND date(gp.started)=date(r.ts) AND it.qid=r.qid)
+             GROUP BY d
+        ) GROUP BY d""", tuple(args))
+    return {r["d"]: int(r["n"] or 0) for r in rows if r["d"]}
+
 _APP_VER = {"v": None, "mtime": None}
 
 def app_ver():
@@ -937,6 +966,20 @@ def ensure_tables():
     db().execute("CREATE INDEX IF NOT EXISTS idx_pg_uid_day ON practice_groups(uid, started)")
     db().execute("CREATE INDEX IF NOT EXISTS idx_pi_gid ON practice_items(gid, pos)")
     db().commit()
+    # ---------- 学习时长拆三段：做题 / 看解析 / 复习 ----------
+    # ms 仍是总时长（老版本页面只报总数时全算作做题），三段是它的拆解，用来回答「时间花在哪」。
+    for _col, _ddl in (
+        ("answer_ms", "ALTER TABLE study_time ADD COLUMN answer_ms INTEGER DEFAULT 0"),
+        ("analysis_ms", "ALTER TABLE study_time ADD COLUMN analysis_ms INTEGER DEFAULT 0"),
+        ("review_ms", "ALTER TABLE study_time ADD COLUMN review_ms INTEGER DEFAULT 0"),
+        # 练习题里被丢弃的行：保留痕迹（回溯里显示「已丢弃」），但不计入任何题数统计
+        ("dropped", "ALTER TABLE practice_items ADD COLUMN dropped INTEGER DEFAULT 0"),
+    ):
+        try:
+            db().execute(_ddl)
+            db().commit()
+        except Exception:
+            pass
     # ---------- 云端账号体系（与本地纯昵称账号并存，互不影响） ----------
     db().executescript("""
     CREATE TABLE IF NOT EXISTS cloud_accounts(
@@ -1025,11 +1068,13 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("答题时可以直接写字了：练习与复习界面左键双击答题区（或点工具条「T 文字」）就能在落点输入，"
-                     "文字颜色跟随当前画笔，输入时滚轮可调字号，字号默认沿用上次（默认 16px，贴近正文大小），"
-                     "回车落笔、Esc 取消，写完和手写笔迹一样可撤销。"
-                     "手机上画笔栏新增第三枚「T」按钮，长按可调字号。"
-                     "备份与管理员账号保持上一版：个人快照只留最新 1 份，全库快照每天 0 点一份、保留 7 份，管理员全库唯一。")
+APP_RELEASE_NOTES = ("「今日已练习」和「今日回溯」终于对得上数了：两处都改成「今天完成（已判分）的题数」，"
+                     "同一道题在不同组各做一次算两题，和回溯里逐组的已答题数逐行一致。"
+                     "练习顶栏是两个按钮：「⏸ 暂时退出」保住进度回总览，随时点「继续上次刷题」接着做；"
+                     "「✕ 放弃」结束本组、不再继续，已作答的题留在回溯（标「已放弃」），统计不会倒退。"
+                     "丢弃题目时自动补一道同类题（同模块同大类），本组题数不变。"
+                     "学习时长拆成三段：做题 / 看解析 / 复习，总览卡片与「数据统计 → 学习时长构成」都能看到今天的时间花在哪。"
+                     "复习排期仍是「今日题目今日不复习」：当天做过的题到期日排到明天。")
 
 
 def ensure_release_announcement():
@@ -1662,6 +1707,9 @@ class Handler(BaseHTTPRequestHandler):
             "/api/practice/start": self.api_practice_start,
             "/api/practice/mark": self.api_practice_mark,
             "/api/practice/end": self.api_practice_end,
+            "/api/practice/abort": self.api_practice_abort,
+            "/api/practice/swap": self.api_practice_swap,
+            "/api/practice/drop": self.api_practice_drop,
             "/api/note": self.api_note,
             "/api/fav": self.api_fav,
             "/api/discard": self.api_discard,
@@ -1826,13 +1874,16 @@ class Handler(BaseHTTPRequestHandler):
             rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
                                    gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
                                    IFNULL(gp.state,'open') state,
-                                   COUNT(it.qid) n,
-                                   SUM(CASE WHEN it.graded_at IS NOT NULL THEN 1 ELSE 0 END) answered,
-                                   SUM(CASE WHEN IFNULL(it.correct,0)=1 THEN 1 ELSE 0 END) right_n,
-                                   SUM(CASE WHEN it.graded_at IS NOT NULL AND IFNULL(it.correct,0)=0
-                                            THEN 1 ELSE 0 END) wrong_n,
-                                   SUM(IFNULL(it.timeout,0)) timeout_n,
-                                   SUM(IFNULL(it.ms,0)) spent_ms
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN 1 ELSE 0 END) n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                            THEN 1 ELSE 0 END) answered,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND IFNULL(it.correct,0)=1
+                                            THEN 1 ELSE 0 END) right_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                             AND IFNULL(it.correct,0)=0 THEN 1 ELSE 0 END) wrong_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.timeout,0) ELSE 0 END) timeout_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.ms,0) ELSE 0 END) spent_ms,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=1 THEN 1 ELSE 0 END) dropped_n
                             FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
                             WHERE gp.uid=? AND date(gp.started)=?
                             GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
@@ -1845,6 +1896,7 @@ class Handler(BaseHTTPRequestHandler):
                 r["timeout_n"] = int(r["timeout_n"] or 0)
                 r["spent_ms"] = int(r["spent_ms"] or 0)
                 r["total_ms"] = int(r["total_ms"] or 0)
+                r["dropped_n"] = int(r["dropped_n"] or 0)
                 r["legacy"] = False
                 groups.append(r)
             # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
@@ -1893,7 +1945,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "没有这组练习记录"})
             items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
                                     IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
-                                    IFNULL(it.ms,0) ms, it.graded_at,
+                                    IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
                                     s.id, s.module, s.category, s.kadian, s.stem
                              FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
                              WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
@@ -2197,10 +2249,20 @@ class Handler(BaseHTTPRequestHandler):
             dropped_n = q_one("SELECT COUNT(*) n FROM discarded WHERE uid=?", (uid,))["n"]
             due_new = max(0, total_q - learned - dropped_n)   # 没进度行的题都算新题，不必预铺行
             due_rev = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
-            studied_today = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?", (uid, t))["n"]
-            # 学习时长（答题 + 看解析，由前端按秒累计后分批上报）
-            st_today = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, t))
-            st_total = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
+            # 今日已练习 = 今日完成（已判分）的题数，与「今日回溯」里的已答题数同一口径
+            studied_today = done_by_day(uid, t).get(t, 0)
+            # 学习时长：ms 是总时长，下面三段是它的拆解（做题 / 看解析 / 复习）
+            st_today = q_one("""SELECT ms, IFNULL(answer_ms,0) answer_ms, IFNULL(analysis_ms,0) analysis_ms,
+                                       IFNULL(review_ms,0) review_ms
+                                FROM study_time WHERE uid=? AND day=?""", (uid, t))
+            st_total = q_one("""SELECT SUM(ms) s, SUM(IFNULL(answer_ms,0)) a, SUM(IFNULL(analysis_ms,0)) an,
+                                       SUM(IFNULL(review_ms,0)) r FROM study_time WHERE uid=?""", (uid,))
+            today_parts = {"answer": int((st_today or {}).get("answer_ms") or 0),
+                           "analysis": int((st_today or {}).get("analysis_ms") or 0),
+                           "review": int((st_today or {}).get("review_ms") or 0)}
+            total_parts = {"answer": int((st_total or {}).get("a") or 0),
+                           "analysis": int((st_total or {}).get("an") or 0),
+                           "review": int((st_total or {}).get("r") or 0)}
             wrong_n = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0", (uid,))["n"]
             fav_n = q_one("SELECT COUNT(*) n FROM favorites WHERE user_id=?", (uid,))["n"]
             by_mod = q_all("""SELECT q.module m, COUNT(*) total,
@@ -2220,6 +2282,7 @@ class Handler(BaseHTTPRequestHandler):
                 "wrong": wrong_n, "fav": fav_n, "discarded": dropped_n,
                 "today_ms": int((st_today or {}).get("ms") or 0),
                 "total_ms": int((st_total or {}).get("s") or 0),
+                "today_parts": today_parts, "total_parts": total_parts,
                 "total": total_q,
             })
 
@@ -2273,16 +2336,19 @@ class Handler(BaseHTTPRequestHandler):
                                 WHERE s.wrong>0{cond} ORDER BY s.wrong DESC, s.ease ASC LIMIT ?""",
                              (uid, *args, size))
             elif mode == "review":
+                # 今日题目今日不复习：今天已经复习过的题不再回到今天的复习池（避免刚做完又抽到同一题）
                 rows = q_all(f"""SELECT q.* {J}
-                                WHERE s.status!='new' AND s.due<=?{cond}
-                                ORDER BY s.due ASC, s.ease ASC LIMIT ?""", (uid, today(), *args, size))
+                                WHERE s.status!='new' AND s.due<=? AND IFNULL(date(s.last_review),'')<>?{cond}
+                                ORDER BY s.due ASC, s.ease ASC LIMIT ?""", (uid, today(), today(), *args, size))
             elif mode == "mix":
                 # 重复练习题优先：答错 > 遗忘(lapses) > 到期复习（此池不受 exclude 限制，刚做错的也能立刻重练）；
                 # 新题仅作补充，且排除近期已练过的，避免无意义重复。
+                # 「今日题目今日不复习」：今天做过的题今天不再自动抽回来，想重做走「错题重练 / 再练今天答错的题」。
                 rows = q_all(f"""SELECT q.* {J}
                                 WHERE 1=1{cond} AND (s.wrong>0 OR s.lapses>0 OR (s.status!='new' AND s.due<=?))
+                                  AND IFNULL(date(s.last_review),'')<>?
                                 ORDER BY (CASE WHEN s.wrong>0 THEN 0 WHEN s.lapses>0 THEN 1 ELSE 2 END),
-                                         s.due ASC, RANDOM() LIMIT ?""", (uid, today(), *args, size))
+                                         s.due ASC, RANDOM() LIMIT ?""", (uid, today(), today(), *args, size))
                 if len(rows) < size:
                     fill = q_all(f"""SELECT q.* {J}
                                     WHERE 1=1{cond} AND {NEW}{excl_clause} ORDER BY RANDOM() LIMIT ?""",
@@ -2371,18 +2437,44 @@ class Handler(BaseHTTPRequestHandler):
             ids = [r["qid"] for r in q_all("SELECT qid FROM favorites WHERE user_id=?", (uid,))]
             return self._send(200, {"ids": ids})
 
+        if path == "/api/study-time/stat":
+            # 学习时长构成：逐日三段（做题 / 看解析 / 复习）+ 累计
+            uid = need_uid(g("token"))
+            days = max(1, min(90, _int(g("days"), 14)))
+            since = (datetime.date.today() - datetime.timedelta(days=days - 1)).isoformat()
+            rows = q_all("""SELECT day, ms, IFNULL(answer_ms,0) a, IFNULL(analysis_ms,0) an,
+                                   IFNULL(review_ms,0) r FROM study_time
+                            WHERE uid=? AND day>=? ORDER BY day""", (uid, since))
+            out = []
+            for r in rows:
+                a, an, rv = int(r["a"] or 0), int(r["an"] or 0), int(r["r"] or 0)
+                ms = int(r["ms"] or 0)
+                # other = 本版上线前的老记录（只有总数、没有拆解），单独显示，不硬塞进任何一段
+                out.append({"day": r["day"], "ms": ms, "answer": a, "analysis": an,
+                            "review": rv, "other": max(0, ms - a - an - rv)})
+            tot = q_one("""SELECT SUM(ms) ms, SUM(IFNULL(answer_ms,0)) a, SUM(IFNULL(analysis_ms,0)) an,
+                                  SUM(IFNULL(review_ms,0)) r FROM study_time WHERE uid=?""", (uid,)) or {}
+            tm, ta = int(tot.get("ms") or 0), int(tot.get("a") or 0)
+            tan, tr = int(tot.get("an") or 0), int(tot.get("r") or 0)
+            blank = {"day": today(), "ms": 0, "answer": 0, "analysis": 0, "review": 0, "other": 0}
+            return self._send(200, {"ok": True, "days": out,
+                                    "total": {"ms": tm, "answer": ta, "analysis": tan, "review": tr,
+                                              "other": max(0, tm - ta - tan - tr)},
+                                    "today": next((x for x in out if x["day"] == today()), blank)})
+
         if path == "/api/heatmap":
             days = max(30, min(365, _int(g("days"), 120)))
             uid = need_uid(g("token"))
-            rows = q_all("""SELECT date(ts) d, COUNT(*) n FROM reviews WHERE user_id=?
-                            GROUP BY date(ts) ORDER BY d DESC LIMIT ?""", (uid, days))
-            return self._send(200, {"days": [{"d": r["d"], "n": r["n"]} for r in reversed(rows)]})
+            since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+            # 与总览 / 今日回溯同一口径：一次判分算一题（旧记录退回 reviews）
+            m = done_by_day(uid, since)
+            return self._send(200, {"days": [{"d": d, "n": m[d]} for d in sorted(m)]})
 
         if path == "/api/streak":
             uid = need_uid(g("token"))
-            dates = [r["d"] for r in q_all("""SELECT DISTINCT date(ts) d FROM reviews
-                                              WHERE user_id=? ORDER BY d DESC""", (uid,))]
-            dset = set(dates)
+            m = done_by_day(uid)                     # 口径同上：热力图、打卡、总览三处数字一致
+            dset = {d for d, n in m.items() if n > 0}
+            dates = sorted(dset, reverse=True)
             cur = 0
             probe = datetime.date.today()
             # 今天没学也不断签：从昨天开始数
@@ -2401,8 +2493,7 @@ class Handler(BaseHTTPRequestHandler):
                     run = 1
                 best = max(best, run); prev = dt
             goal = int(get_user_setting(uid, "daily_goal", get_setting("daily_goal", "120")) or 120)
-            today_n = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?",
-                            (uid, today()))["n"]
+            today_n = m.get(today(), 0)
             return self._send(200, {"current": cur, "best": best, "goal": goal, "today": today_n})
 
         if path == "/api/accuracy":
@@ -2788,6 +2879,112 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(404, {"error": "没有这组练习记录"})
         return self._send(200, {"ok": True})
 
+    def api_practice_drop(self, p):
+        """删除一组「还没交卷」的练习记录。
+
+        两个入口共用：练习中的「放弃本组」，以及今日回溯里清理没做完的半截记录。
+        已交卷（state='done'）的记录不允许删除——那是真实做过的成绩，回溯里必须保留。
+        """
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()[:40]
+        gp = q_one("SELECT gid, IFNULL(state,'open') state FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+        if not gp:
+            return self._send(404, {"error": "没有这组练习记录"})
+        if gp["state"] == "done":
+            return self._send(409, {"error": "已交卷的练习记录不能删除"})
+        with _LOCK:
+            db().execute("DELETE FROM practice_items WHERE gid=?", (gid,))
+            del_n = db().execute("DELETE FROM practice_groups WHERE gid=? AND uid=?", (gid, uid)).rowcount
+            db().commit()
+        return self._send(200, {"ok": True, "gid": gid, "removed": int(del_n or 0)})
+
+    def api_practice_abort(self, p):
+        """放弃本组：结束、不再继续，但已经作答的记录留在今日回溯里（标「已放弃」）。
+
+        与「删除记录」的区别：放弃只停手，不抹掉已经做过的题——否则「今日已练习」会随着
+        放弃而倒退，看起来像白做了。想彻底清掉这条记录，用回溯里组头的「删除」。
+        """
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()[:40]
+        gp = q_one("SELECT gid, IFNULL(state,'open') state FROM practice_groups WHERE gid=? AND uid=?",
+                   (gid, uid))
+        if not gp:
+            return self._send(404, {"error": "没有这组练习记录"})
+        if gp["state"] == "done":
+            return self._send(200, {"ok": True, "state": "done"})
+        ms = max(0, _int(p.get("total_ms"), 0))
+        with _LOCK:
+            if ms:
+                db().execute("""UPDATE practice_groups SET state='aborted', ended=?, total_ms=?
+                                WHERE gid=? AND uid=?""", (now(), ms, gid, uid))
+            else:
+                db().execute("""UPDATE practice_groups SET state='aborted', ended=?
+                                WHERE gid=? AND uid=?""", (now(), gid, uid))
+            db().commit()
+        return self._send(200, {"ok": True, "state": "aborted", "gid": gid})
+
+    def api_practice_swap(self, p):
+        """丢弃一题，当场补一道同类题（同模块 + 同大类），本组题数保持不变。
+
+        丢弃本身写进 discarded：所有抽题模式都不再出现，真题浏览的「已丢弃」里能恢复。
+        组内那一行打 dropped=1 留痕——今日回溯看得到「已丢弃」，但不计入题数与正确率。
+        找不到同类题时返回 card=null，由前端把这道题从本组队列里摘掉（题数变少但不会错乱）。
+        """
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()[:40]
+        qid = (p.get("qid") or "").strip()[:40]
+        old = q_one("SELECT qid, module, IFNULL(category,'') category FROM qdb.questions WHERE qid=?", (qid,))
+        if not old:
+            return self._send(404, {"error": "没有这道题"})
+        pos = 0
+        with _LOCK:
+            db().execute("INSERT OR REPLACE INTO discarded(uid,qid,ts) VALUES(?,?,?)", (uid, qid, now()))
+            if gid:
+                row = q_one("SELECT pos, graded_at FROM practice_items WHERE gid=? AND uid=? AND qid=?",
+                            (gid, uid, qid))
+                if row and not row["graded_at"]:        # 没作答的才允许标丢弃；已判分的是真实成绩
+                    db().execute("UPDATE practice_items SET dropped=1 WHERE gid=? AND uid=? AND qid=?",
+                                 (gid, uid, qid))
+                if row:
+                    pos = int(row["pos"] or 0)
+                else:
+                    mx = q_one("SELECT MAX(pos) m FROM practice_items WHERE gid=?", (gid,)) or {}
+                    pos = int(mx.get("m") or 0) + 1
+            db().commit()
+        excl = [x.strip() for x in (p.get("exclude") or "").split(",")
+                if re.fullmatch(r"\d{1,20}", x.strip())][:400]
+        excl_sql = (" AND q.qid NOT IN (%s)" % ",".join("?" * len(excl))) if excl else ""
+        base_where = f"""q.qid NOT IN (SELECT qid FROM discarded WHERE uid=?)
+                      AND q.qid NOT IN (SELECT qid FROM practice_items WHERE gid=?)
+                      AND q.qid<>?{excl_sql}"""
+
+        def pick(extra, extra_args):
+            sql = f"""SELECT q.* FROM qdb.questions q
+                        LEFT JOIN srs s ON s.qid=q.qid AND s.user_id=?
+                       WHERE {base_where}{extra}
+                       ORDER BY (CASE WHEN s.qid IS NULL OR s.status='new' THEN 0 ELSE 1 END), RANDOM()
+                       LIMIT 1"""
+            # 参数顺序必须与 SQL 里的占位符一致：excl 的占位符在 base_where 末尾，所以排在 extra 之前
+            return q_one(sql, tuple([uid, uid, gid or "-", qid] + excl + list(extra_args)))
+
+        picked, how = None, ""
+        if old["category"]:
+            picked = pick(" AND q.module=? AND IFNULL(q.category,'')=?", (old["module"], old["category"]))
+            how = "category"
+        if not picked:
+            picked = pick(" AND q.module=?", (old["module"],))
+            how = "module"
+        if not picked:
+            return self._send(200, {"ok": True, "qid": "", "pos": pos, "card": None, "same": ""})
+        ensure_srs_rows(uid, [picked["qid"]])
+        if gid:
+            with _LOCK:
+                db().execute("""INSERT OR IGNORE INTO practice_items(gid,uid,qid,pos) VALUES(?,?,?,?)""",
+                             (gid, uid, picked["qid"], pos))
+                db().commit()
+        return self._send(200, {"ok": True, "qid": picked["qid"], "pos": pos, "same": how,
+                                "card": clean_card(picked, reveal=False)})
+
     def api_grade(self, p):
         try:
             qid_int = int(p.get("id")); grade = int(p.get("grade"))
@@ -2886,7 +3083,9 @@ class Handler(BaseHTTPRequestHandler):
         dump("doubt", "SELECT qid,status,note,updated FROM doubt_status WHERE user_id=?")
         dump("exam", "SELECT title,total,correct,score,duration,ts FROM exam_history WHERE user_id=?")
         dump("discarded", "SELECT qid,ts FROM discarded WHERE uid=?")
-        dump("study_time", "SELECT day,ms FROM study_time WHERE uid=?")
+        dump("study_time", "SELECT day,ms,IFNULL(answer_ms,0) answer_ms,"
+                           "IFNULL(analysis_ms,0) analysis_ms,IFNULL(review_ms,0) review_ms "
+                           "FROM study_time WHERE uid=?")
         out["counts"] = {k: len(out[k]) for k in ("srs", "reviews", "notes", "favorites",
                                                   "doubt", "discarded", "exam", "study_time")}
         fn = "kaogong-backup-%s.json" % today().replace("-", "")
@@ -2971,9 +3170,16 @@ class Handler(BaseHTTPRequestHandler):
                 day = str(r.get("day") or "")
                 if not day:
                     continue
-                old = c.execute("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, day)).fetchone()
+                old = c.execute("""SELECT ms, IFNULL(answer_ms,0) answer_ms, IFNULL(analysis_ms,0) analysis_ms,
+                                          IFNULL(review_ms,0) review_ms
+                                   FROM study_time WHERE uid=? AND day=?""", (uid, day)).fetchone()
                 ms = max(int(old["ms"] or 0) if old else 0, int(r.get("ms") or 0))
-                c.execute("INSERT OR REPLACE INTO study_time(uid,day,ms) VALUES(?,?,?)", (uid, day, ms))
+                # 三段取较大值合并（旧备份没有这三列 → 0，不会把已有拆解冲掉）
+                parts = []
+                for k in ("answer_ms", "analysis_ms", "review_ms"):
+                    parts.append(max(int(old[k] or 0) if old else 0, int(r.get(k) or 0)))
+                c.execute("""INSERT OR REPLACE INTO study_time(uid,day,ms,answer_ms,analysis_ms,review_ms)
+                             VALUES(?,?,?,?,?,?)""", (uid, day, ms, *parts))
                 n["study_time"] += 1
             for r in data.get("exam") or []:
                 if not r.get("ts"):
@@ -3479,25 +3685,53 @@ class Handler(BaseHTTPRequestHandler):
 
     def api_study_time(self, p):
         """累计学习时长（毫秒）。前端在答题页 / 解析页按秒累计，每 20 秒或离开页面时上报一次。
-        单次上限 6 小时，避免异常数据把统计冲爆。"""
+
+        ms 是总时长；parts 是它的拆解：answer 做题 / analysis 看解析 / review 复习到期。
+        旧版页面只报 ms（没有 parts）时全部算作做题，保证总数永远准确、三段之和不超过总数。
+        单次每段上限 6 小时，避免异常数据把统计冲爆。
+        """
         uid = need_uid(p.get("token"))
         try:
             ms = int(p.get("ms") or 0)
         except (TypeError, ValueError):
             ms = 0
         ms = max(0, min(ms, 6 * 3600 * 1000))
+        cap = 6 * 3600 * 1000
+        parts = {"answer": 0, "analysis": 0, "review": 0}
+        raw = p.get("parts")
+        if isinstance(raw, dict):
+            for k in parts:
+                try:
+                    parts[k] = max(0, min(int(raw.get(k) or 0), cap))
+                except (TypeError, ValueError):
+                    parts[k] = 0
+        if not any(parts.values()):
+            parts["answer"] = ms                   # 老页面 / 只报总数：算作做题
+        add = sum(parts.values())
         d = today()
-        if ms:
+        if add:
             with _LOCK:
-                db().execute("INSERT OR IGNORE INTO study_time(uid,day,ms) VALUES(?,?,0)", (uid, d))
-                db().execute("UPDATE study_time SET ms=ms+? WHERE uid=? AND day=?", (ms, uid, d))
+                db().execute("""INSERT OR IGNORE INTO study_time(uid,day,ms,answer_ms,analysis_ms,review_ms)
+                                VALUES(?,?,0,0,0,0)""", (uid, d))
+                db().execute("""UPDATE study_time SET ms=ms+?, answer_ms=answer_ms+?,
+                                       analysis_ms=analysis_ms+?, review_ms=review_ms+?
+                                WHERE uid=? AND day=?""",
+                             (add, parts["answer"], parts["analysis"], parts["review"], uid, d))
                 db().commit()
-        cur = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, d))
-        tot = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
+        cur = q_one("""SELECT ms, IFNULL(answer_ms,0) a, IFNULL(analysis_ms,0) an, IFNULL(review_ms,0) r
+                       FROM study_time WHERE uid=? AND day=?""", (uid, d)) or {}
+        tot = q_one("""SELECT SUM(ms) s, SUM(IFNULL(answer_ms,0)) a, SUM(IFNULL(analysis_ms,0)) an,
+                              SUM(IFNULL(review_ms,0)) r FROM study_time WHERE uid=?""", (uid,)) or {}
         return self._send(200, {
-            "ok": True, "added": ms,
-            "today_ms": int((cur or {}).get("ms") or 0),
-            "total_ms": int((tot or {}).get("s") or 0),
+            "ok": True, "added": add,
+            "today_ms": int(cur.get("ms") or 0),
+            "total_ms": int(tot.get("s") or 0),
+            "today_parts": {"answer": int(cur.get("a") or 0),
+                            "analysis": int(cur.get("an") or 0),
+                            "review": int(cur.get("r") or 0)},
+            "total_parts": {"answer": int(tot.get("a") or 0),
+                            "analysis": int(tot.get("an") or 0),
+                            "review": int(tot.get("r") or 0)},
         })
 
     def api_account_reset(self, p):
@@ -3539,10 +3773,12 @@ class Handler(BaseHTTPRequestHandler):
         learned = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new'", (uid,))["n"]
         due = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
         wrong = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0", (uid,))["n"]
-        today_n = q_one("SELECT COUNT(DISTINCT qid) n FROM reviews WHERE user_id=? AND date(ts)=?", (uid, t))["n"]
+        today_n = done_by_day(uid, t).get(t, 0)      # 与这位陪读自己的总览同一口径
         ans = q_one("""SELECT COUNT(*) n, SUM(CASE WHEN grade>=3 THEN 1 ELSE 0 END) ok
                        FROM reviews WHERE user_id=?""", (uid,)) or {}
-        st_today = q_one("SELECT ms FROM study_time WHERE uid=? AND day=?", (uid, t))
+        st_today = q_one("""SELECT ms, IFNULL(answer_ms,0) answer_ms, IFNULL(analysis_ms,0) analysis_ms,
+                                   IFNULL(review_ms,0) review_ms
+                            FROM study_time WHERE uid=? AND day=?""", (uid, t))
         st_all = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
         last = q_one("SELECT MAX(ts) ts FROM reviews WHERE user_id=?", (uid,))
         fav = q_one("SELECT COUNT(*) n FROM favorites WHERE user_id=?", (uid,))["n"]
@@ -3555,6 +3791,9 @@ class Handler(BaseHTTPRequestHandler):
             "answered": n, "accuracy": round(ok * 100.0 / n, 1) if n else 0,
             "today_ms": int((st_today or {}).get("ms") or 0),
             "total_ms": int((st_all or {}).get("s") or 0),
+            "today_parts": {"answer": int((st_today or {}).get("answer_ms") or 0),
+                            "analysis": int((st_today or {}).get("analysis_ms") or 0),
+                            "review": int((st_today or {}).get("review_ms") or 0)},
             "last_ts": (last or {}).get("ts") or "",
             "online": bool(live and live.get("online")),
             "live": live or {"online": False, "status": "idle"},

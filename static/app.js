@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261123f';
+const APP_VER = '20261124a';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -74,7 +74,7 @@ const esc = (s) => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;
 const app = document.getElementById('app');
 let BOOT = null;
 
-const state = { session: null, exam: null, ink: Object.create(null), inkRef: null, ul: Object.create(null), gradeCtx: null };
+const state = { session: null, exam: null, ink: Object.create(null), inkTxt: Object.create(null), inkRef: null, ul: Object.create(null), gradeCtx: null };
 
 /* ---------- 功能2：限时模式配置 ---------- */
 const LIMIT_DEFAULT = {
@@ -405,8 +405,8 @@ async function viewDashboard() {
   <div class="grid g4" style="margin-top:16px">
     <a class="card kpi" href="#/wrongbook" style="text-decoration:none"><div class="n" style="color:var(--bad)">${s.wrong}</div><div class="l">📕 错题本</div></a>
     <a class="card kpi" href="#/favorites" style="text-decoration:none"><div class="n" style="color:var(--purple)">${s.fav}</div><div class="l">⭐ 我的收藏</div></a>
-    <div class="card kpi brand time" title="今日学习时长（答题 + 看解析）：${durText(s.today_ms)}"><div class="n">${durHtml(s.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
-    <a class="card kpi purple time" href="#/stats" style="text-decoration:none" title="累计学习时长（答题 + 看解析）：${durText(s.total_ms)}"><div class="n">${durHtml(s.total_ms)}</div><div class="l">⏳ 总学习时长</div></a>
+    <div class="card kpi brand time" title="今日学习时长 = 做题 + 看解析 + 复习：${durText(s.today_ms)}"><div class="n">${durHtml(s.today_ms)}</div><div class="l">⏱️ 今日学习时长</div>${tpLine(s.today_parts, s.today_ms)}</div>
+    <a class="card kpi purple time" href="#/stats" style="text-decoration:none" title="累计学习时长（做题 + 看解析 + 复习）：${durText(s.total_ms)}"><div class="n">${durHtml(s.total_ms)}</div><div class="l">⏳ 总学习时长</div>${tpLine(s.total_parts, s.total_ms)}</a>
   </div>
   <div class="center" style="padding:24px">
     ${resumeBtn}
@@ -689,13 +689,14 @@ function renderCard() {
   <div class="progress"><div class="pp-main"><span id="pp-txt">第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; ${ppStat}</span>
     <div class="pbar"><i style="width:${doneN / S.queue.length * 100}%"></i></div></div>
     <div class="pp-side">
-      <button class="pp-home" id="pp-home" type="button" title="返回总览：本组进度已保存，回来可继续">⌂ 总览</button>
+      <button class="pp-home" id="pp-back" type="button" title="暂时退出：本组进度已保存，回总览点「继续上次刷题」可接着做">⏸<span class="pp-lbl"> 暂时退出</span></button>
+      <button class="pp-home pp-quit" id="pp-quit" type="button" title="放弃本组：结束并删除这组记录，不再出现在今日回溯">✕<span class="pp-lbl"> 放弃</span></button>
       <button class="qtimer" id="qtimer" type="button" title="左键单击这里可暂停计时"><span id="qt-icon" aria-hidden="true">⏱</span><b id="qt-now">0:00</b><small>/ <span id="qt-all">0:00</span></small><span class="qt-hint" id="qt-hint"></span></button>
       <div id="ctime-box"></div>
     </div></div>
   <div class="draw-toolbar" id="draw-toolbar" aria-label="答题画笔工具">
     <button class="btn sm ghost" id="draw-toggle" type="button" aria-pressed="false">✎ 画笔</button>
-    <label class="draw-setting" title="画笔粗细">粗细<input id="draw-size" type="range" min="1" max="8" value="2"><output id="draw-size-value">2</output></label>
+    <label class="draw-setting" title="画笔粗细：6 档，最细 1px、最粗 4px">粗细<input id="draw-size" type="range" min="1" max="6" step="1" value="3"><output id="draw-size-value">3 档</output></label>
     <span class="draw-setting">颜色</span><div class="draw-colors" role="group" aria-label="画笔颜色">
       ${INK_COLORS.map(([c, n]) => `<button class="draw-color-swatch${c.toLowerCase() === loadInk().c.toLowerCase() ? ' selected' : ''}" type="button" data-color="${c}" style="background:${c}" aria-label="${n}" title="${n}"></button>`).join('')}
     </div>
@@ -744,9 +745,12 @@ function renderCard() {
   </div></div>`;
   const qb = document.getElementById('qtimer');
   if (qb) qb.onclick = (e) => { e.preventDefault(); e.stopPropagation(); toggleClockPause(); };
-  // 功能：返回总览（本组进度已随 saveSession 落盘，总览页可「继续上次刷题」）
-  const homeB = document.getElementById('pp-home');
-  if (homeB) homeB.onclick = () => { try { saveSession(); } catch (e) { } location.hash = '#/'; };
+  // 暂时退出：本组进度已随 saveSession 落盘，总览页可「继续上次刷题」
+  const backB = document.getElementById('pp-back');
+  if (backB) backB.onclick = () => { try { saveSession(); } catch (e) { } location.hash = '#/'; };
+  // 放弃：结束本组并删掉这组记录（不再继续，也不占着今日回溯）
+  const quitB = document.getElementById('pp-quit');
+  if (quitB) quitB.onclick = () => abandonPractice();
   // 功能：丢弃本题
   const dropB = document.getElementById('t-drop');
   if (dropB) dropB.onclick = () => dropCurrent();
@@ -776,13 +780,47 @@ function renderCard() {
   startClock();
 }
 
+/* 放弃本组：不再继续，但已经作答的记录留在「今日回溯」里（标为已放弃）。
+   不删记录是刻意的——删掉会让「今日已练习」「今日完成题数」凭空倒退，看起来像白做了；
+   想彻底清掉这条记录，去回溯里点组头的「删除」。 */
+async function abandonPractice() {
+  const S = state.session;
+  if (!S) return;
+  const n = (S.queue || []).length;
+  const answered = isDeferred(S)
+    ? (S.queue || []).filter(c => S.answers && S.answers[c.id]).length
+    : Math.min(S.idx + (S.phase === 'answer' ? 1 : 0), n);
+  const msg = `放弃本组练习？\n\n· 本组还剩 ${Math.max(0, n - S.idx)} 题没做，已作答 ${answered} 题\n`
+    + '· 放弃后不能再继续，这组会在「今日回溯」里标为已放弃\n'
+    + (answered ? '· 已作答的题仍计入今日已练习，复习排期照常\n' : '')
+    + '· 想连记录一起清掉，可在今日回溯里点组头右侧的「删除」';
+  if (!confirm(msg)) return;
+  const gid = S.gid || '';
+  stopClock(); stopLimitTimer();
+  try { captureInk(); } catch (e) { }
+  clearSession();                 // 总览不再提供「继续上次刷题」
+  clearInkStore(); clearUlStore();
+  state.session = null;
+  if (gid) {
+    try { await POST('/api/practice/abort', { gid, total_ms: Math.round(allElapsed(S) || 0) }); }
+    catch (e) { /* 组还没建好：本来就没有记录 */ }
+  }
+  if ((location.hash || '') === '#/' || location.hash === '') { try { await viewDashboard(); } catch (e) { } }
+  else location.hash = '#/';
+}
+
 /* ---------- 答题画笔：颜色可调 / 大号橡皮 / 撤销回退 / 移动端悬浮钮 ---------- */
 const INK_KEY = 'kg_ink';
 const INK_COLORS = [['#d73535', '红色'], ['#2563eb', '蓝色'], ['#198754', '绿色']];
-const PEN_MIN = 1, PEN_MAX = 8, PEN_DEFAULT = 2;
+/* 画笔粗细：共 6 档，每档实际线宽 1.0 / 1.6 / 2.2 / 2.8 / 3.4 / 4.0 px。
+   最细仍是原来的 1 号，最粗是原来的 4 号；1-4 之间再细分，细笔不再只有 1 和 2 两个跳档。 */
+const PEN_LEVELS = 6;
+const PEN_WIDTHS = [1, 1.6, 2.2, 2.8, 3.4, 4];
+const PEN_DEFAULT = 3;                                      // 默认第 3 档 = 2.2px，接近旧版粗细
+const clampPen = v => Math.min(PEN_LEVELS, Math.max(1, Math.round(+v || PEN_DEFAULT)));
+const penW = lv => PEN_WIDTHS[clampPen(lv) - 1];             // 档位 → 实际线宽（px）
 const ERASE_MIN = 8, ERASE_MAX = 72, ERASE_DEFAULT = 24;   // 橡皮默认 24px ≈ 旧版的 3 倍
-const TEXT_MIN = 10, TEXT_MAX = 72, TEXT_DEFAULT = 16;     // 标注文字字号（px，画布坐标；默认贴近正文大小）
-const clampPen = v => Math.min(PEN_MAX, Math.max(PEN_MIN, Math.round(+v || PEN_DEFAULT)));
+const TEXT_MIN = 10, TEXT_MAX = 72, TEXT_DEFAULT = 15;     // 标注文字字号（px，画布坐标；默认贴近正文大小）
 const clampErase = v => Math.min(ERASE_MAX, Math.max(ERASE_MIN, Math.round((+v || ERASE_DEFAULT) / 2) * 2));
 const clampText = v => Math.min(TEXT_MAX, Math.max(TEXT_MIN, Math.round(+v || TEXT_DEFAULT)));
 function loadInk() {
@@ -814,8 +852,16 @@ function inkStore() {
   if (!state.ink) state.ink = Object.create(null);
   return state.ink;
 }
+/* 文字标注按「对象」而不是位图保存：每条 {id,t,x,y,s,c}，
+   x/y/字号都是画布坐标（= 答题纸 CSS 像素），所以能随时重新定位、重新编辑、单独删除，
+   删除一条不影响底下的手写笔迹。 */
+function textStore() {
+  if (!state.inkTxt) state.inkTxt = Object.create(null);
+  return state.inkTxt;
+}
 function clearInkStore() {
   state.ink = Object.create(null);
+  state.inkTxt = Object.create(null);
   try { sessionStorage.removeItem(INK_SS_KEY); } catch (e) { }
 }
 /* 刷新页面后「继续上次刷题」：把这次答题已画的笔迹接回来 */
@@ -824,10 +870,17 @@ function loadInkStore() {
   if (!sig) return;
   try {
     const o = JSON.parse(sessionStorage.getItem(INK_SS_KEY) || 'null');
-    if (o && o.sig === sig && o.map && typeof o.map === 'object') {
-      const m = Object.create(null);
-      Object.keys(o.map).forEach(k => { if (typeof o.map[k] === 'string') m[k] = o.map[k]; });
-      state.ink = m;
+    if (o && o.sig === sig) {
+      if (o.map && typeof o.map === 'object') {
+        const m = Object.create(null);
+        Object.keys(o.map).forEach(k => { if (typeof o.map[k] === 'string') m[k] = o.map[k]; });
+        state.ink = m;
+      }
+      if (o.txt && typeof o.txt === 'object') {
+        const t = Object.create(null);
+        Object.keys(o.txt).forEach(k => { if (Array.isArray(o.txt[k]) && o.txt[k].length) t[k] = o.txt[k]; });
+        state.inkTxt = t;
+      }
     }
   } catch (e) { }
 }
@@ -835,17 +888,23 @@ function saveInkStore() {
   const sig = inkSig();
   if (!sig) return;
   try {
-    const map = inkStore(), keys = Object.keys(map);
-    const keep = Object.create(null);
+    const map = inkStore(), txt = textStore();
+    const keys = Object.keys(map).concat(Object.keys(txt).filter(k => !(k in map)));
+    const keep = Object.create(null), keepTxt = Object.create(null);
     let total = 0, n = 0;
     // 体积保护：最多保留 24 题 / 约 3.2M 字符，超出丢最早的
     for (let i = keys.length - 1; i >= 0 && n < 24; i--) {
-      const v = map[keys[i]];
-      if (!v || typeof v !== 'string') continue;
-      if (total + v.length > 3.2e6) break;
-      keep[keys[i]] = v; total += v.length; n++;
+      const k = keys[i];
+      const img = typeof map[k] === 'string' ? map[k] : '';
+      const items = Array.isArray(txt[k]) && txt[k].length ? txt[k] : null;
+      if (!img && !items) continue;
+      const size = img.length + (items ? JSON.stringify(items).length : 0);
+      if (total + size > 3.2e6) break;
+      if (img) keep[k] = img;
+      if (items) keepTxt[k] = items;
+      total += size; n++;
     }
-    sessionStorage.setItem(INK_SS_KEY, JSON.stringify({ sig, map: keep }));
+    sessionStorage.setItem(INK_SS_KEY, JSON.stringify({ sig, map: keep, txt: keepTxt }));
   } catch (e) { }
 }
 /* 把当前画布存进本题的笔迹位（题目切换 / 离开答题页 / 刷新前调用） */
@@ -1027,7 +1086,7 @@ function initUnderline() {
   sheet.addEventListener('pointerup', e => {
     const vp = document.getElementById('answer-viewport');
     if (vp && vp.classList.contains('drawing')) return;              // 画笔/橡皮模式不抢框选
-    if (e.target && e.target.closest && e.target.closest('.ink-text-editor')) return;   // 文字框里的拖选不划线
+    if (e.target && e.target.closest && e.target.closest('.ink-text-editor, .ink-text-item')) return;   // 文字框里的拖选不划线
     if (Math.hypot(e.clientX - dx, e.clientY - dy) < 8) return;      // 单击 / 双击不算框选
     const sel = window.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount) return;
@@ -1091,7 +1150,8 @@ function initAnswerDrawing() {
   const ink = loadInk();
   let penColor = ink.c, penSize = ink.s, eraseSize = ink.e, textSize = ink.t, tool = 'pen';
   const eraseW = () => eraseSize;                      // 橡皮尺寸独立记录，与画笔粗细互不影响
-  const strokeW = () => (tool === 'eraser' ? eraseW() : penSize);
+  const strokeW = () => (tool === 'eraser' ? eraseW() : penW(penSize));   // 画笔按档位换算实际线宽
+  const sizeText = () => `${penSize} 档`;
   const saveInkState = () => saveInk({ c: penColor, s: penSize, e: eraseSize, t: textSize });
 
   const setPressed = (el, on) => { if (el) el.setAttribute('aria-pressed', String(!!on)); };
@@ -1104,8 +1164,9 @@ function initAnswerDrawing() {
     setPressed(textBtn, on && tool === 'text');
     setPressed(fabText, on && tool === 'text');
     viewport.classList.toggle('tool-text', on && tool === 'text');
+    if (textSel && !(on && tool === 'text')) selectText(null);   // 切出文字模式就取消选中
     if (size && +size.value !== penSize) size.value = penSize;
-    if (sizeVal) sizeVal.value = penSize;
+    if (sizeVal) sizeVal.value = sizeText();
     if (esize && +esize.value !== eraseSize) esize.value = eraseSize;
     if (esizeVal) esizeVal.value = eraseSize;
   };
@@ -1167,7 +1228,7 @@ function initAnswerDrawing() {
   };
   if (textBtn) textBtn.onclick = () => {
     if (viewport.classList.contains('drawing') && tool === 'text') setDrawing(false);
-    else { setDrawing(true, 'text'); flashHint(`文字 ${textSize}px · 单击落点 · Enter 确认 · 滚轮 调字号`); }
+    else { setDrawing(true, 'text'); flashHint(`文字 ${textSize}px · 单击落点写字 · 点已写的字可改可删`); }
   };
   if (widthSel) {
     widthSel.value = getReadW();
@@ -1187,6 +1248,7 @@ function initAnswerDrawing() {
         penColor = btn.dataset.color; saveInkState();
         paintSwatches();
         if (textEdit) { textEdit.el.style.color = penColor; return; }
+        if (textSel) { repaintSelectedText(); return; }   // 选中某条文字时换颜色，只改这一条
         if (!viewport.classList.contains('drawing') || tool === 'eraser' || tool === 'text') setDrawing(true, 'pen');
       };
     });
@@ -1197,7 +1259,7 @@ function initAnswerDrawing() {
   const applySize = v => {
     penSize = clampPen(v);
     if (size) size.value = penSize;
-    if (sizeVal) sizeVal.value = penSize;
+    if (sizeVal) sizeVal.value = sizeText();
     saveInkState();
   };
   const applyErase = v => {
@@ -1210,6 +1272,7 @@ function initAnswerDrawing() {
     textSize = clampText(v);
     saveInkState();
     if (textEdit) textEdit.el.style.fontSize = textSize + 'px';
+    else resizeSelectedText();          // 选中某条文字时，调字号直接改这一条
     syncUi();
   };
   if (size) size.oninput = () => { applySize(size.value); syncUi(); };
@@ -1244,7 +1307,7 @@ function initAnswerDrawing() {
        <div class="draw-colors" role="group" aria-label="画笔颜色">
          ${INK_COLORS.map(([c, n]) => `<button class="draw-color-swatch${c.toLowerCase() === penColor.toLowerCase() ? ' selected' : ''}" type="button" data-color="${c}" style="background:${c}" aria-label="${n}" title="${n}"></button>`).join('')}
        </div>
-       <label class="draw-setting">粗细<input id="fab-size" type="range" min="${PEN_MIN}" max="${PEN_MAX}" value="${penSize}"><output id="fab-size-v">${penSize}</output></label>`
+       <label class="draw-setting">粗细<input id="fab-size" type="range" min="1" max="${PEN_LEVELS}" step="1" value="${penSize}"><output id="fab-size-v">${sizeText()}</output></label>`
     : kind === 'text'
     ? `<div class="fab-title">文字 · 字号</div>
        <label class="draw-setting">字号<input id="fab-text-size" type="range" min="${TEXT_MIN}" max="${TEXT_MAX}" step="2" value="${textSize}"><output id="fab-text-size-v">${textSize}</output></label>
@@ -1274,7 +1337,7 @@ function initAnswerDrawing() {
     if (kind === 'pen') {
       bindSwatches(panel); paintSwatches();
       const fs = document.getElementById('fab-size'), fv = document.getElementById('fab-size-v');
-      if (fs) fs.oninput = () => { applySize(fs.value); if (fv) fv.value = penSize; };
+      if (fs) fs.oninput = () => { applySize(fs.value); if (fv) fv.value = sizeText(); };
     } else if (kind === 'text') {
       bindSwatches(panel); paintSwatches();
       const ts = document.getElementById('fab-text-size'), tv = document.getElementById('fab-text-size-v');
@@ -1327,39 +1390,118 @@ function initAnswerDrawing() {
     if (undo.length > 30) undo.shift();
     redo.length = 0; refreshUndoBtns();
   };
-  let lastStrokeTs = 0, strokeLive = false;
-  const paint = p => { ctx.lineTo(p.x, p.y); ctx.stroke(); lastStrokeTs = Date.now(); };
+  let lastStrokeTs = 0, strokeLive = false, penPrev = null;
+  /* 平滑落笔：以上一点当控制点、两点中点当终点画二次曲线，每段画完立刻重开路径。
+     既消掉了快速划动时的折线感，也不会反复重描同一条路径把笔画边缘越描越毛。 */
+  const paint = p => {
+    if (!penPrev) {
+      penPrev = p; ctx.lineTo(p.x, p.y); ctx.stroke();
+      lastStrokeTs = Date.now(); return;
+    }
+    const mx = (penPrev.x + p.x) / 2, my = (penPrev.y + p.y) / 2;
+    ctx.quadraticCurveTo(penPrev.x, penPrev.y, mx, my);
+    ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(mx, my);
+    penPrev = p; lastStrokeTs = Date.now();
+  };
 
-  /* ---------- 文字标注 ----------
-     左键双击答题区（或「T 文字」后单击）在落点唤出一个带光标的输入框；
-     字号跟画笔一样记在本地，下次默认沿用上一次的大小；编辑时滚轮直接调字号；
-     文字颜色始终跟随当前画笔颜色，确认（Enter / 点别处）后真正画进画布，可撤销。 */
-  const inkFont = () => `600 ${textSize}px ${getComputedStyle(sheet).fontFamily || 'system-ui,sans-serif'}`;
-  const wrapInkText = (txt, x) => {
-    const limit = Math.max(60, sheet.clientWidth - 8 - x);     // 写到纸边自动折行，别画到画布外面
-    const out = [];
-    String(txt).split('\n').forEach(par => {
-      let line = '';
-      for (const ch of par) {
-        const test = line + ch;
-        if (line && ctx.measureText(test).width > limit) { out.push(line); line = ch === ' ' ? '' : ch; }
-        else line = test;
-      }
-      out.push(line);
+  /* ---------- 文字标注（可再编辑 / 单独删除） ----------
+     文字不再烧进画布位图：每条文字是一份独立记录（内容 / 位置 / 字号 / 颜色），
+     以纸张上的 DOM 浮层呈现。所以「T 文字」模式下点一下旧文字就能选中：
+     再点一次改内容，Delete / Backspace 或右上角 × 删掉这一条，删掉不伤底下的手写笔迹。
+     字号与颜色记在本地，下次落笔沿用上一次；编辑时滚轮直接调字号。 */
+  const textEls = new Map();            // id -> DOM（仅用于命中与样式，数据以 qidTexts 为准）
+  let textSel = null;                   // 当前选中的文字 id
+  const qidTexts = () => {
+    const s = textStore();
+    if (!Array.isArray(s[qid0])) s[qid0] = [];
+    return s[qid0];
+  };
+  const textById = id => qidTexts().find(x => x.id === id) || null;
+  const textNewId = () => 't' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+  const layoutTextEl = (el, it) => {
+    el.style.left = it.x + 'px';
+    el.style.top = it.y + 'px';
+    el.style.fontSize = it.s + 'px';
+    el.style.color = it.c;
+    el.style.maxWidth = Math.max(48, sheet.clientWidth - it.x - 8) + 'px';   // 写到纸边自动折行
+  };
+  const paintSelection = () => textEls.forEach((el, id) => el.classList.toggle('selected', id === textSel));
+  const selectText = id => {
+    const next = id || null;
+    if (textSel === next) { paintSelection(); return; }
+    textSel = next; paintSelection();
+    if (textSel) flashHint('已选中文字 · Delete 删除 · 再点一次重新编辑');
+  };
+  function resizeSelectedText() {
+    if (!textSel) return;
+    const it = textById(textSel), el = textEls.get(textSel);
+    if (!it || !el) return;
+    it.s = textSize; layoutTextEl(el, it); saveInkStore();
+  }
+  function repaintSelectedText() {
+    if (!textSel) return;
+    const it = textById(textSel), el = textEls.get(textSel);
+    if (!it || !el) return;
+    it.c = penColor; el.style.color = penColor; saveInkStore();
+  }
+  function removeText(id) {
+    const arr = qidTexts();
+    const i = arr.findIndex(x => x.id === id);
+    if (i < 0) return false;
+    arr.splice(i, 1);
+    const el = textEls.get(id);
+    if (el) el.remove();
+    textEls.delete(id);
+    if (textSel === id) textSel = null;
+    paintSelection(); saveInkStore(); kgMarkInk();
+    flashHint('已删除这条文字标注');
+    return true;
+  }
+  const textBodyOf = el => el && el.querySelector('.ink-text-body');
+  const mountText = it => {
+    const el = document.createElement('div');
+    el.className = 'ink-text-item';
+    el.dataset.inkId = it.id;
+    const body = document.createElement('span');
+    body.className = 'ink-text-body';
+    body.textContent = it.t;
+    el.appendChild(body);
+    const del = document.createElement('button');       // 触屏没有 Delete 键，给一个 × 兜底
+    del.className = 'ink-text-del';
+    del.type = 'button';
+    del.textContent = '×';
+    del.setAttribute('aria-label', '删除这条文字标注');
+    del.addEventListener('pointerdown', e => { e.preventDefault(); e.stopPropagation(); removeText(it.id); });
+    el.appendChild(del);
+    layoutTextEl(el, it);
+    el.addEventListener('pointerdown', e => {          // 文字模式下点选旧文字：别穿到画布上另起一段
+      if (!viewport.classList.contains('drawing') || tool !== 'text') return;
+      e.preventDefault(); e.stopPropagation();
+      if (textSel === it.id) openTextEditor({ x: it.x, y: it.y }, it);   // 再点一次 → 改内容
+      else selectText(it.id);                                            // 先选中
     });
-    return out;
+    el.addEventListener('dblclick', e => e.stopPropagation());
+    el.addEventListener('contextmenu', e => { if (tool === 'text') e.preventDefault(); });
+    sheet.appendChild(el);
+    textEls.set(it.id, el);
+    return el;
   };
-  const drawInkText = (txt, x, y) => {
-    ctx.save();
-    ctx.globalCompositeOperation = 'source-over';
-    ctx.fillStyle = penColor;
-    ctx.textBaseline = 'top';
-    ctx.font = inkFont();
-    const lh = Math.round(textSize * 1.35);
-    wrapInkText(txt, x).forEach((line, i) => { if (line) ctx.fillText(line, x, y + i * lh); });
-    ctx.restore();
-    inked = true; kgMarkInk();
+  const renderTexts = () => {
+    textEls.forEach(el => { try { el.remove(); } catch (e) { } });
+    textEls.clear(); textSel = null;
+    (textStore()[qid0] || []).forEach(mountText);
   };
+
+  /* 纸张宽度变化（换阅读宽度 / 窗口缩放）时重排文字折行宽度，别让字跑出纸外 */
+  if (window.__kgTextRO) { try { window.__kgTextRO.disconnect(); } catch (e) { } }
+  try {
+    window.__kgTextRO = new ResizeObserver(() => {
+      textEls.forEach((el, id) => { const it = textById(id); if (it) layoutTextEl(el, it); });
+    });
+    window.__kgTextRO.observe(sheet);
+  } catch (e) { }
 
   function closeTextEditor(cancel) {
     const cur = textEdit;
@@ -1369,36 +1511,59 @@ function initAnswerDrawing() {
     const txt = raw.split('\n').map(s => s.replace(/[ \t]+$/g, '')).join('\n').replace(/^\n+|\n+$/g, '');
     try { cur.el.remove(); } catch (e) { }
     viewport.classList.remove('text-editing');
-    if (cancel || !txt.trim()) return;
-    snapshot();
-    drawInkText(txt, cur.x, cur.y);
-    captureInk();                        // 立刻落进本题笔迹表，切题 / 刷新都不丢
-    refreshUndoBtns();
+    const host = cur.item ? textEls.get(cur.item.id) : null;
+    if (host) host.style.visibility = '';          // 编辑期间临时藏起来的原文字放回来
+    if (cancel) return;
+    if (cur.item) {                                // 改已有文字
+      if (!txt.trim()) { removeText(cur.item.id); return; }   // 内容清空 = 删掉这条
+      cur.item.t = txt; cur.item.s = textSize; cur.item.c = penColor;
+      if (host) { const b = textBodyOf(host); if (b) b.textContent = txt; layoutTextEl(host, cur.item); }
+      saveInkStore(); kgMarkInk();
+      return;
+    }
+    if (!txt.trim()) return;
+    const it = { id: textNewId(), t: txt, x: cur.x, y: cur.y, s: textSize, c: penColor };
+    qidTexts().push(it);
+    mountText(it);
+    saveInkStore(); kgMarkInk();                   // 立刻落盘，切题 / 刷新都不丢
   }
 
-  const openTextEditor = p => {
+  function openTextEditor(p, item) {
     if (!p) return;
     closeTextEditor(false);              // 上一个框先落笔，别把两段文字叠在一起
-    const r = canvas.getBoundingClientRect();
-    const kx = r.width ? canvas.width / r.width : 1, ky = r.height ? canvas.height / r.height : 1;
+    if (item) {                          // 改旧文字：字号/颜色跟着这条走
+      selectText(null);
+      textSize = item.s; penColor = item.c; saveInkState(); syncUi();
+    }
     const el = document.createElement('div');
     el.className = 'ink-text-editor';
     el.contentEditable = 'true';
     el.spellcheck = false;
     el.setAttribute('role', 'textbox');
     el.setAttribute('aria-label', '文字标注：输入内容，回车确认，Esc 取消，滚轮调字号');
-    el.style.left = (p.x / kx) + 'px';
-    el.style.top = (p.y / ky) + 'px';
-    el.style.maxWidth = Math.max(48, sheet.clientWidth - (p.x / kx) - 8) + 'px';
+    el.style.left = p.x + 'px';
+    el.style.top = p.y + 'px';
+    el.style.maxWidth = Math.max(48, sheet.clientWidth - p.x - 8) + 'px';
     el.style.fontSize = textSize + 'px';
     el.style.color = penColor;
+    if (item) el.textContent = item.t;
     sheet.appendChild(el);
-    textEdit = { el, x: p.x, y: p.y };
+    textEdit = { el, x: p.x, y: p.y, item: item || null };
+    if (item) { const host = textEls.get(item.id); if (host) host.style.visibility = 'hidden'; }
     viewport.classList.add('text-editing');
     try { el.focus({ preventScroll: true }); } catch (x) { el.focus(); }
+    if (item) {
+      try {                                        // 光标放到末尾，方便直接接着改
+        const r = document.createRange(); r.selectNodeContents(el); r.collapse(false);
+        const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+      } catch (x) { }
+    }
     el.addEventListener('keydown', e => {
       e.stopPropagation();
       if (e.key === 'Escape') { e.preventDefault(); closeTextEditor(true); }
+      else if (e.key === 'Delete' && item && !String(el.innerText || '').replace(/\u200b/g, '').trim()) {
+        e.preventDefault(); closeTextEditor(true); removeText(item.id);   // 编辑空框按 Delete = 删掉整条
+      }
       else if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); closeTextEditor(false); }
     });
     el.addEventListener('wheel', e => {          // 滚轮调字号：不缩放页面，记进本地
@@ -1412,8 +1577,31 @@ function initAnswerDrawing() {
       const t = (e.clipboardData && e.clipboardData.getData('text/plain')) || '';
       if (t) { try { document.execCommand('insertText', false, t.replace(/\r/g, '')); } catch (x) { } }
     });
-    flashHint(`字号 ${textSize}px · Enter 确认 · Esc 取消 · 滚轮 调字号`);
+    flashHint(item ? '修改文字 · Enter 确认 · Esc 取消 · 清空内容即删除'
+      : `字号 ${textSize}px · Enter 确认 · Esc 取消 · 滚轮 调字号`);
+  }
+
+  /* 选中文字后：Delete / Backspace 删掉整条，其余按键不再透给「按 A/B/C/D 作答」；
+     正在输入框里打字时全部交给输入框自己处理。 */
+  const onTextKey = e => {
+    if (!textSel) return;
+    if (e.ctrlKey || e.metaKey || e.altKey || e.isComposing || e.keyCode === 229) return;
+    const t = e.target;
+    if (t && (t.isContentEditable || t.tagName === 'INPUT' || t.tagName === 'TEXTAREA')) return;
+    if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); selectText(null); return; }
+    if (e.key === 'Delete' || e.key === 'Backspace') {
+      if (!textById(textSel)) { textSel = null; paintSelection(); return; }
+      e.preventDefault(); e.stopPropagation();
+      removeText(textSel);
+      return;
+    }
+    e.stopPropagation();                 // 选中状态下的普通按键不再当作答快捷键
   };
+  if (window.__kgTextKey) { try { document.removeEventListener('keydown', window.__kgTextKey, true); } catch (e) { } }
+  window.__kgTextKey = onTextKey;
+  document.addEventListener('keydown', onTextKey, true);
+
+  renderTexts();                          // 切回本题 / 刷新后把已写的文字接回来
 
   /* 左键双击画布落点写字（刚画完一笔时不抢，避免连笔误触） */
   canvas.addEventListener('dblclick', e => {
@@ -1427,7 +1615,7 @@ function initAnswerDrawing() {
     if (viewport.classList.contains('drawing')) return;              // 画笔模式交给画布
     const t = e.target;
     if (!t || !t.closest) return;
-    if (t.closest('.ink-text-editor') || t.closest('span.kg-ul')) return;
+    if (t.closest('.ink-text-editor') || t.closest('.ink-text-item') || t.closest('span.kg-ul')) return;
     if (t.closest('button, a, input, select, textarea, .opt, .grade, .rev-rate, .qtool')) return;
     if (t.closest('.stem, .material, .askmodel, .qhead')) return;    // 正文里的双击 = 选词
     if (!t.closest('.answer-sheet')) return;
@@ -1439,7 +1627,7 @@ function initAnswerDrawing() {
 
   /* 工具条提示条：右键快捷操作后短暂反馈 */
   const hintEl = document.getElementById('draw-hint');
-  const HINT_DEFAULT = '框选文字自动划线 · 双击写文字 · 右键 画笔/鼠标 · 滚轮 调大小';
+  const HINT_DEFAULT = '框选自动划线 · 双击写文字 · 文字模式下点已写的字可改可删';
   let hintTimer = null;
   const flashHint = txt => {
     if (!hintEl) return;
@@ -1454,7 +1642,7 @@ function initAnswerDrawing() {
     // 右键快捷开启时，滚轮用于调整当前工具尺寸；按住 Ctrl/⌘ 才缩放画布
     if (getRmouse() && !e.ctrlKey && !e.metaKey) {
       if (tool === 'eraser') { applyErase(eraseSize + (e.deltaY < 0 ? 4 : -4)); flashHint(`橡皮 ${eraseSize}px`); }
-      else { applySize(penSize + (e.deltaY < 0 ? 1 : -1)); flashHint(`画笔 ${penSize}px`); }
+      else { applySize(penSize + (e.deltaY < 0 ? 1 : -1)); flashHint(`画笔 ${sizeText()} · ${penW(penSize)}px`); }
       syncUi(); return;
     }
     const r = viewport.getBoundingClientRect(); setZoom(scale * (e.deltaY < 0 ? 1.1 : .9), e.clientX - r.left, e.clientY - r.top);
@@ -1478,22 +1666,22 @@ function initAnswerDrawing() {
     rTimer = setTimeout(() => {                          // 右键单击 → 画笔 / 鼠标 来回切
       rTimer = null; rLastDown = 0;
       if (viewport.classList.contains('drawing') && tool === 'pen') { setDrawing(false); flashHint('已切回鼠标（可正常选字）'); }
-      else { setDrawing(true, 'pen'); flashHint(`画笔 ${penSize}px · 滚轮调粗细`); }
+      else { setDrawing(true, 'pen'); flashHint(`画笔 ${sizeText()} · 滚轮调粗细`); }
     }, 300);
   });
 
   viewport.addEventListener('pointerdown', e => {
     if (!viewport.classList.contains('zoom-enabled')) return;
     if (e.button !== 0 && e.pointerType === 'mouse') return;   // 右键/中键不落笔
-    if (e.target && e.target.closest && e.target.closest('.ink-text-editor')) return;   // 文字框内点选/挪光标
+    if (e.target && e.target.closest && e.target.closest('.ink-text-editor, .ink-text-item')) return;   // 文字框内点选/挪光标
     if (panel && !panel.hidden) closePanel();
     if (textEdit) closeTextEditor(false);                      // 点画布别处：先把上一段文字落笔
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) { drawing = false; const a = [...pointers.values()]; pinch = { dist: Math.hypot(a[1].x - a[0].x, a[1].y - a[0].y), scale }; return; }
     // 鼠标在非画笔模式下拖动 = 框选文字（用于自动划线），不要顺带滚动页面
     if (!viewport.classList.contains('drawing')) { if (e.pointerType !== 'mouse') panPoint = { x: e.clientX, y: e.clientY, left: viewport.scrollLeft, top: viewport.scrollTop }; return; }
-    if (tool === 'text') { e.preventDefault(); openTextEditor(point(e)); return; }   // 文字模式：单击落点写字
-    e.preventDefault(); const p = point(e); strokeLive = false; ctx.beginPath(); ctx.moveTo(p.x, p.y);
+    if (tool === 'text') { e.preventDefault(); selectText(null); openTextEditor(point(e)); return; }   // 文字模式：空白处单击落点写字
+    e.preventDefault(); const p = point(e); strokeLive = false; penPrev = null; ctx.beginPath(); ctx.moveTo(p.x, p.y);
     ctx.lineWidth = strokeW(); ctx.lineCap = 'round'; ctx.lineJoin = 'round';
     ctx.globalCompositeOperation = tool === 'eraser' ? 'destination-out' : 'source-over';
     ctx.strokeStyle = penColor;
@@ -1513,7 +1701,12 @@ function initAnswerDrawing() {
   });
   const end = e => {
     pointers.delete(e.pointerId);
-    if (drawing) { ctx.closePath(); ctx.globalCompositeOperation = 'source-over'; drawing = false; strokeLive = false; kgMarkInk(); }
+    if (drawing) {
+      if (penPrev) { ctx.lineTo(penPrev.x, penPrev.y); ctx.stroke(); }   // 补上收笔的最后一小段
+      ctx.beginPath();                                                   // 结束这一笔，别接到下一笔的起点
+      ctx.globalCompositeOperation = 'source-over';
+      drawing = false; strokeLive = false; penPrev = null; kgMarkInk();
+    }
     if (!pointers.size) panPoint = null;
     if (pointers.size < 2) pinch = null;
   };
@@ -1992,20 +2185,31 @@ function nextCard() {
   saveSession();
 }
 
-/* 丢弃本题：服务端记一笔（所有练习模式都不再抽到它），并从本组队列里拿掉。
+/* 丢弃本题：服务端记一笔（所有练习模式都不再抽到它），并当场补一道同类题（同模块 + 同大类），
+   本组题数保持不变。补题由服务端 /api/practice/swap 完成；回溯里这道题标「已丢弃」，不计入统计。
    记录保留在「真题浏览 → 已丢弃」里，随时可以恢复。 */
 async function dropCurrent() {
   const S = state.session;
   if (!S || !S.queue || !S.queue.length) return;
   const c = S.queue[S.idx]; if (!c) return;
   if (S._dropping) return;
-  const left = S.queue.length - 1;
+  const same = c.category || c.module || '同模块';
   const tip = '· 本题不再出现在任何练习里（新题 / 错题重练 / 复习到期都跳过）；\n'
+    + `· 会补一道同类题（${same}），本组题数不变；\n`
     + '· 可在「真题浏览 → 已丢弃」中找到并恢复。';
-  if (!confirm(`丢弃第 ${S.idx + 1} 题？\n\n${tip}${left ? '' : '\n\n这是本组最后一题，丢弃后会抽取下一批题。'}`)) return;
+  if (!confirm(`丢弃第 ${S.idx + 1} 题？\n\n${tip}`)) return;
   S._dropping = true;
-  try { await POST('/api/discard', { id: c.id, on: 1 }); }
-  catch (e) { S._dropping = false; toast('丢弃失败：' + (e.message || e)); return; }
+  let r = null;
+  try {
+    r = await POST('/api/practice/swap', {
+      gid: S.gid || '', qid: c.qid,
+      exclude: (S.queue || []).map(x => x.qid).join(','),
+    });
+  } catch (e) {
+    S._dropping = false;
+    toast('丢弃失败：' + (e.message || e));
+    return;
+  }
   S._dropping = false;
   stopLimitTimer();
   captureInk();
@@ -2014,13 +2218,19 @@ async function dropCurrent() {
   if (S.spent) delete S.spent[c.id];
   if (S.fulls) delete S.fulls[c.id];
   if (S.marked) S.marked.delete(c.id);
-  if (!S.queue.length) {           // 整组丢完：收工回总览
+  const card = r && r.card;
+  if (card) {                                   // 同类题补回同一位置
+    S.queue.splice(S.idx, 0, card);
+    if (S.answers) delete S.answers[card.id];
+    try { addSeen([card.qid]); } catch (e) { }
+  }
+  if (!S.queue.length) {                        // 一题都补不到：收工回总览
     clearSession();
     toast('本组已全部丢弃');
     location.hash = '#/';
     return;
   }
-  if (S.idx >= S.queue.length) {   // 丢的是最后一题：按「做完最后一题」继续抽题或收尾
+  if (S.idx >= S.queue.length) {   // 丢的是最后一题且没补到：按「做完最后一题」继续抽题或收尾
     S.idx = S.queue.length - 1;
     saveSession();
     nextCard();
@@ -2029,7 +2239,9 @@ async function dropCurrent() {
   S.phase = 'question'; S.chosen = null; S.full = null; S.graded = 0;
   renderCard();
   saveSession();
-  toast('已丢弃 · 可在「真题浏览 → 已丢弃」里找回');
+  toast(card
+    ? `已丢弃，补了一道同类题${card.category ? '（' + card.category + '）' : ''}`
+    : '已丢弃 · 同类题暂时没有可补的');
 }
 
 function renderNextBar(auto) {
@@ -2163,14 +2375,40 @@ function toggleClockPause() {
   try { saveSession(); } catch (e) { }
 }
 
-/* ---------- 学习时长：答题 + 看解析 的连续计时 ----------
+/* ---------- 学习时长：分三段计时的连续累计 ----------
    不做「题数 × 平均时长」估算，按秒实时累计：只要停留在答题页 / 解析页且标签页可见就计入，
    点计时胶囊暂停、切到后台、回到总览或设置页则停止。每 20 秒把增量上报一次（离开页面时立刻上报），
-   服务端按天累加进 study_time 表，总览面板据此显示「今日学习时长 / 总学习时长」。 */
+   服务端按天累加进 study_time 表，总览面板据此显示「今日学习时长 / 总学习时长」。
+
+   一天的时间被切成三段（互斥、加起来等于总时长）：
+   · review   复习到期里回忆自评的那段时间（不含展开解析之后）
+   · analysis 答案/解析已展开、交卷报告、真题详情与浏览
+   · answer   其余在答题纸上的时间 = 做题
+   「时间花在哪」这件事只看这三段：复盘时能直接看出是刷题不够还是解析看太久。 */
 const ST_ROUTES = new Set(['#/study', '#/review', '#/wrongbook', '#/favorites', '#/materials',
   '#/detail', '#/exam', '#/browse', '#/kadian', '#/doubts']);
-const ST = { acc: 0, sent: 0, last: 0, timer: null, sending: false, p: null };
-
+const ST_READ_ONLY_ROUTES = new Set(['#/detail', '#/browse', '#/kadian', '#/doubts']);
+const ST = {
+  acc: { answer: 0, analysis: 0, review: 0 },
+  sent: { answer: 0, analysis: 0, review: 0 },
+  last: 0, timer: null, sending: false, p: null,
+};
+function stCurrentKind() {
+  const h = (location.hash || '#/').split('?')[0];
+  if (ST_READ_ONLY_ROUTES.has(h)) return 'analysis';        // 看题/看解析的页面
+  if (h === '#/exam') return (state.exam && !state.exam.submitted) ? 'answer' : 'analysis';
+  const S = state.session;
+  if (S) {
+    if (S.submitted) return 'analysis';                     // 交卷报告：在读解析
+    if (isRev(S) && S.phase !== 'answer') return 'review';
+    return S.phase === 'answer' ? 'analysis' : 'answer';
+  }
+  return h === '#/review' ? 'review' : 'answer';
+}
+function stPending() {
+  return Math.max(0, Math.round((ST.acc.answer - ST.sent.answer)
+    + (ST.acc.analysis - ST.sent.analysis) + (ST.acc.review - ST.sent.review)));
+}
 function stShouldRun() {
   if (document.hidden) return false;
   const h = (location.hash || '#/').split('?')[0];
@@ -2182,14 +2420,14 @@ function stShouldRun() {
 }
 function stStep() {
   const t = Date.now(); const d = t - ST.last; ST.last = t;
-  if (d > 0) ST.acc += Math.min(d, 10000);   // 休眠 / 后台节流造成的超长间隔不计
+  if (d > 0) ST.acc[stCurrentKind()] += Math.min(d, 10000);   // 休眠 / 后台节流造成的超长间隔不计
 }
 /* 常驻 1 秒心跳：该计时就累加，不该计时只把时间基准推后（不补算），
    这样在答题页 / 解析页 / 报告页之间来回切换都不会漏计或重复计。 */
 function stTick() {
   if (!stShouldRun()) { ST.last = Date.now(); return; }
   stStep();
-  if (ST.acc - ST.sent >= 20000) stFlush(false);
+  if (stPending() >= 20000) stFlush(false);
 }
 function stBoot() {
   if (ST.timer) return;
@@ -2202,18 +2440,26 @@ function stSync() {
   if (!stShouldRun() && (!ST_ROUTES.has(h) || document.hidden)) stFlush(false);
 }
 function stFlush(keepalive) {
-  const pend = Math.round(ST.acc - ST.sent);
-  if (pend < 1000) return Promise.resolve();
+  const parts = {};
+  let pend = 0;
+  Object.keys(ST.acc).forEach(k => {
+    const d = Math.round(ST.acc[k] - ST.sent[k]);
+    if (d > 0) { parts[k] = d; pend += d; }
+  });
+  if (pend < 1000) return Promise.resolve();                // 零头留着，下次一起报
   if (ST.sending) return ST.p || Promise.resolve();
-  const upto = ST.acc;
+  const upto = { ...ST.acc };
   ST.sending = true;
   ST.p = fetch(withU('/api/study-time'), {
     method: 'POST', keepalive: !!keepalive,
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ms: pend, token: tok() }),
+    body: JSON.stringify({ ms: pend, parts, token: tok() }),
   }).then(r => (r && r.ok) ? r.json() : null).then(j => {
-    ST.sent = upto;
-    if (j && typeof j.today_ms === 'number') { ST.todayMs = j.today_ms; ST.totalMs = j.total_ms || 0; }
+    Object.keys(ST.sent).forEach(k => { ST.sent[k] = upto[k]; });
+    if (j && typeof j.today_ms === 'number') {
+      ST.todayMs = j.today_ms; ST.totalMs = j.total_ms || 0;
+      ST.todayParts = j.today_parts || null;
+    }
   }).catch(() => { /* 网络失败：增量留着下次重试 */ }).then(() => { ST.sending = false; });
   return ST.p;
 }
@@ -2247,6 +2493,82 @@ function durTight(ms) {
   const m = Math.floor(s / 60), h = Math.floor(m / 60);
   if (!h) return m + 'm';
   return h + 'h' + (m % 60 ? (m % 60) + 'm' : '');
+}
+
+/* ---------- 学习时长三段：做题 / 看解析 / 复习 ----------
+   服务端把每天的总时长拆成 answer / analysis / review 三段（旧数据只有总数，落在 other 里）。
+   卡片里用一行小字，统计页用堆叠条，三段之和永远等于总时长。 */
+const TP_KINDS = [['answer', '做题', 'a'], ['analysis', '看解析', 'n'], ['review', '复习', 'r']];
+function tpOther(parts, ms) {
+  const s = (parts && ((parts.answer || 0) + (parts.analysis || 0) + (parts.review || 0))) || 0;
+  return Math.max(0, (ms || 0) - s);
+}
+function tpLine(parts, ms) {
+  const other = tpOther(parts, ms);
+  const rows = TP_KINDS.filter(([k]) => (parts && parts[k]) > 0)
+    .map(([k, label, cls]) => `<span><i class="tp-dot ${cls}"></i>${label} ${durTight(parts[k])}</span>`);
+  if (other > 0) rows.push(`<span><i class="tp-dot o"></i>旧记录 ${durTight(other)}</span>`);
+  return rows.length ? `<div class="tp-line">${rows.join('')}</div>` : '';
+}
+function tpBar(parts, ms) {
+  const items = TP_KINDS.map(([k, label, cls]) => [parts && parts[k] || 0, label, cls]);
+  const other = tpOther(parts, ms);
+  if (other > 0) items.push([other, '旧记录（未拆分）', 'o']);
+  const total = items.reduce((a, b) => a + b[0], 0);
+  if (!total) return '<div class="tp-bar empty"></div>';
+  return `<div class="tp-bar">${items.filter(x => x[0] > 0)
+    .map(([v, label, cls]) => `<i class="${cls}" style="width:${(v / total * 100).toFixed(2)}%" title="${label} ${durText(v)}"></i>`).join('')}</div>`;
+}
+/* 统计页的「学习时长构成」整块卡片：今日/累计三段 + 近 14 天逐日堆叠柱 */
+function timeStatHtml(ts, daysN = 14) {
+  if (!ts) return '<div class="card"><p class="sub" style="margin:0">学习时长构成暂时取不到，刷新页面再试。</p></div>';
+  const t = ts.today || {}, tot = ts.total || {};
+  const byDay = {};
+  (ts.days || []).forEach(d => { byDay[d.day] = d; });
+  const list = [];
+  for (let i = daysN - 1; i >= 0; i--) {
+    const dt = new Date(); dt.setDate(dt.getDate() - i);
+    const k = `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+    list.push(byDay[k] || { day: k, ms: 0, answer: 0, analysis: 0, review: 0, other: 0 });
+  }
+  const maxMs = Math.max(1, ...list.map(d => d.ms || 0));
+  const seg = (v, cls, label) => v > 0
+    ? `<i class="${cls}" style="flex-grow:${v}" title="${label} ${durText(v)}"></i>` : '';
+  const cols = list.map(d => {
+    const tip = `${d.day} · 共 ${durText(d.ms)}｜做题 ${durText(d.answer)}｜看解析 ${durText(d.analysis)}`
+      + `｜复习 ${durText(d.review)}${d.other ? '｜旧记录 ' + durText(d.other) : ''}`;
+    const dd = String(d.day);
+    const dt = new Date(dd + 'T00:00:00');
+    // 柱高 = 当天总量 / 最多的一天（最少留 2%，空白的日子也有一条底线，看得出「这天没学」）
+    const h = d.ms ? Math.max(2, d.ms / maxMs * 100) : 0;
+    return `<div class="tp-col" title="${esc(tip)}" aria-label="${esc(tip)}">
+      <div class="tp-stack" style="height:${h.toFixed(2)}%">${seg(d.answer, 'a', '做题')}${seg(d.analysis, 'n', '看解析')}${seg(d.review, 'r', '复习')}${seg(d.other, 'o', '旧记录')}</div>
+      <span>${isNaN(dt.getTime()) ? '' : dt.getDate()}</span></div>`;
+  }).join('');
+  const legend = o => `<div class="tp-legend">
+      <span><i class="tp-dot a"></i>做题 <b>${durTight(o.answer)}</b></span>
+      <span><i class="tp-dot n"></i>看解析 <b>${durTight(o.analysis)}</b></span>
+      <span><i class="tp-dot r"></i>复习 <b>${durTight(o.review)}</b></span>
+      ${o.other ? `<span><i class="tp-dot o"></i>旧记录 <b>${durTight(o.other)}</b></span>` : ''}
+    </div>`;
+  return `<div class="card">
+    <div class="tp-head">
+      <div style="flex:1;min-width:250px">
+        <p class="sub" style="margin:0">今日 · 共 ${durText(t.ms || 0)}</p>
+        ${tpBar(t, t.ms)}
+        ${legend(t)}
+      </div>
+      <div style="flex:1;min-width:250px">
+        <p class="sub" style="margin:0">累计 · 共 ${durText(tot.ms || 0)}</p>
+        ${tpBar(tot, tot.ms)}
+        ${legend(tot)}
+      </div>
+    </div>
+    <p class="sub" style="margin:20px 0 0">近 ${daysN} 天每天的时间构成（柱高 = 当天总时长，鼠标悬停看三段明细）</p>
+    <div class="tp-cols">${cols}</div>
+    <p class="sub" style="margin:14px 0 0">做题 = 在答题纸上思考与作答；看解析 = 对答案、读解析、翻真题；
+      复习 = 复习到期里的回忆自评。三者互斥，相加就是当天总学习时长。</p>
+  </div>`;
 }
 
 /* ---------- 功能2：限时模式倒计时 / 超时自动判错 ---------- */
@@ -3241,6 +3563,7 @@ function rvWhen(ts) {
 }
 function rvResult(it, g) {
   const review = g.mode === 'review';
+  if (it.dropped) return '<span class="rv-r none">已丢弃</span>';
   if (it.correct) return '<span class="rv-r ok">✓ 对</span>';
   if (it.timeout) return '<span class="rv-r bad">✗ 超时</span>';
   if (!review && !it.choice) return '<span class="rv-r none">未答</span>';
@@ -3251,8 +3574,14 @@ function rvGroupCard(g) {
   const pct = n ? Math.round(answered / n * 100) : 0;
   const acc = answered ? Math.round((g.right_n || 0) / answered * 100) : 0;
   const done = g.state === 'done';
+  const aborted = g.state === 'aborted';
+  const canDel = !done && !g.legacy;              // 没交卷的半截记录 / 已放弃的组都能删
+  const stateTag = g.legacy ? '<span class="tag" style="color:var(--ink-3)">旧记录 · 未保存选项</span>'
+    : (done ? '<span class="tag">已交卷</span>'
+      : aborted ? '<span class="tag" style="color:var(--bad)">已放弃</span>'
+        : '<span class="tag" style="color:var(--warn)">未完成</span>');
   return `<section class="card rv-g" data-gid="${esc(g.gid)}">
-    <button type="button" class="rv-g-head" aria-expanded="false">
+    <div class="rv-g-head" role="button" tabindex="0" aria-expanded="false">
       <div class="rv-g-main">
         <div class="rv-g-title">
           <b>${esc(g.title || RV_MODE[g.mode] || '练习')}</b>
@@ -3261,14 +3590,14 @@ function rvGroupCard(g) {
       : g.answer_mode === 'deferred'
         ? '<span class="mode-badge deferred">先答后对</span>'
         : '<span class="mode-badge">边答边对</span>')}
-          ${g.legacy ? '<span class="tag" style="color:var(--ink-3)">旧记录 · 未保存选项</span>'
-      : (done ? '<span class="tag">已交卷</span>' : '<span class="tag" style="color:var(--warn)">未完成</span>')}
+          ${stateTag}
         </div>
         <div class="rv-g-meta">
           <span>${rvClock(g.started)}${done && g.ended ? ' – ' + rvClock(g.ended) : ''}</span>
           <span>${answered < n ? `已答 ${answered}/${n} 题` : `${n} 题`}</span>
           <span>用时 ${durTight(g.total_ms || g.spent_ms)}</span>
           ${g.timeout_n ? `<span style="color:var(--warn)">超时 ${g.timeout_n}</span>` : ''}
+          ${g.dropped_n ? `<span style="color:var(--ink-3)">丢弃 ${g.dropped_n}</span>` : ''}
           ${g.scope ? `<span>${esc(g.scope)}</span>` : ''}
         </div>
         <div class="pbar rv-pbar"><i style="width:${pct}%"></i></div>
@@ -3277,8 +3606,9 @@ function rvGroupCard(g) {
         <b style="color:${!answered ? 'var(--ink-3)' : acc >= 80 ? 'var(--ok)' : acc >= 60 ? 'var(--brand)' : 'var(--bad)'}">${answered ? acc + '%' : '—'}</b>
         <span>${g.right_n || 0}/${answered}</span>
       </div>
+      ${canDel ? `<button type="button" class="rv-del" data-gid="${esc(g.gid)}" title="删除这条未完成的记录"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9.5 7V5.5h5V7"/><path d="M6.5 7l.8 12.1a1.6 1.6 0 0 0 1.6 1.4h6.2a1.6 1.6 0 0 0 1.6-1.4L17.5 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>删除</button>` : ''}
       <span class="rv-caret" aria-hidden="true">▾</span>
-    </button>
+    </div>
     <div class="rv-g-body" hidden></div>
   </section>`;
 }
@@ -3295,10 +3625,12 @@ function rvItemsHtml(g, items) {
     <div class="tbl-wrap cards rv-tbl"><table>
     <thead><tr><th>#</th><th>模块</th><th>题干</th><th>你的选择</th><th>正确答案</th><th>结果</th><th>用时</th></tr></thead>
     <tbody>${items.map((it, i) => {
-    const choice = it.choice
-      ? `<b>${esc(it.choice)}</b>`
-      : (review ? '<span class="sub">—</span>' : '<span class="rv-none">未答</span>');
-    return `<tr class="rv-row" data-qid="${esc(it.qid)}">
+    const choice = it.dropped
+      ? '<span class="sub">—</span>'
+      : it.choice
+        ? `<b>${esc(it.choice)}</b>`
+        : (review ? '<span class="sub">—</span>' : '<span class="rv-none">未答</span>');
+    return `<tr class="rv-row${it.dropped ? ' is-dropped' : ''}" data-qid="${esc(it.qid)}">
         <td data-label="" data-inline>${it.pos || i + 1}</td>
         <td data-label="模块">${esc(it.module || '')}${it.category ? `<span class="sub">${esc(it.category)}</span>` : ''}</td>
         <td data-label="题干">${esc(it.stem || '（题目已下架）')}</td>
@@ -3323,16 +3655,16 @@ async function viewToday() {
   const isToday = d.date === rvDay(0);
   app.innerHTML = `
   <h1>${isToday ? '今日回溯' : rvDayLabel(d.date) + '回溯'}</h1>
-  <p class="sub">按组回看练过的每一道题：当时选了什么、对没对、用了多久。先答后对模式记录的是<b>交卷对答案那一刻</b>的状态。</p>
+  <p class="sub">按组回看练过的每一道题：当时选了什么、对没对、用了多久。先答后对模式记录的是<b>交卷对答案那一刻</b>的状态。中途退出没交卷的组会标为「未完成」、放弃的组标「已放弃」，点组头右侧的 <b>删除</b> 可以清掉；丢弃的题会标「已丢弃」，不计入题数与正确率。</p>
   <div class="rv-days">${days.map((day, i) => `<a class="rv-day ${day === d.date ? 'on' : ''}" href="#/today${i === 0 ? '' : '?date=' + day}">${rvDayLabel(day)}</a>`).join('')}</div>
   <div class="grid g4 rv-sum">
     <div class="card kpi brand"><div class="n">${sum.groups || 0}</div><div class="l">练习组数</div></div>
-    <div class="card kpi"><div class="n">${sum.questions || 0}</div><div class="l">共练习题数</div></div>
+    <div class="card kpi" title="今日完成（已作答判分）的题数，和总览面板的「今日已练习」同一口径；同一道题在不同组各做一次算两题"><div class="n">${sum.answered || 0}</div><div class="l">完成题数</div></div>
     <div class="card kpi ok"><div class="n">${acc}%</div><div class="l">正确率 (${sum.right || 0}/${sum.answered || 0})</div></div>
     <div class="card kpi warn"><div class="n">${durTight(sum.ms || 0)}</div><div class="l">答题用时</div></div>
   </div>
   ${(sum.questions || 0) > (sum.answered || 0)
-      ? `<p class="sub" style="margin:10px 0 0">还有 ${sum.questions - sum.answered} 题未作答（含中途退出未交卷的组），在下面的组里可以看到具体是哪几道。</p>` : ''}
+      ? `<p class="sub" style="margin:10px 0 0">本页 ${sum.questions} 个题位中 <b>${sum.answered}</b> 题已完成，剩下 ${sum.questions - sum.answered} 题没作答（含中途退出、没交卷的组），在下面的组里能看到是哪几道。</p>` : ''}
   <div class="rv-list">
     ${groups.length ? groups.map(rvGroupCard).join('') : `<div class="empty"><div class="big">🗂</div>
       <h2>${isToday ? '今天还没有练习记录' : '这一天没有练习记录'}</h2>
@@ -3347,6 +3679,27 @@ async function viewToday() {
     const g = byGid[box.dataset.gid]; if (!g) return;
     const head = box.querySelector('.rv-g-head');
     const body = box.querySelector('.rv-g-body');
+    // 头部是 div[role=button]（里面还要放「删除」按钮）：补上键盘可达性
+    head.onkeydown = e => {
+      if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); head.click(); }
+    };
+    const delB = box.querySelector('.rv-del');
+    if (delB) delB.onclick = async ev => {
+      ev.stopPropagation();
+      if (g.state === 'done' || g.legacy) return;      // 交卷 / 旧记录不提供删除
+      const tip = `删除这条未完成的练习记录？\n\n· ${g.title || RV_MODE[g.mode] || '练习'} · 共 ${g.n || 0} 题，已答 ${g.answered || 0} 题\n`
+        + '· 删除后本组不再出现在今日回溯，也没法继续做\n'
+        + '· 已经自评过的题仍按记忆曲线排复习，不受影响';
+      if (!confirm(tip)) return;
+      delB.disabled = true;
+      try {
+        await POST('/api/practice/drop', { gid: g.gid });
+        viewToday();
+      } catch (e) {
+        delB.disabled = false;
+        alert(e && e.status === 409 ? '这组已经交卷了，记录不能删除。' : ('删除失败：' + (e.message || e)));
+      }
+    };
     head.onclick = async () => {
       const open = !box.classList.contains('open');
       box.classList.toggle('open', open);
@@ -3395,8 +3748,9 @@ async function viewToday() {
 async function viewStats() {
   loading('统计中…');
   await stSettle();                 // 同上：学习时长先落库再取数
-  const [st, heat, sk, acc, weak] = await Promise.all([
+  const [st, heat, sk, acc, weak, tstat] = await Promise.all([
     API('/api/stats'), API('/api/heatmap?days=180'), API('/api/streak'), API('/api/accuracy'), API('/api/weak'),
+    API('/api/study-time/stat?days=14').catch(() => null),
   ]);
   const hm = {}; heat.days.forEach(d => hm[d.d] = d.n);
   const cells = [];
@@ -3435,9 +3789,11 @@ async function viewStats() {
     <div class="card kpi warn"><div class="n">${st.wrong}</div><div class="l">📕 错题总数</div></div>
   </div>
   <div class="grid g2" style="margin-top:16px">
-    <div class="card kpi brand time" title="今日学习时长（答题 + 看解析）：${durText(st.today_ms)}"><div class="n">${durHtml(st.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
-    <div class="card kpi purple time" title="累计学习时长（答题 + 看解析）：${durText(st.total_ms)}"><div class="n">${durHtml(st.total_ms)}</div><div class="l">⏳ 总学习时长</div></div>
+    <div class="card kpi brand time" title="今日学习时长 = 做题 + 看解析 + 复习：${durText(st.today_ms)}"><div class="n">${durHtml(st.today_ms)}</div><div class="l">⏱️ 今日学习时长</div>${tpLine(st.today_parts, st.today_ms)}</div>
+    <div class="card kpi purple time" title="累计学习时长（做题 + 看解析 + 复习）：${durText(st.total_ms)}"><div class="n">${durHtml(st.total_ms)}</div><div class="l">⏳ 总学习时长</div>${tpLine(st.total_parts, st.total_ms)}</div>
   </div>
+  <h2>⏱ 学习时长构成</h2>
+  ${timeStatHtml(tstat, 14)}
   <div class="card" style="margin-top:16px">
     <div class="ring-row">
       <div class="ring" style="--v:${goalPct}"><div class="in"><b>${sk.today}/${sk.goal}</b><span>今日目标</span></div></div>
@@ -4111,8 +4467,8 @@ function tStuCard(s) {
     <div class="tstu-grid" style="margin-top:8px">
       <div><span class="sub">错题本</span><b style="color:var(--bad)">${s.wrong || 0}</b></div>
       <div><span class="sub">我的收藏</span><b style="color:var(--purple)">${s.fav || 0}</b></div>
-      <div title="今日学习时长（答题 + 看解析）"><span class="sub">今日学习时长</span><b>${durTight(s.today_ms)}</b></div>
-      <div title="累计学习时长（答题 + 看解析）"><span class="sub">总学习时长</span><b>${durTight(s.total_ms)}</b></div>
+      <div title="今日学习时长（做题 + 看解析 + 复习）"><span class="sub">今日学习时长</span><b>${durTight(s.today_ms)}</b></div>
+      <div title="累计学习时长（做题 + 看解析 + 复习）"><span class="sub">总学习时长</span><b>${durTight(s.total_ms)}</b></div>
     </div>
     <div class="tstu-live">${line}</div>
   </a>`;
@@ -4342,8 +4698,8 @@ async function viewTeacherStudent(uid) {
   <div class="grid g4" style="margin-top:12px">
     <div class="card kpi"><div class="n" style="color:var(--bad)">${b.wrong || 0}</div><div class="l">📕 错题本</div></div>
     <div class="card kpi"><div class="n" style="color:var(--purple)">${b.fav || 0}</div><div class="l">⭐ 我的收藏</div></div>
-    <div class="card kpi brand time" title="今日学习时长（答题 + 看解析）：${durText(b.today_ms)}"><div class="n">${durHtml(b.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
-    <div class="card kpi purple time" title="累计学习时长（答题 + 看解析）：${durText(b.total_ms)}"><div class="n">${durHtml(b.total_ms)}</div><div class="l">⏳ 总学习时长</div></div>
+    <div class="card kpi brand time" title="今日学习时长（做题 + 看解析 + 复习）：${durText(b.today_ms)}"><div class="n">${durHtml(b.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
+    <div class="card kpi purple time" title="累计学习时长（做题 + 看解析 + 复习）：${durText(b.total_ms)}"><div class="n">${durHtml(b.total_ms)}</div><div class="l">⏳ 总学习时长</div></div>
   </div>
 
   <div class="card" style="margin-top:16px">
@@ -5277,7 +5633,7 @@ async function prefsFlush() {
   renderNav();       // 陪伴者账号只显示「陪读看板 / 鼓励信息」，陪读显示原有导航
   showAnnouncementIfNeeded();
   if (!isTeacher()) {
-    stBoot();          // 学习时长心跳：登录后开始按秒累计（答题 + 看解析）
+    stBoot();          // 学习时长心跳：登录后开始按秒累计（做题 / 看解析 / 复习 三段分开记）
     liveStart();       // 答题状态心跳：陪伴者端据此实时看进度
     refreshSide().catch(() => { });
   }

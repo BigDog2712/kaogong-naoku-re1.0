@@ -9,7 +9,7 @@
   熟悉(5)：首学 4 天 → 4×ease(≈2.6)×1.3 ≈ 13 天 → 指数增长
   一般(4)：首学 2 天 → 2×ease(≈2.5)×1.0 ≈ 5 天
   困难(3)：首学 1 天 → 1×ease(≈2.36)×1.2 ≈ 3 天
-  忘记(1/2)：当天重练（interval=0），恢复后按对应档位重新起算
+  忘记(1/2)：interval 归零、记为学习中，但到期日排到明天（今日题目今日不复习），恢复后按对应档位重新起算
 pacing（复习节奏，用户可调，乘在算出的间隔上）：
   tight 紧凑 ×0.7 / std 标准 ×1.0 / loose 舒缓 ×1.6
 """
@@ -58,7 +58,9 @@ def grade_state(state, grade, pacing="std"):
             ease = 1.3
         status = "review" if reps >= 2 else "learning"
 
-    due = add_days(interval)
+    # 今日题目今日不复习：即便评为「忘记」(interval=0)，到期日也排到明天，
+    # 不让当天做过的题立刻回到「今日待复习」与复习池里（想重做请走「错题重练」）。
+    due = add_days(max(1, interval))
     return dict(ease=round(ease, 3), interval=interval, repetitions=reps,
                 lapses=lapses, status=status, due=due)
 
