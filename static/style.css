@@ -1126,6 +1126,24 @@ tr.qrow:hover td{background:var(--surface-2)}
 .rv-r.bad{background:var(--paper-2);color:var(--bad)}
 .rv-r.none{background:var(--paper-2);color:var(--ink-3)}
 
+/* 设置：左侧功能栏排序 */
+.navorder{display:flex;flex-direction:column;gap:6px}
+.no-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border:1px solid var(--rule);
+  border-radius:var(--radius-sm);background:var(--surface)}
+.no-idx{flex:none;width:22px;height:22px;border-radius:50%;background:var(--paper-2);color:var(--ink-3);
+  font-size:12px;display:flex;align-items:center;justify-content:center}
+.no-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.no-btns{display:flex;gap:6px;flex:none}
+.no-btns .btn{min-width:40px;padding:4px 0;line-height:1.25}
+
+/* 陪伴者看陪读的「今日回溯」：每组一张卡，展开就是逐题明细（含陪读笔记） */
+.rv-note{margin-top:5px;font-size:12.5px;color:var(--ink-2);background:var(--paper-2);
+  border-left:2px solid var(--brand);border-radius:0 var(--radius-sm) var(--radius-sm) 0;
+  padding:5px 9px;white-space:pre-wrap;word-break:break-word;max-height:110px;overflow:auto}
+.rv-note b{color:var(--ink-3);font-weight:700;margin-right:4px}
+.tl-today-sum{display:flex;gap:14px;flex-wrap:wrap;margin:0 0 12px;font-size:13px;color:var(--ink-3)}
+.tl-today-sum b{color:var(--ink);font-family:var(--font-serif);font-size:1.1rem;margin-right:2px}
+
 /* 回溯弹层里的「当时状态」条 */
 .rv-state{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 12px;margin-bottom:14px;
   border-radius:var(--radius-sm);background:var(--paper-2);font-size:13px;color:var(--ink-2)}
@@ -1152,6 +1170,11 @@ tr.qrow:hover td{background:var(--surface-2)}
   .rv-tbl td:nth-child(3){min-width:0}
   .rv-state{gap:8px 10px;font-size:12.5px}
   .rv-state-t{margin-left:0;width:100%}
+  /* 手机端：排序按钮放大到能稳稳点中，行高不挤压 */
+  .no-row{padding:7px 8px;gap:8px}
+  .no-name{font-size:13.5px}
+  .no-btns .btn{min-width:46px;padding:6px 0}
+  .rv-note{font-size:12px;max-height:88px}
 }
 
 /* 回溯弹层：选项标签固定在右侧，不挤占多行选项的文字宽度 */
@@ -1322,6 +1345,18 @@ html[data-theme="dark"] .tq-full .material img[flag="tex"]{
 @media(max-width:560px){
   .ans-peek-tip{display:block;margin:4px 0 0}
 }
+/* 历史选择：正确答案旁边一行极小回顾（新 → 旧），只占一行、不换行不撑高 */
+.ans-hist{font-weight:400;font-size:12px;color:var(--ink-3);margin-left:10px;letter-spacing:0;white-space:nowrap}
+.ans-hist i{font-style:normal;font-weight:800;color:var(--ink-2)}
+.ans-hist i.ok{color:var(--ok)}
+.ans-hist i.bad{color:var(--bad)}
+.ans-hist .sep{opacity:.5;margin:0 2px}
+.ans-hist em{font-style:normal;opacity:.7}
+/* 复习模式：答案还没揭晓时历史也一起藏起来（否则等于提前给了提示） */
+.ans-open .ans-line .ans-hist{visibility:hidden}
+.ans-open .ans-line.ans-visible .ans-hist{visibility:visible}
+@media(hover:hover){.ans-open .ans-line:hover .ans-hist{visibility:visible}}
+@media(max-width:560px){.ans-hist{font-size:11.5px;margin-left:8px}}
 /* 复习自评后自动跳题的停留按钮 */
 .grade.nextbar .nx-stay{flex:none}
 /* 总览：复习计划（未来逐日到期） */

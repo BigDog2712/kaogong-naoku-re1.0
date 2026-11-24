@@ -477,6 +477,65 @@ def done_by_day(uid, since=None):
         ) GROUP BY d""", tuple(args))
     return {r["d"]: int(r["n"] or 0) for r in rows if r["d"]}
 
+def answer_flow_sql():
+    """统一的「作答流水」子查询：练习分组里的逐题作答 + 分组功能上线前的 reviews 旧记录。
+
+    为什么需要它：边答边对时 /api/grade 会往 reviews 写一条，先答后对时只在 practice_items
+    里记 graded_at，reviews 要等复盘自评才写。只读 reviews 就会出现「今日已练习 74、最近作答
+    却是三小时前」的错位。这里两侧合并，去重规则与 done_by_day 一致：同一题同一天已经有了
+    分组记录，就不再重复计 reviews 那一条。参数顺序固定为 (uid, uid, uid)。
+    """
+    return """
+        SELECT it.graded_at ts, it.qid qid, IFNULL(it.choice,'') choice,
+               IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout
+          FROM practice_items it JOIN practice_groups gp ON gp.gid=it.gid
+         WHERE gp.uid=? AND it.graded_at IS NOT NULL AND IFNULL(it.dropped,0)=0
+        UNION ALL
+        SELECT r.ts, r.qid, '', CASE WHEN IFNULL(r.grade,0)>=3 THEN 1 ELSE 0 END,
+               IFNULL(r.timeout,0)
+          FROM reviews r
+         WHERE r.user_id=?
+           AND NOT EXISTS (SELECT 1 FROM practice_items it2
+                             JOIN practice_groups gp2 ON gp2.gid=it2.gid
+                            WHERE gp2.uid=? AND it2.qid=r.qid
+                              AND date(it2.graded_at)=date(r.ts))
+    """
+
+
+def answer_totals(uid):
+    """累计作答题数 / 正确题数（口径同 done_by_day：一次判分算一题）。"""
+    r = q_one("SELECT COUNT(*) n, SUM(correct) ok FROM (%s)" % answer_flow_sql(),
+              (uid, uid, uid)) or {}
+    return int(r.get("n") or 0), int(r.get("ok") or 0)
+
+
+def answer_recent(uid, limit=40):
+    """最近作答流水（含是否写过笔记），供陪伴者看板使用。"""
+    limit = max(1, min(200, int(limit or 40)))
+    return q_all("""SELECT e.ts, e.qid, e.choice, e.correct, e.timeout,
+                           s.id, s.module, s.category, s.stem,
+                           CASE WHEN TRIM(IFNULL(nn.text,''))='' THEN 0 ELSE 1 END has_note
+                      FROM (%s) e
+                      JOIN qdb.questions s ON s.qid=e.qid
+                      LEFT JOIN notes nn ON nn.qid=e.qid AND nn.user_id=?
+                     ORDER BY e.ts DESC LIMIT ?""" % answer_flow_sql(),
+                 (uid, uid, uid, uid, limit))
+
+
+def choice_history(uid, qid, limit=8):
+    """这道题在本账号下历次都选了什么（新 → 旧）。
+
+    只取真正选了选项的记录（复习自评没有选项，不进这里）。数据来自 practice_items，
+    即使先答后对里没自评也存在，所以「以前每次选的什么」不会因为没写复习历史而丢失。
+    """
+    limit = max(1, min(20, int(limit or 8)))
+    return q_all("""SELECT IFNULL(it.choice,'') c, it.graded_at ts, IFNULL(it.correct,0) ok, it.gid
+                      FROM practice_items it JOIN practice_groups gp ON gp.gid=it.gid
+                     WHERE gp.uid=? AND it.qid=? AND TRIM(IFNULL(it.choice,''))<>''
+                       AND it.graded_at IS NOT NULL AND IFNULL(it.dropped,0)=0
+                     ORDER BY it.graded_at DESC LIMIT ?""", (uid, qid, limit))
+
+
 _APP_VER = {"v": None, "mtime": None}
 
 def app_ver():
@@ -1164,13 +1223,16 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("「我的笔记」不再藏在按钮后面：练习（边答边对 / 先答后对 / 复习）、交卷后看解析、"
-                     "完整标注三处都直接显示笔记框，边做题边写，不用先点「📝 笔记」。"
-                     "而且不用再点保存——边写边自动存，停笔约 0.7 秒就落盘，切题、翻页、关掉浏览器都不丢；"
-                     "框下会显示「已自动保存 · 时间」，网络不好时先留住文字再自动重试。"
-                     "三处是同一份数据，任一处改动，另外两处立刻同步。"
-                     "真题浏览顶部新增题库切换：全部题库 / 内置真题库 / 导入题库。"
-                     "选中导入题库（如「四海公考 · 逻辑填空600题」）后按它自己的题集分类翻阅，每套 20 题，顺序与题本一致。")
+APP_RELEASE_NOTES = ("设置里新增「左侧功能栏排序」：用 ↑ ↓ 把常用的功能挪到最上面，电脑端竖栏和手机端横条"
+                     "用同一份顺序，并跟着账号同步到其它设备，随时可恢复默认。"
+                     "陪伴者现在能看陪读的「今日回溯」：在陪读详情页点「今日已练习」直接展开今天每一组练习，"
+                     "逐题看当时选了什么、对没对、用时多久，陪读写过的笔记也显示在题干下面（仍然只读）。"
+                     "修好了陪伴者「最近作答」看不到最新记录的问题：以前只读复习历史，先答后对里没自评的题根本不出现，"
+                     "于是在刚练完时会一直停在几小时前；现在「最近作答」「累计作答」「正确率」「今日已练习」"
+                     "统一按同一份作答流水统计，数字互相对得上。"
+                     "做题（含复习）揭晓答案后，「正确答案」右边会多出一行极小的「历史 C·B·A」："
+                     "这道题以前每次选的是什么、对没对一眼可见，鼠标停上去看具体时间；"
+                     "复习模式里答案没揭晓前不显示，不会提前提示。")
 
 
 def ensure_release_announcement():
@@ -1967,95 +2029,14 @@ class Handler(BaseHTTPRequestHandler):
         # ---------- 今日回溯：按组回看当天练过的题，以及「对答案那一刻」的状态 ----------
         if path == "/api/practice/today":
             uid = need_uid(g("token"))
-            day = (g("date") or "").strip()
-            try:
-                d0 = datetime.date.fromisoformat(day) if day else datetime.date.today()
-            except Exception:
-                d0 = datetime.date.today()
-            span = (datetime.date.today() - d0).days
-            if span < 0 or span > 31:          # 只开放最近 31 天，避免随意翻库
-                d0 = datetime.date.today()
-            day = d0.isoformat()
-            rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
-                                   gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
-                                   IFNULL(gp.state,'open') state,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN 1 ELSE 0 END) n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
-                                            THEN 1 ELSE 0 END) answered,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND IFNULL(it.correct,0)=1
-                                            THEN 1 ELSE 0 END) right_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
-                                             AND IFNULL(it.correct,0)=0 THEN 1 ELSE 0 END) wrong_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.timeout,0) ELSE 0 END) timeout_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.ms,0) ELSE 0 END) spent_ms,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=1 THEN 1 ELSE 0 END) dropped_n
-                            FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
-                            WHERE gp.uid=? AND date(gp.started)=?
-                            GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
-            groups = []
-            for r in rows:
-                r["n"] = int(r["n"] or 0)
-                r["answered"] = int(r["answered"] or 0)
-                r["right_n"] = int(r["right_n"] or 0)
-                r["wrong_n"] = int(r["wrong_n"] or 0)
-                r["timeout_n"] = int(r["timeout_n"] or 0)
-                r["spent_ms"] = int(r["spent_ms"] or 0)
-                r["total_ms"] = int(r["total_ms"] or 0)
-                r["dropped_n"] = int(r["dropped_n"] or 0)
-                r["legacy"] = False
-                groups.append(r)
-            # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
-            legacy = q_all("""SELECT r.qid, r.grade, r.ts, IFNULL(r.timeout,0) timeout,
-                                     s.id, s.module, s.category, s.stem, s.answer
-                              FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
-                              WHERE r.user_id=? AND date(r.ts)=?
-                                AND r.id=(SELECT MAX(r2.id) FROM reviews r2
-                                          WHERE r2.user_id=r.user_id AND r2.qid=r.qid AND date(r2.ts)=?)
-                                AND r.qid NOT IN (SELECT it.qid FROM practice_items it
-                                                  JOIN practice_groups gp ON gp.gid=it.gid
-                                                  WHERE gp.uid=? AND date(gp.started)=?)
-                              ORDER BY r.id""", (uid, day, day, uid, day))
-            if legacy:
-                items = []
-                for i, r in enumerate(legacy, 1):
-                    items.append({"qid": r["qid"], "id": r["id"], "pos": i,
-                                  "module": r["module"], "category": r["category"],
-                                  "stem": plain_text(r["stem"], 140), "answer": r["answer"],
-                                  "choice": "", "correct": 1 if int(r["grade"] or 0) >= 3 else 0,
-                                  "timeout": r["timeout"], "ms": 0, "graded_at": r["ts"]})
-                right_n = sum(1 for x in items if x["correct"])
-                groups.append({"gid": "legacy-" + day, "mode": "legacy", "answer_mode": "instant",
-                               "title": "未分组的作答记录", "scope": "", "size": len(items),
-                               "started": legacy[0]["ts"], "ended": legacy[-1]["ts"],
-                               "total_ms": 0, "state": "done", "n": len(items),
-                               "answered": len(items), "right_n": right_n,
-                               "wrong_n": len(items) - right_n, "timeout_n": sum(1 for x in items if x["timeout"]),
-                               "spent_ms": 0, "legacy": True, "items": items})
-            summary = {
-                "groups": len(groups),
-                "questions": sum(x["n"] for x in groups),
-                "answered": sum(x["answered"] for x in groups),
-                "right": sum(x["right_n"] for x in groups),
-                "wrong": sum(x["wrong_n"] for x in groups),
-                "timeout": sum(x["timeout_n"] for x in groups),
-                "ms": sum(x["spent_ms"] for x in groups),
-            }
-            return self._send(200, {"ok": True, "date": day, "summary": summary, "groups": groups})
+            return self._send(200, self._today_payload(uid, g("date")))
 
         if path == "/api/practice/group":
             uid = need_uid(g("token"))
-            gid = (g("gid") or "").strip()
-            gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
-            if not gp:
+            got = self._group_payload(uid, g("gid"))
+            if not got:
                 return self._send(404, {"error": "没有这组练习记录"})
-            items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
-                                    IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
-                                    IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
-                                    s.id, s.module, s.category, s.kadian, s.stem
-                             FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
-                             WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
-            for x in items:
-                x["stem"] = plain_text(x["stem"], 140)
+            gp, items = got
             # full=1：把每题的完整卡片（材料/选项/官方解析/收藏）一起带回，
             # 让回溯能直接复用「交卷后解析」那套界面，不用逐题再请求
             if g("full") == "1":
@@ -2067,8 +2048,8 @@ class Handler(BaseHTTPRequestHandler):
                         cards[r["id"]] = clean_card(r, reveal=True, uid=uid)
                 for x in items:
                     x["card"] = cards.get(x.get("id"))
-            gp["legacy"] = False
             return self._send(200, {"ok": True, "group": gp, "items": items})
+
 
         # ---------- 陪伴者（只读督导）：陪读列表 / 陪读详情 / 实时看板 / 鼓励信息 ----------
         if path == "/api/teacher/students":
@@ -2098,13 +2079,12 @@ class Handler(BaseHTTPRequestHandler):
                                 IFNULL(role,'student') role FROM users WHERE id=?""", (sid,))
             days = q_all("""SELECT day, ms FROM study_time WHERE uid=? AND day>=date(?,'-13 day') ORDER BY day""",
                          (sid, today()))
-            recent = q_all("""SELECT r.ts, r.grade, IFNULL(r.timeout,0) timeout, s.id, s.qid,
-                                     s.module, s.category, s.stem
-                              FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
-                              WHERE r.user_id=? ORDER BY r.id DESC LIMIT 40""", (sid,))
+            # 最近作答：与「今日已练习」同一份流水（练习分组 + 旧 reviews），
+            # 否则先答后对里没自评的题根本不会出现在陪伴者眼前
+            recent = answer_recent(sid, 40)
             for x in recent:
                 x["stem"] = plain_text(x["stem"], 120)
-                x["right"] = int(x["grade"] or 0) >= 3
+                x["right"] = int(x["correct"] or 0) == 1
             wrong = q_all("""SELECT x.qid, x.wrong, x.due, x.wb_status, s.id, s.module, s.category, s.stem
                              FROM srs x JOIN qdb.questions s ON s.qid=x.qid
                              WHERE x.user_id=? AND x.wrong>0
@@ -2205,6 +2185,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "peers": out,
                                     "code": (q_one("SELECT IFNULL(link_code,'') c FROM users WHERE id=?",
                                                    (uid,)) or {}).get("c", "")})
+
+        if path == "/api/coach/today":
+            # 陪伴者看某位陪读的「今日回溯」：只读，权限来自双向陪伴关系。
+            # 与陪读自己的 /api/practice/today 用同一个 _today_payload，口径完全一致。
+            uid = need_uid(g("token"))
+            sid = (g("uid") or "").strip()
+            if not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            payload = self._today_payload(sid, g("date"))
+            payload["uid"] = sid
+            payload["student"] = q_one("SELECT id,name,username FROM users WHERE id=?", (sid,))
+            return self._send(200, payload)
+
+        if path == "/api/coach/group":
+            # 陪伴者看某一组的逐题明细（含陪读在这一组的笔记）
+            uid = need_uid(g("token"))
+            sid = (g("uid") or "").strip()
+            if not link_ok(uid, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            got = self._group_payload(sid, g("gid"), with_note=True)
+            if not got:
+                return self._send(404, {"error": "没有这组练习记录"})
+            gp, items = got
+            return self._send(200, {"ok": True, "group": gp, "items": items})
 
         if path == "/api/teacher/mine":
             uid = need_uid(g("token"))
@@ -2488,7 +2492,10 @@ class Handler(BaseHTTPRequestHandler):
                 ensure_srs_rows(uid, [r["qid"]])
                 srs = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (r["qid"], uid))
             dropped = bool(q_one("SELECT 1 x FROM discarded WHERE uid=? AND qid=?", (uid, r["qid"])))
-            return self._send(200, {"card": clean_card(r, reveal=True, uid=uid), "srs": srs, "dropped": dropped})
+            card = clean_card(r, reveal=True, uid=uid)
+            # 正确答案旁边回顾「以前这道题我都选了什么」：新 → 旧，最多 8 次
+            card["choice_hist"] = choice_history(uid, r["qid"])
+            return self._send(200, {"card": card, "srs": srs, "dropped": dropped})
 
         if path == "/api/browse":
             page = max(1, _int(g("page"), 1)); size = max(1, min(100, _int(g("size"), 25)))
@@ -3799,7 +3806,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(500, {"error": "恢复失败：%s" % e})
 
     PREFS_KEYS = ("limits", "limitOn", "theme", "fontscale", "focus", "navfit",
-                  "answerMode", "readw", "sessionSize", "rmouse", "seen")
+                  "answerMode", "readw", "sessionSize", "rmouse", "seen", "navOrder")
 
     def api_prefs(self, p):
         """保存本机偏好到当前账号。写入为「合并」：seen 取并集（保留最近 800 条），
@@ -3839,6 +3846,17 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     merged["limits"] = lm
+                continue
+            if k == "navOrder":
+                # 左侧功能栏的自定义顺序：只收「#/xxx」形式的路由，去重、限长；
+                # 整份覆盖（不合并），因为顺序本身就是一份完整列表。
+                if isinstance(v, list):
+                    seq = []
+                    for h in v:
+                        h = str(h or "").strip()[:40]
+                        if h.startswith("#/") and h not in seq:
+                            seq.append(h)
+                    merged["navOrder"] = seq[:40]
                 continue
             merged[k] = v
         ts = now()
@@ -3926,6 +3944,120 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, {"ok": True, "srs": n_srs, "reviews": n_rev, "exams": n_exam,
                                 "study_time": n_time, "discarded": n_drop})
 
+    def _group_payload(self, uid, gid, with_note=False):
+        """一组练习的逐题状态。uid 是这组属于谁（陪读自己，或陪伴者代看）。
+
+        with_note=True 时把每题在该账号下的笔记一起带回（陪伴者需要看到陪读的想法）。
+        """
+        gid = (gid or "").strip()
+        gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+        if not gp:
+            return None
+        items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
+                                IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
+                                IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
+                                s.id, s.module, s.category, s.kadian, s.stem
+                         FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
+                         WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
+        qids = [x["qid"] for x in items if x.get("qid")] if with_note else []
+        notes = {}
+        if qids:
+            ph = ",".join("?" * len(qids))
+            notes = {r["qid"]: r["text"] for r in q_all(
+                "SELECT qid, text FROM notes WHERE user_id=? AND qid IN (%s)" % ph,
+                [uid] + qids)}
+        for x in items:
+            x["stem"] = plain_text(x["stem"], 140)
+            if with_note:
+                x["note"] = notes.get(x["qid"]) or ""
+        gp["legacy"] = False
+        return gp, items
+
+    def _today_payload(self, uid, want_day=None):
+        """某一天（默认今天）的练习分组与逐题状态。陪读自己和陪伴者共用同一份口径。"""
+        day = (want_day or "").strip()
+        try:
+            d0 = datetime.date.fromisoformat(day) if day else datetime.date.today()
+        except Exception:
+            d0 = datetime.date.today()
+        span = (datetime.date.today() - d0).days
+        if span < 0 or span > 31:          # 只开放最近 31 天，避免随意翻库
+            d0 = datetime.date.today()
+        day = d0.isoformat()
+        rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
+                                   gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
+                                   IFNULL(gp.state,'open') state,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN 1 ELSE 0 END) n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                            THEN 1 ELSE 0 END) answered,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND IFNULL(it.correct,0)=1
+                                            THEN 1 ELSE 0 END) right_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                             AND IFNULL(it.correct,0)=0 THEN 1 ELSE 0 END) wrong_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.timeout,0) ELSE 0 END) timeout_n,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.ms,0) ELSE 0 END) spent_ms,
+                                   SUM(CASE WHEN IFNULL(it.dropped,0)=1 THEN 1 ELSE 0 END) dropped_n
+                            FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
+                            WHERE gp.uid=? AND date(gp.started)=?
+                            GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
+        groups = []
+        for r in rows:
+            r["n"] = int(r["n"] or 0)
+            r["answered"] = int(r["answered"] or 0)
+            r["right_n"] = int(r["right_n"] or 0)
+            r["wrong_n"] = int(r["wrong_n"] or 0)
+            r["timeout_n"] = int(r["timeout_n"] or 0)
+            r["spent_ms"] = int(r["spent_ms"] or 0)
+            r["total_ms"] = int(r["total_ms"] or 0)
+            r["dropped_n"] = int(r["dropped_n"] or 0)
+            r["legacy"] = False
+            groups.append(r)
+        # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
+        legacy = q_all("""SELECT r.qid, r.grade, r.ts, IFNULL(r.timeout,0) timeout,
+                                 s.id, s.module, s.category, s.stem, s.answer
+                          FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
+                          WHERE r.user_id=? AND date(r.ts)=?
+                            AND r.id=(SELECT MAX(r2.id) FROM reviews r2
+                                      WHERE r2.user_id=r.user_id AND r2.qid=r.qid AND date(r2.ts)=?)
+                            AND r.qid NOT IN (SELECT it.qid FROM practice_items it
+                                              JOIN practice_groups gp ON gp.gid=it.gid
+                                              WHERE gp.uid=? AND date(gp.started)=?)
+                          ORDER BY r.id""", (uid, day, day, uid, day))
+        if legacy:
+            items = []
+            for i, r in enumerate(legacy, 1):
+                items.append({"qid": r["qid"], "id": r["id"], "pos": i,
+                              "module": r["module"], "category": r["category"],
+                              "stem": plain_text(r["stem"], 140), "answer": r["answer"],
+                              "choice": "", "correct": 1 if int(r["grade"] or 0) >= 3 else 0,
+                              "timeout": r["timeout"], "ms": 0, "graded_at": r["ts"]})
+            right_n = sum(1 for x in items if x["correct"])
+            groups.append({"gid": "legacy-" + day, "mode": "legacy", "answer_mode": "instant",
+                           "title": "未分组的作答记录", "scope": "", "size": len(items),
+                           "started": legacy[0]["ts"], "ended": legacy[-1]["ts"],
+                           "total_ms": 0, "state": "done", "n": len(items),
+                           "answered": len(items), "right_n": right_n,
+                           "wrong_n": len(items) - right_n, "timeout_n": sum(1 for x in items if x["timeout"]),
+                           "spent_ms": 0, "legacy": True, "items": items})
+        # 每组有多少题写过笔记：陪伴者据此一眼看出哪一组该点开看想法
+        for x in groups:
+            if x.get("legacy"):
+                continue
+            x["note_n"] = int((q_one("""SELECT COUNT(*) n FROM practice_items it
+                                          JOIN notes nn ON nn.qid=it.qid AND nn.user_id=?
+                                         WHERE it.gid=? AND TRIM(IFNULL(nn.text,''))!=''""",
+                                     (uid, x["gid"])) or {}).get("n") or 0)
+        summary = {
+            "groups": len(groups),
+            "questions": sum(x["n"] for x in groups),
+            "answered": sum(x["answered"] for x in groups),
+            "right": sum(x["right_n"] for x in groups),
+            "wrong": sum(x["wrong_n"] for x in groups),
+            "timeout": sum(x["timeout_n"] for x in groups),
+            "ms": sum(x["spent_ms"] for x in groups),
+        }
+        return {"ok": True, "date": day, "summary": summary, "groups": groups}
+
     # ---------- 陪伴者（只读督导） ----------
     def _student_brief(self, uid, full=False):
         """陪伴者的列表/详情共用的陪读摘要（纯读，不改任何记录）。
@@ -3939,17 +4071,17 @@ class Handler(BaseHTTPRequestHandler):
         due = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?", (uid, t))["n"]
         wrong = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND wrong>0", (uid,))["n"]
         today_n = done_by_day(uid, t).get(t, 0)      # 与这位陪读自己的总览同一口径
-        ans = q_one("""SELECT COUNT(*) n, SUM(CASE WHEN grade>=3 THEN 1 ELSE 0 END) ok
-                       FROM reviews WHERE user_id=?""", (uid,)) or {}
+        # 累计作答 / 正确率同样走「作答流水」：只数 reviews 会漏掉先答后对里没自评的题，
+        # 于是出现「今日已练习 74、累计作答却比昨天还少」的错位。
+        n, ok = answer_totals(uid)
         st_today = q_one("""SELECT ms, IFNULL(answer_ms,0) answer_ms, IFNULL(analysis_ms,0) analysis_ms,
                                    IFNULL(review_ms,0) review_ms
                             FROM study_time WHERE uid=? AND day=?""", (uid, t))
         st_all = q_one("SELECT SUM(ms) s FROM study_time WHERE uid=?", (uid,))
-        last = q_one("SELECT MAX(ts) ts FROM reviews WHERE user_id=?", (uid,))
+        last = q_one("SELECT MAX(ts) ts FROM (%s)" % answer_flow_sql(), (uid, uid, uid))
         fav = q_one("SELECT COUNT(*) n FROM favorites WHERE user_id=?", (uid,))["n"]
         total_q = q_total()
         live = live_get(uid)
-        n = int(ans.get("n") or 0); ok = int(ans.get("ok") or 0)
         out = {
             "learned": learned, "due_review": due, "wrong": wrong, "studied_today": today_n,
             "new": max(0, total_q - learned), "fav": fav, "total": total_q,

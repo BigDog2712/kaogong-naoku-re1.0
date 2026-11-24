@@ -1887,11 +1887,11 @@ function renderAct() {
   if (answerable) { S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++; }
   // 复习模式：解析直接展开可见，正确答案放在解析末尾且默认打码——看解析不影响先自评
   const ansBlock = answerable
-    ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}</div>`
+    ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}${ansHistHtml(f, S.gid)}</div>`
     : `<div class="ans-open">
         ${revealHtml(f)}
         <div class="answer-line ans-line" id="ans-line" title="悬停核对答案 · 点击揭晓">
-          <span>正确答案：</span><b class="ans-secret">${esc(f.answer)}</b>
+          <span>正确答案：</span><b class="ans-secret">${esc(f.answer)}</b>${ansHistHtml(f, S.gid)}
           <span class="ans-peek-tip"><span class="tip-hover">🙈 悬停核对 · 按 0 揭晓</span><span class="tip-touch">🙈 点这一行揭晓答案</span></span>
         </div>
       </div>`;
@@ -1926,6 +1926,20 @@ function renderAct() {
   };
   document.getElementById('t-detail').onclick = () => { location.hash = '#/detail?id=' + c2id(); };
   document.getElementById('t-push').onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
+}
+
+/* 历史选择：正确答案旁边一行极简回顾（新 → 旧），只在真正揭晓答案后出现。
+   gid 传当前这一组的组号：本组刚选的那个不算「历史」，要从列表里剔掉。 */
+function ansHistHtml(card, gid) {
+  const all = (card && card.choice_hist) || [];
+  const list = all.filter(x => !gid || String(x.gid || '') !== String(gid));
+  if (!list.length) return '';
+  const shown = list.slice(0, 5);
+  const more = list.length - shown.length;
+  const tip = '以前这道题选过（新 → 旧）：' + list.map(x =>
+    `${String(x.ts || '').replace('T', ' ').slice(5, 16)} 选 ${x.c}${x.ok ? ' 对' : ' 错'}`).join(' · ');
+  const chips = shown.map(x => `<i class="${x.ok ? 'ok' : 'bad'}">${esc(x.c)}</i>`).join('<span class="sep">·</span>');
+  return `<span class="ans-hist" title="${esc(tip)}">历史 ${chips}${more > 0 ? '<span class="sep">·</span><em>+' + more + '</em>' : ''}</span>`;
 }
 
 /* 复习模式：正确答案打码开关（V 键 / 点答案行共用），悬停由 CSS 临时揭开 */
@@ -3387,7 +3401,7 @@ async function viewDetail(id, from) {
   <div class="opts">${c.options.map(o => `<div class="opt ${o.is_answer ? 'show-ans' : ''}">
     <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
     ${o.is_answer ? '<span style="color:var(--ok);font-weight:800">✔</span>' : ''}</div>`).join('')}</div>
-  <div class="answer-line right">正确答案：${esc(c.answer)}</div>
+  <div class="answer-line right">正确答案：${esc(c.answer)}${ansHistHtml(c, '')}</div>
   ${noteBox(c)}
   <div class="reveal">
     ${c.mother ? `<div class="sec mother"><h4>🧩 母题抽象</h4>${inlineMd(c.mother)}</div>` : ''}
@@ -4267,6 +4281,15 @@ async function viewSettings() {
     </div>
   </div>
   <div class="card" style="max-width:640px;margin-top:16px">
+    <h2 style="margin-top:0">🧭 左侧功能栏排序</h2>
+    <p class="sub" style="margin:0 0 12px">把常用的放到最上面。电脑端（左侧竖栏）和手机端（顶部横条）用<b>同一份顺序</b>，并随账号同步到其它设备；点 ↑ ↓ 立即生效，点错了可以恢复默认。</p>
+    <div id="st-navorder" class="navorder"></div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn ghost" id="st-navorder-reset">恢复默认顺序</button>
+      <span class="sub" style="margin:0" id="st-navorder-tip"></span>
+    </div>
+  </div>
+  <div class="card" style="max-width:640px;margin-top:16px">
     <h2 style="margin-top:0">答题模式</h2>
     <div class="seg" id="st-amode" role="radiogroup" aria-label="答题模式">
       <button type="button" class="seg-btn ${getAnswerMode() === 'instant' ? 'on' : ''}" data-m="instant" role="radio" aria-checked="${getAnswerMode() === 'instant'}">边答边对</button>
@@ -4421,6 +4444,31 @@ async function viewSettings() {
     nfb.className = 'btn ' + (on ? 'ok' : 'ghost');
   };
   syncNavFit(); nfb.onclick = () => { setNavFit(!isNavFit()); syncNavFit(); };
+  renderNavOrderEditor();
+  const noBox = document.getElementById('st-navorder');
+  if (noBox) noBox.onclick = (ev) => {
+    const btn = ev.target.closest('.no-up, .no-dn'); if (!btn) return;
+    const row = btn.closest('.no-row'); if (!row) return;
+    const order = getNavOrder();
+    const i = order.indexOf(row.dataset.href); if (i < 0) return;
+    const up = btn.classList.contains('no-up');
+    if (up ? i === 0 : i === order.length - 1) return;
+    const j = up ? i - 1 : i + 1;
+    const tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+    setNavOrder(order);
+    renderNavOrderEditor();
+    const back = document.querySelector('#st-navorder .no-row[data-href="' + row.dataset.href + '"] ' + (up ? '.no-up' : '.no-dn'));
+    if (back) back.focus();
+    const tip = document.getElementById('st-navorder-tip');
+    if (tip) tip.textContent = '已保存 · 现在排第 ' + (j + 1) + ' 位';
+  };
+  const noReset = document.getElementById('st-navorder-reset');
+  if (noReset) noReset.onclick = () => {
+    setNavOrder(NAV_ITEMS.map(x => x.href));
+    renderNavOrderEditor();
+    const tip = document.getElementById('st-navorder-tip');
+    if (tip) tip.textContent = '已恢复默认顺序';
+  };
   if (ME && ME.role === 'admin') initAdminSettings();
   initUserBackupSettings();
   try { renderTeacherBox(); } catch (e) { }   // 陪伴者督导：读我已绑定的陪伴者
@@ -4614,27 +4662,73 @@ function setFocus(on) {
 /* ---------- 陪伴者模式（只读督导） ----------
    陪伴者已融合为普通账号的功能：任何账号都能在「陪伴者」模块里互加（用户名 + 链接码）。
    role=teacher 仅作旧数据兼容，不再限制任何路由或写操作。 */
-const STUDENT_NAV = `<a href="#/">总览面板</a>
-      <a href="#/study">开始练习</a>
-      <a href="#/review">复习到期</a>
-      <a href="#/wrongbook">错题本</a>
-      <a href="#/favorites">我的收藏</a>
-      <a href="#/exam">模拟考试</a>
-      <a href="#/browse">真题浏览</a>
-      <a href="#/kadian">考点导航</a>
-      <a href="#/materials">材料组题</a>
-      <a href="#/doubts">疑点复核</a>
-      <a href="#/coach">陪伴者<span class="nav-dot" id="nav-push-dot" style="display:none"></span></a>
-      <a href="#/stats">数据统计</a>
-      <a href="#/settings">设置</a>`;
+
+/* 侧栏功能项：顺序可自定义（设置 → 左侧功能栏排序）。
+   顺序存 localStorage（本机立即可用），同时进偏好同步，换设备/手机端保持一致。
+   新增功能项只要加进这张表，老账号没存过的会自动补在末尾。 */
+const NAV_ITEMS = [
+  { href: '#/', label: '总览面板' },
+  { href: '#/study', label: '开始练习' },
+  { href: '#/review', label: '复习到期' },
+  { href: '#/wrongbook', label: '错题本' },
+  { href: '#/favorites', label: '我的收藏' },
+  { href: '#/exam', label: '模拟考试' },
+  { href: '#/browse', label: '真题浏览' },
+  { href: '#/kadian', label: '考点导航' },
+  { href: '#/materials', label: '材料组题' },
+  { href: '#/doubts', label: '疑点复核' },
+  { href: '#/coach', label: '陪伴者', dot: 'nav-push-dot' },
+  { href: '#/stats', label: '数据统计' },
+  { href: '#/settings', label: '设置' },
+];
+const NAV_ORDER_KEY = 'kg_navorder';
+
+function navItemByHref(h) { return NAV_ITEMS.filter(x => x.href === h)[0] || null; }
+function getNavOrder() {
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem(NAV_ORDER_KEY) || 'null'); } catch (e) { }
+  const all = NAV_ITEMS.map(x => x.href), out = [];
+  if (Array.isArray(saved)) saved.forEach(h => { if (all.indexOf(h) >= 0 && out.indexOf(h) < 0) out.push(h); });
+  all.forEach(h => { if (out.indexOf(h) < 0) out.push(h); });     // 新功能补在末尾
+  return out;
+}
+function setNavOrder(list, silent) {
+  const all = NAV_ITEMS.map(x => x.href), out = [];
+  (Array.isArray(list) ? list : []).forEach(h => { if (all.indexOf(h) >= 0 && out.indexOf(h) < 0) out.push(h); });
+  all.forEach(h => { if (out.indexOf(h) < 0) out.push(h); });
+  try { localStorage.setItem(NAV_ORDER_KEY, JSON.stringify(out)); } catch (e) { }
+  if (!silent) { renderNav(); cloudSchedule(); }
+  return out;
+}
 
 function isTeacher() { return false; }   // 陪伴者已融合为普通账号功能，不再有只读角色
 
 function renderNav() {
   const navEl = document.getElementById('nav'); if (!navEl) return;
-  navEl.innerHTML = STUDENT_NAV;
+  const cur = (location.hash || '#/').split('?')[0];
+  navEl.innerHTML = getNavOrder().map(href => {
+    const it = navItemByHref(href) || { href, label: href };
+    const dot = it.dot ? `<span class="nav-dot" id="${it.dot}" style="display:none"></span>` : '';
+    return `<a href="${it.href}"${it.href === cur ? ' class="active"' : ''}>${esc(it.label)}${dot}</a>`;
+  }).join('');
   refreshEncDot();
   refreshPushDot();
+}
+
+/* 设置页的排序编辑器：一行一个功能项，↑↓ 立即换位并落盘（手机端同样是点按，不依赖拖拽） */
+function renderNavOrderEditor() {
+  const box = document.getElementById('st-navorder'); if (!box) return;
+  const order = getNavOrder();
+  box.innerHTML = order.map((href, i) => {
+    const it = navItemByHref(href) || { label: href, href: href };
+    return `<div class="no-row" data-href="${esc(href)}">
+      <span class="no-idx">${i + 1}</span>
+      <span class="no-name">${esc(it.label)}</span>
+      <span class="no-btns">
+        <button type="button" class="btn ghost sm no-up" title="上移" aria-label="把「${esc(it.label)}」上移"${i === 0 ? ' disabled' : ''}>↑</button>
+        <button type="button" class="btn ghost sm no-dn" title="下移" aria-label="把「${esc(it.label)}」下移"${i === order.length - 1 ? ' disabled' : ''}>↓</button>
+      </span></div>`;
+  }).join('');
 }
 
 function agoIso(ts) {
@@ -4681,6 +4775,129 @@ function tStuCard(s) {
     </div>
     <div class="tstu-live">${line}</div>
   </a>`;
+}
+
+/* ---------- 陪伴者视角的「今日回溯」 ----------
+   与陪读自己看到的今日回溯是同一份数据（服务端 /api/coach/today 复用 _today_payload），
+   区别只有两点：① 一切只读，没有删除 / 重做；② 每题的陪读笔记直接摊在题干下面。
+   样式复用陪读端那套 rv-* 卡片，手机端同样是「点组头展开、点行看原题」。 */
+function coachRvCard(g) {
+  const n = g.n || 0, answered = g.answered || 0;
+  const pct = n ? Math.round(answered / n * 100) : 0;
+  const acc = answered ? Math.round((g.right_n || 0) / answered * 100) : 0;
+  const done = g.state === 'done', aborted = g.state === 'aborted';
+  const stateTag = g.legacy ? '<span class="tag" style="color:var(--ink-3)">旧记录</span>'
+    : done ? '<span class="tag">已交卷</span>'
+      : aborted ? '<span class="tag" style="color:var(--bad)">已放弃</span>'
+        : '<span class="tag" style="color:var(--warn)">未完成</span>';
+  const modeTag = g.legacy ? ''
+    : g.mode === 'review' ? '<span class="mode-badge">回忆自评</span>'
+      : g.answer_mode === 'deferred' ? '<span class="mode-badge deferred">先答后对</span>'
+        : '<span class="mode-badge">边答边对</span>';
+  return `<section class="card rv-g" data-gid="${esc(g.gid)}">
+    <div class="rv-g-head" role="button" tabindex="0" aria-expanded="false">
+      <div class="rv-g-main">
+        <div class="rv-g-title">
+          <b>${esc(g.title || RV_MODE[g.mode] || '练习')}</b>${modeTag}${stateTag}
+          ${g.note_n ? `<span class="mode-badge" style="background:var(--paper-2);color:var(--brand)">📝 笔记 ${g.note_n}</span>` : ''}
+        </div>
+        <div class="rv-g-meta">
+          <span>${rvClock(g.started)}${done && g.ended ? ' – ' + rvClock(g.ended) : ''}</span>
+          <span>${answered < n ? `已答 ${answered}/${n} 题` : `${n} 题`}</span>
+          <span>用时 ${durTight(g.total_ms || g.spent_ms)}</span>
+          ${g.timeout_n ? `<span style="color:var(--warn)">超时 ${g.timeout_n}</span>` : ''}
+          ${g.dropped_n ? `<span style="color:var(--ink-3)">丢弃 ${g.dropped_n}</span>` : ''}
+        </div>
+        <div class="pbar rv-pbar"><i style="width:${pct}%"></i></div>
+      </div>
+      <div class="rv-g-acc">
+        <b style="color:${!answered ? 'var(--ink-3)' : acc >= 80 ? 'var(--ok)' : acc >= 60 ? 'var(--brand)' : 'var(--bad)'}">${answered ? acc + '%' : '—'}</b>
+        <span>${g.right_n || 0}/${answered}</span>
+      </div>
+      <span class="rv-caret" aria-hidden="true">▾</span>
+    </div>
+    <div class="rv-g-body" hidden></div>
+  </section>`;
+}
+
+function coachRvItemsHtml(g, items) {
+  if (!items.length) return '<p class="sub" style="padding:14px">这组还没有作答记录。</p>';
+  const review = g.mode === 'review';
+  return `<p class="sub" style="margin:8px 2px 6px">点任意一题看完整原题、答案与解析；陪读写过的笔记直接显示在题干下面。</p>
+    <div class="tbl-wrap cards rv-tbl"><table>
+    <thead><tr><th>#</th><th>模块</th><th>题干</th><th>选择</th><th>正确答案</th><th>结果</th><th>用时</th></tr></thead>
+    <tbody>${items.map((it, i) => {
+    const choice = it.dropped ? '<span class="sub">—</span>'
+      : it.choice ? `<b>${esc(it.choice)}</b>`
+        : (review ? '<span class="sub">—</span>' : '<span class="rv-none">未答</span>');
+    const note = String(it.note || '').trim();
+    return `<tr class="rv-row${it.dropped ? ' is-dropped' : ''}" data-qid="${esc(it.qid)}"
+        data-id="${it.id || ''}" data-choice="${esc(it.choice || '')}" title="点击查看原题">
+        <td data-label="" data-inline>${it.pos || i + 1}</td>
+        <td data-label="模块">${esc(it.module || '')}${it.category ? `<span class="sub">${esc(it.category)}</span>` : ''}</td>
+        <td data-label="题干">${esc(it.stem || '（题目已下架）')}${note ? `<div class="rv-note"><b>📝 陪读笔记</b>${esc(note)}</div>` : ''}</td>
+        <td data-label="选择" data-inline>${choice}</td>
+        <td data-label="正确答案" data-inline><b style="color:var(--ok)">${esc(it.answer || '')}</b></td>
+        <td data-label="结果" data-inline>${rvResult(it, g)}</td>
+        <td data-label="用时" data-inline>${it.ms ? durTight(it.ms) : '—'}</td>
+      </tr>`;
+  }).join('')}</tbody></table></div>`;
+}
+
+async function loadCoachToday(uid) {
+  const body = document.getElementById('tl-today-body');
+  if (!body || !uid) return;
+  const subEl = document.getElementById('tl-today-sub');
+  let d = null;
+  try { d = await API('/api/coach/today?uid=' + encodeURIComponent(uid)); }
+  catch (e) {
+    body.innerHTML = `<p class="sub" style="color:var(--bad);margin:0">加载失败：${esc(e.message || e)}</p>`;
+    if (subEl) subEl.textContent = '';
+    return;
+  }
+  const sum = d.summary || {}, groups = d.groups || [];
+  const acc = sum.answered ? Math.round((sum.right || 0) / sum.answered * 100) : 0;
+  if (subEl) subEl.textContent = groups.length ? `${d.date || ''} · 与陪读自己看到的完全一致` : '';
+  body.innerHTML = groups.length ? `
+    <div class="tl-today-sum">
+      <span><b>${sum.groups || 0}</b> 组</span>
+      <span><b>${sum.answered || 0}</b> 题已完成</span>
+      <span><b>${acc}%</b> 正确率</span>
+      <span><b>${durTight(sum.ms || 0)}</b> 答题用时</span>
+    </div>
+    <div class="rv-list">${groups.map(coachRvCard).join('')}</div>`
+    : '<p class="sub" style="margin:0">这位陪读今天还没有练习记录。等他开始做题，这里会按组列出每一道题。</p>';
+
+  const byGid = {}; groups.forEach(g => byGid[g.gid] = g);
+  body.querySelectorAll('.rv-g').forEach(box => {
+    const g = byGid[box.dataset.gid]; if (!g) return;
+    const head = box.querySelector('.rv-g-head');
+    const b = box.querySelector('.rv-g-body');
+    head.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); head.click(); } };
+    head.onclick = async () => {
+      const open = !box.classList.contains('open');
+      box.classList.toggle('open', open);
+      head.setAttribute('aria-expanded', String(open));
+      b.hidden = !open;
+      if (!open || b.dataset.loaded) return;
+      let items = g.items;
+      if (!items) {
+        b.innerHTML = '<div class="loading">加载题目…</div>';
+        try {
+          const dd = await API('/api/coach/group?uid=' + encodeURIComponent(uid) + '&gid=' + encodeURIComponent(g.gid));
+          items = dd.items || [];
+        } catch (e) {
+          b.innerHTML = `<p class="sub" style="color:var(--bad);padding:12px">加载失败：${esc(e.message || e)}</p>`;
+          return;
+        }
+      }
+      b.dataset.loaded = '1';
+      b.innerHTML = coachRvItemsHtml(g, items);
+      b.querySelectorAll('tr.rv-row').forEach(tr => {
+        tr.onclick = () => tQPop(uid, { id: tr.dataset.id, qid: tr.dataset.qid, choice: tr.dataset.choice });
+      });
+    };
+  });
 }
 
 /* 陪伴者模块：普通账号的一个功能（不再是独立只读角色）
@@ -4901,7 +5118,7 @@ async function viewTeacherStudent(uid) {
   <div class="grid g4" style="margin-top:16px">
     <div class="card kpi warn"><div class="n">${b.due_review || 0}</div><div class="l">🔔 今日待复习</div></div>
     <div class="card kpi brand"><div class="n">${(b.new || 0).toLocaleString()}</div><div class="l">✨ 未学新题</div></div>
-    <div class="card kpi ok"><div class="n">${b.studied_today || 0}</div><div class="l">✅ 今日已练习</div></div>
+    <div class="card kpi ok kpi-link" id="kpi-today" role="button" tabindex="0" style="cursor:pointer" title="点开看陪读今天每一道题的作答与笔记"><div class="n">${b.studied_today || 0}</div><div class="l">✅ 今日已练习</div><div class="kpi-more">看今日回溯 →</div></div>
     <div class="card kpi purple"><div class="n">${(b.learned || 0).toLocaleString()}</div><div class="l">📈 已纳入复习</div></div>
   </div>
   <div class="grid g4" style="margin-top:12px">
@@ -4909,6 +5126,15 @@ async function viewTeacherStudent(uid) {
     <div class="card kpi"><div class="n" style="color:var(--purple)">${b.fav || 0}</div><div class="l">⭐ 我的收藏</div></div>
     <div class="card kpi brand time" title="今日学习时长（做题 + 看解析 + 复习）：${durText(b.today_ms)}"><div class="n">${durHtml(b.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
     <div class="card kpi purple time" title="累计学习时长（做题 + 看解析 + 复习）：${durText(b.total_ms)}"><div class="n">${durHtml(b.total_ms)}</div><div class="l">⏳ 总学习时长</div></div>
+  </div>
+
+  <div class="card" id="tl-today" style="margin-top:16px">
+    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <h2 style="margin:0">🗓 今日回溯</h2>
+      <span class="sub" style="margin:0" id="tl-today-sub"></span>
+    </div>
+    <p class="sub" style="margin:6px 0 12px">和陪读自己点开的「今日回溯」是同一份记录：按组列出今天做过的每一道题，他选了什么、对没对、用了多久，写过的笔记也在这里。<b>只读</b>，不能替他改任何东西。</p>
+    <div id="tl-today-body"><div class="loading">加载中…</div></div>
   </div>
 
   <div class="card" style="margin-top:16px">
@@ -4940,12 +5166,12 @@ async function viewTeacherStudent(uid) {
   <div class="card" style="margin-top:16px">
     <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
       <h2 style="margin:0">最近作答</h2>
-      <span class="sub" style="margin:0">累计 ${b.answered || 0} 题 · 正确率 ${b.answered ? b.accuracy + '%' : '—'} · 点任意一行看原题</span>
+      <span class="sub" style="margin:0">累计 ${b.answered || 0} 题 · 正确率 ${b.answered ? b.accuracy + '%' : '—'} · 带 📝 的题写过笔记 · 点任意一行看原题</span>
     </div>
     ${recent.length ? `<div class="tbl-wrap cards"><table><thead><tr><th>时间</th><th>模块</th><th>题型</th><th>题干</th><th>结果</th></tr></thead><tbody>
-      ${recent.map(r => `<tr class="qrow" data-id="${r.id || ''}" data-qid="${esc(r.qid || '')}" title="点击查看原题">
+      ${recent.map(r => `<tr class="qrow" data-id="${r.id || ''}" data-qid="${esc(r.qid || '')}" data-choice="${esc(r.choice || '')}" title="点击查看原题">
         <td class="nowrap" data-label="时间">${agoIso(r.ts)}</td><td class="nowrap" data-label="模块">${esc(r.module || '')}</td>
-        <td class="nowrap" data-label="题型">${esc(r.category || '')}</td><td data-label="题干">${esc(r.stem || '')}…</td>
+        <td class="nowrap" data-label="题型">${esc(r.category || '')}</td><td data-label="题干">${esc(r.stem || '')}…${r.has_note ? ' <span class="tag" style="color:var(--brand)">📝</span>' : ''}</td>
         <td data-label="结果">${r.right ? '<span class="tag vbadge">正确</span>' : '<span class="tag" style="background:var(--paper-2);color:var(--bad)">错误</span>'}${r.timeout ? ' <span class="tag">超时</span>' : ''}</td></tr>`).join('')}
       </tbody></table></div>` : '<p class="sub" style="margin:8px 0 0">还没有作答记录。</p>'}
   </div>
@@ -4978,8 +5204,17 @@ async function viewTeacherStudent(uid) {
   </div>`;
 
   app.querySelectorAll('tr.qrow').forEach(tr => {
-    tr.onclick = () => tQPop(uid, { id: tr.dataset.id, qid: tr.dataset.qid });
+    tr.onclick = () => tQPop(uid, { id: tr.dataset.id, qid: tr.dataset.qid, choice: tr.dataset.choice || '' });
   });
+
+  // 「今日已练习」点一下就滚到下面的今日回溯
+  const kpiToday = document.getElementById('kpi-today');
+  if (kpiToday) {
+    const jump = () => { const t = document.getElementById('tl-today'); if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
+    kpiToday.onclick = jump;
+    kpiToday.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); jump(); } };
+  }
+  loadCoachToday(uid);
 
   // 实时卡：点「完整习题」或题干区都直接开整题视图（浏览器里选字复制时不算点击）
   const tliveBox = document.getElementById('tlive');
@@ -5736,6 +5971,7 @@ function collectPrefs() {
     sessionSize: loadSessionSize(),
     rmouse: getRmouse() ? 1 : 0,
     seen: loadSeen(),
+    navOrder: getNavOrder(),
   };
 }
 function applyPrefs(d) {
@@ -5779,6 +6015,8 @@ function applyPrefs(d) {
       d.seen.forEach(q => s.add(String(q)));
       try { localStorage.setItem('kg_seen', JSON.stringify(Array.from(s).slice(-800))); } catch (e) { }
     }
+    // 功能栏顺序：账号里存过就按账号来（手机 / 电脑同一份）
+    if (Array.isArray(d.navOrder) && d.navOrder.length) setNavOrder(d.navOrder, true);
     ok = true;
   } catch (e) { /* 云端数据格式异常时忽略该项，不影响本地 */ }
   return ok;
@@ -5853,7 +6091,7 @@ async function prefsFlush() {
   // 偏好同步：账号里有记录就应用到本机；没有就把当前设置作为初始值上传
   try {
     const r = await prefsPull();
-    if (r && r.ok && r.prefs && Object.keys(r.prefs).length) applyPrefs(r.prefs);
+    if (r && r.ok && r.prefs && Object.keys(r.prefs).length) { applyPrefs(r.prefs); renderNav(); }
     else if (r && r.ok) await prefsPushNow().catch(() => { });
   } catch (e) { /* 偏好同步失败不影响主流程 */ }
 })();
