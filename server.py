@@ -1336,9 +1336,7 @@ def get_setting(key, default=None):
 
 APP_RELEASE_VERSION = app_ver()
 APP_RELEASE_NOTES = ("本次更新：\n"
-                     "优化：复习答题卡移到页面顶部，选项直接展开，作答后自动展开解析，未作答按 0 也能直接看答案解析；\n"
-                     "优化：今日学习时长按「逐题作答 + 看解析」重新统计，总览与今日回溯显示同一口径；\n"
-                     "修复：复习完成页「返回总览」点了没反应、完成页题数显示为 0，以及作答后正确选项没点亮的问题。\n"
+                     "修复：练习新题偶发提示「网络连接失败」，以及做题较多后点「练习新题」进不去的问题。\n"
                      "刷新页面即可生效。")
 
 
@@ -2519,9 +2517,11 @@ class Handler(BaseHTTPRequestHandler):
                 cond += " AND q.year=?"
                 args.append(year)
             ref = g("ref")
-            # 跨次去重：排除近期已练习过的 qid（由前端传入，限额 500，仅作用于新题补充分支）
+            # 跨次去重：排除近期已练习过的 qid（由前端传入，取最近 500 个，仅作用于新题补充分支）
+            # 取尾部而不是头部：前端发的是最近做过的题，排除它们才有意义（早先取头部等于排除最老的 500 道）
             excl = g("exclude", "")
-            excl_ids = [x for x in excl.split(",") if re.fullmatch(r"\d+", x.strip())][:500] if excl else []
+            _ex = [x.strip() for x in excl.split(",") if re.fullmatch(r"\d+", x.strip())] if excl else []
+            excl_ids = _ex[-500:]
             ea = args + excl_ids
             # 进度行按需生成：LEFT JOIN 让没有进度行的题也视为「新题」，
             # 不再依赖注册时预铺 2.7 万行空白记录（那是注册慢 + 写锁长的根源）

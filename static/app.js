@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261125f';
+const APP_VER = '20261125g';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -50,8 +50,15 @@ class ApiError extends Error {
 async function API(p) {
   let r;
   try { r = await fetch(withU(p)); }
-  catch (e) { throw new ApiError('网络连接失败，请检查网络后重试', 0); }
+  catch (e) {
+    // 手机切网 / 锁屏常把在途请求直接掐断，浏览器只给一个 TypeError。
+    // GET 是幂等的，等 400ms 再取一次，别让用户看到「网络连接失败」。
+    await new Promise(s => setTimeout(s, 400));
+    try { r = await fetch(withU(p)); }
+    catch (e2) { throw new ApiError('网络连接失败，请检查网络后重试', 0); }
+  }
   if (r.status === 401) { onExpired(); throw new ApiError('登录已失效', 401); }
+  if (r.status === 414) throw new ApiError('请求内容过长，请刷新页面后重试', 414);
   if (!r.ok) throw new ApiError('服务器返回 ' + r.status + '，请稍后重试', r.status);
   try { return await r.json(); }
   catch (e) { throw new ApiError('服务器返回数据异常，请重试', r.status); }
@@ -650,15 +657,28 @@ async function startSession(cfg) {
   p.set('mode', cfg.mode); p.set('size', String(cfg.size || loadSessionSize()));
   // 「已做过的题」这个缓存只用来避免新题重复；错题重练 / 复习到期 / 收藏练习本来就是「再做一遍」，
   // 带上它会把刚练过的题全部排除掉，表现为「今天做过的错题/复习一题都抽不到」。
-  if (EXCL_MODES.has(cfg.mode)) p.set('exclude', loadSeen().join(','));
+  // 且只发最近 500 个（服务端上限也是 500）：本地缓存最多 800 条，全塞进 query string 会让请求行
+  // 越过网关 8KB 上限，练习新题直接失败（页面上只看到「网络连接失败」）。
+  if (EXCL_MODES.has(cfg.mode)) p.set('exclude', loadSeen().slice(-500).join(','));
   if (cfg.module) p.set('module', cfg.module);
   if (cfg.category) p.set('category', cfg.category);
   if (cfg.kadian) p.set('kadian', cfg.kadian);
   if (cfg.year) p.set('year', cfg.year);
   if (cfg.ref) p.set('ref', cfg.ref);
-  if (cfg.ids && cfg.ids.length) p.set('ids', cfg.ids.join(','));
+  if (cfg.ids && cfg.ids.length) p.set('ids', cfg.ids.slice(0, 200).join(','));   // 服务端同样只取 200
   let res;
-  try { res = await API('/api/next?' + p); } catch (e) { return fatal(e); }
+  try { res = await API('/api/next?' + p); }
+  catch (e) {
+    // 弱网瞬断、或请求行仍被网关掐断（414）时，去掉去重列表再试一次：
+    // 最坏结果只是这组可能抽到做过的题，比整页「出错了」好得多。
+    let retried = null;
+    if (p.has('exclude')) {
+      p.delete('exclude');
+      try { retried = await API('/api/next?' + p); } catch (e2) { retried = null; }
+    }
+    if (!retried) return fatal(e);
+    res = retried;
+  }
   if (!res.cards.length) {
     const emptyMsg = {
       review: ['没有到期需要复习的题目', '今天做过的题已经按记忆曲线排到后面了。想现在再过一遍，点下面的按钮。'],
