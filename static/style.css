@@ -488,6 +488,15 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
 /* 复习模式：选项可直接点选，答对自动进入下一题 */
 .rev-pick-tip{margin:10px 0 0;font-size:12.5px}
 .rev-opts .opt:active{background:var(--surface-2)}
+/* 复习：已记下的档位高亮 + 「已记」小字；再点其它档位就是改评 */
+.grade button.on{border-width:2px;border-color:var(--ok)}
+.grade button .g-cur{display:block;margin-top:2px;font-size:10.5px;font-weight:700;color:var(--ok)}
+.answer-sheet .grade button.on{background:#eef8f1;color:#14572c;border-color:#6fbf8d}
+html[data-theme="dark"] .answer-sheet .grade button.on{background:#16281c;color:#c6f0d5;border-color:#4d8f66}
+/* 复习：上一题 / 下一题 */
+.rev-nav{display:inline-flex;gap:6px}
+.pp-home:disabled{opacity:.4;cursor:not-allowed}
+.pp-home.rev-next{border-color:var(--brand);color:var(--brand)}
 .answer-sheet .rev-rate{border-top-color:#d9dee2}
 .answer-sheet .rev-rate-head .sub,.answer-sheet .rev-rate-tip{color:#6b757e}
 html[data-theme="dark"] .answer-sheet .rev-rate{border-top-color:#34373b}

@@ -203,7 +203,7 @@ function saveSession() {
       mode: S.mode, cfg: S.cfg, queue: S.queue, idx: S.idx,
       tally: S.tally, marked: Array.from(S.marked || []),
       answerMode: S.answerMode, answers: S.answers || {}, spent: S.spent || {},
-      gid: S.gid || '',
+      gid: S.gid || '', rev: S.rev || {},
       kind: 'study', savedAt: Date.now(), cAcc: allElapsed(S), qAcc: qElapsed(S), qQid: S.qQid || null,
       qTimes: S.qTimes || {},
     }));
@@ -248,6 +248,7 @@ function resumeSession() {
     cAcc: +o.cAcc || 0, cRun: 0, qAcc: +o.qAcc || 0, qRun: 0, qQid: o.qQid || null, qTimes: o.qTimes || {}, times: [], timeoutN: 0,
     answerMode: o.answerMode === 'deferred' ? 'deferred' : 'instant',
     answers: o.answers || {}, spent: o.spent || {}, fulls: {}, submitted: false,
+    rev: o.rev || {},
     gid: o.gid || '',
   };
   try {
@@ -278,7 +279,9 @@ function resumeAgo(ts) {
 /* 任何视图抛错都不能让页面停在"加载中…"：统一兜住并给重试入口。 */
 async function nav() {
   try {
-    return await route();
+    const r = await route();
+    stSync();      // 新页面已经渲染完：把「离开学习页」剩下的零头落库（此时答题页/报告页已不在屏幕上）
+    return r;
   } catch (e) {
     if (e && e.status === 401) return;          // 已跳登录，无需重复提示
     console.error('[nav]', e);
@@ -668,6 +671,7 @@ async function startSession(cfg) {
     ids: cfg.ids || null, cAcc: 0, cRun: Date.now(), qAcc: 0, qRun: Date.now(), qTimes: {}, qQid: null, times: [], timeoutN: 0,
     answerMode: cfg.answerMode || getAnswerMode(),
     answers: {}, spent: {}, fulls: {}, submitted: false,
+    rev: {},
     gid: cfg.gid || '',
   };
   addSeen(res.cards.map(c => c.qid));
@@ -681,18 +685,40 @@ function renderCard() {
   const S = state.session; const c = S.queue[S.idx];
   if (!c) { clearSession(); return finishSession(); }
   S.phase = 'question'; S.chosen = null; S.full = null; S.graded = 0; S.ansShown = false;
+  // 复习：回到做过的题（点「上一题」或刷新后接着练）时，把当时的选项、解析状态和已记档位恢复回来，
+  // 这样「跳回去改掌握程度」看到的就是当时的样子，而不是一张空白题。
+  let revNeedFull = null;
+  if (isRev(S)) {
+    const rv = (S.rev || {})[c.id];
+    if (rv) {
+      if (rv.chosen) S.chosen = rv.chosen;
+      if (rv.g) S.graded = rv.g;
+      if (rv.rev) {
+        if (S.fulls && S.fulls[c.id]) { S.full = S.fulls[c.id]; S.phase = 'answer'; }
+        else revNeedFull = c;
+      }
+    }
+  }
   // 只有真的换了题才把「本题用时」归零；同一题重渲染 / 从快照恢复都保留已用时间
   if (S.qQid !== c.id) clockStartQ(S, c.id);
   const hasMat = !!c.material; window.__curMatRaw = c.material;
   const deferred = isDeferred(S);
-  const doneN = deferred ? S.queue.filter(x => S.answers[x.id]).length : S.idx;
+  // 复习可以来回跳题，进度看「已评几题」而不是「走到第几题」，否则跳回上一题进度条会倒退
+  const revN = isRev(S) ? S.queue.filter(x => { const r = (S.rev || {})[x.id]; return r && r.g; }).length : 0;
+  const doneN = deferred ? S.queue.filter(x => S.answers[x.id]).length : (isRev(S) ? revN : S.idx);
   const ppStat = deferred
     ? `<span class="mode-badge deferred">先答后对</span> 已答 <b>${doneN}</b> / ${S.queue.length}`
-    : `<span class="mode-badge">边答边对</span> 本次对 <b style="color:var(--ok)">${S.tally.right}</b> 错 <b style="color:var(--bad)">${S.tally.wrong}</b>${S.timeoutN ? ` &nbsp;·&nbsp; <b style="color:var(--warn)">超时 ${S.timeoutN}</b>` : ''}`;
+    : (isRev(S)
+      ? `<span class="mode-badge">复习</span> 已评 <b>${revN}</b> / ${S.queue.length}`
+      : `<span class="mode-badge">边答边对</span> 本次对 <b style="color:var(--ok)">${S.tally.right}</b> 错 <b style="color:var(--bad)">${S.tally.wrong}</b>${S.timeoutN ? ` &nbsp;·&nbsp; <b style="color:var(--warn)">超时 ${S.timeoutN}</b>` : ''}`);
   app.innerHTML = `
-  <div class="progress"><div class="pp-main"><span id="pp-txt">第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; ${ppStat}</span>
-    <div class="pbar"><i style="width:${doneN / S.queue.length * 100}%"></i></div></div>
+  <div class="progress"><div class="pp-main"><span id="pp-txt">第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; <span id="pp-stat">${ppStat}</span></span>
+    <div class="pbar"><i id="pp-bar" style="width:${doneN / S.queue.length * 100}%"></i></div></div>
     <div class="pp-side">
+      ${isRev(S) ? `<div class="rev-nav">
+        <button class="pp-home" id="rev-prev" type="button" title="上一题（←）：回到做过的题，可改掌握程度" ${S.idx === 0 ? 'disabled' : ''}>←<span class="pp-lbl"> 上一题</span></button>
+        <button class="pp-home rev-next" id="rev-next" type="button" title="下一题（→）：还没选掌握程度的，按「一般」记录">→<span class="pp-lbl"> 下一题</span></button>
+      </div>` : ''}
       <button class="pp-home" id="pp-back" type="button" title="暂时退出：本组进度已保存，回总览点「继续上次刷题」可接着做">⏸<span class="pp-lbl"> 暂时退出</span></button>
       <button class="pp-home pp-quit" id="pp-quit" type="button" title="放弃本组：结束并删除这组记录，不再出现在今日回溯">✕<span class="pp-lbl"> 放弃</span></button>
       <button class="qtimer" id="qtimer" type="button" title="左键单击这里可暂停计时"><span id="qt-icon" aria-hidden="true">⏱</span><b id="qt-now">0:00</b><small>/ <span id="qt-all">0:00</span></small><span class="qt-hint" id="qt-hint"></span></button>
@@ -752,6 +778,11 @@ function renderCard() {
   // 暂时退出：本组进度已随 saveSession 落盘，总览页可「继续上次刷题」
   const backB = document.getElementById('pp-back');
   if (backB) backB.onclick = () => { try { saveSession(); } catch (e) { } location.hash = '#/'; };
+  // 复习：上一题 / 下一题（离开前把「答对但没自评」的题按默认档记上）
+  const prevB = document.getElementById('rev-prev');
+  if (prevB) prevB.onclick = () => revNav(-1);
+  const nextB = document.getElementById('rev-next');
+  if (nextB) nextB.onclick = () => revNav(1);
   // 放弃：结束本组并删掉这组记录（不再继续，也不占着今日回溯）
   const quitB = document.getElementById('pp-quit');
   if (quitB) quitB.onclick = () => abandonPractice();
@@ -782,6 +813,23 @@ function renderCard() {
     stopLimitTimer();
   }
   startClock();
+  if (revNeedFull) revFetchFull(S, revNeedFull);
+}
+
+/* 复习跳回一道已展开解析的题：本地没有完整卡片（刷新过 / 快照里不存解析）就补取一次再渲染。
+   取不到就停在「回忆阶段」，用户仍可照常自评。 */
+async function revFetchFull(S, c) {
+  if (!S || S._revFetch === c.id) return;
+  S._revFetch = c.id;
+  try {
+    const d = await API('/api/question?id=' + c.id);
+    if (d && d.card) S.fulls[c.id] = d.card;
+  } catch (e) { }
+  S._revFetch = 0;
+  if (state.session === S && S.queue[S.idx] === c && S.phase === 'question') {
+    S.full = (S.fulls || {})[c.id] || null;
+    if (S.full) { S.phase = 'answer'; renderCard(); }
+  }
 }
 
 /* 放弃本组：不再继续，但已经作答的记录留在「今日回溯」里（标为已放弃）。
@@ -1832,7 +1880,7 @@ function renderOptions() {
       <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
         <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
       </div>`).join('') + `</div>
-      <p class="sub rev-pick-tip">点击选项作答 · 答对自动进入下一题（记为「一般」），答错留在本题看解析</p>`;
+      <p class="sub rev-pick-tip">点击选项作答 · 答对先记为「一般」（可改档位，按 → 进下一题），答错留在本题看解析</p>`;
     box.querySelectorAll('.opt').forEach(el => bindPick(el, () => revPick(el.dataset.key)));
   } else if (!answerable && S.phase === 'answer') {
     // 复习模式：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪
@@ -1883,7 +1931,7 @@ function renderAct() {
       <div class="rev-rate">
         <div class="rev-rate-head">
           <b>这道题现在掌握得怎么样？</b>
-          <span class="sub" style="margin:0">不点选项也可以直接自评，选完自动进入下一题</span>
+          <span class="sub" style="margin:0">不点选项也可以直接自评；选完停留本题，按 → 进下一题</span>
         </div>
         <div class="grade">
           <button class="g-again" data-g="1">忘记<small>1 · again 完全没印象</small></button>
@@ -1906,7 +1954,10 @@ function renderAct() {
   const isRight = (answerable || picked)
     ? (String(S.chosen || '').toUpperCase() === String(f.answer || '').toUpperCase())
     : null;
-  if (answerable) { S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++; }
+  if (answerable && S._tallyId !== c.id) {   // 同一题重渲染不重复计数
+    S._tallyId = c.id;
+    S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++;
+  }
   // 复习模式：解析直接展开可见，正确答案放在解析末尾且默认打码——看解析不影响先自评
   const ansBlock = (answerable || picked)
     ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}${ansHistHtml(f, S.gid)}</div>`
@@ -1926,18 +1977,19 @@ function renderAct() {
     ${ansBlock}
     ${noteBox(f)}
     ${(answerable || picked) ? revealHtml(f) : ''}
-    <div class="grade">
+    <div class="grade" id="grade-bar">
       <button class="g-again" data-g="1">忘记<small>1 · again 马上重来</small></button>
       <button class="g-hard" data-g="3">困难<small>2 · hard 有点卡</small></button>
       <button class="g-good" data-g="4">一般<small>3 · good 记住了</small></button>
       <button class="g-easy" data-g="5">熟悉<small>4 · easy 轻松</small></button>
     </div>
-    <p class="sub" style="margin-top:10px">${answerable
+    <p class="sub" id="rev-tip" style="margin-top:10px">${answerable
       ? '按你的真实记忆强度自评（直接按键盘 1 / 2 / 3 / 4）。系统将据此计算下次复习间隔。'
       : (picked
-        ? (isRight ? '答对了，已记为「一般」（熟悉程度 3）。' : '答错了，先看完解析再自评（键盘 1 / 2 / 3 / 4）；自评后进入下一题。')
-        : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；自评后自动进入下一题。')}</p>`;
+        ? (isRight ? '答对了 · 按「一般」（熟悉程度 3）记录；点其它档位可改，按 → 进下一题。' : '答错了，先看完解析再自评（键盘 1 / 2 / 3 / 4）；按 → 也可以直接跳过本题。')
+        : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；按 → 进下一题。')}</p>`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
+  if (!answerable) syncRevGrade();
   if (!answerable && !picked) bindAnsToggle();
   bindNoteBox(act, f);            // 笔记常驻：与「完整标注 / 看解析」同一份数据
   document.getElementById('t-fav').onclick = async (e) => {
@@ -2396,6 +2448,15 @@ async function doReveal() {
   const S = state.session, c = S.queue[S.idx];
   stopLimitTimer();
   try { const d = await API('/api/question?id=' + c.id); S.full = d.card; } catch (e) { return fatal(e); }
+  // 复习：记下「这题已展开解析」与当时的选项，跳回上一题时才还原得出来
+  if (isRev(S)) {
+    S.fulls = S.fulls || {};
+    S.fulls[c.id] = S.full;
+    S.rev = S.rev || {};
+    const rec = (S.rev[c.id] = S.rev[c.id] || {});
+    rec.rev = 1;
+    if (S.chosen) rec.chosen = S.chosen;
+  }
   S.phase = 'answer'; renderOptions();
   // 只有真的选了选项才落一条作答流水：复习模式里「直接看答案与解析」不算作答，
   // 否则单纯核对答案会被记成一次答错，拖累今日正确率与历史答案。
@@ -2408,8 +2469,9 @@ async function doReveal() {
   }
 }
 
-/* 复习模式点选项作答：答对立刻记「熟悉程度 3（一般）」并进入下一题；答错留在本题看解析（不跳转）。
-   两种结果都会经 doReveal / doGrade 落进 practice_items，因此能在「历史答案」和今日回溯里看到。 */
+/* 复习模式点选项作答：答对先按「熟悉程度 3（一般）」记上，但停在本题不跳（可以改档位、看解析）；
+   答错留在本题看解析，等用户自评。两种结果都会经 doReveal / doGrade 落进 practice_items，
+   因此能在「历史答案」和今日回溯里看到。 */
 async function revPick(key) {
   const S = state.session;
   if (!S || S._revPicking || S._grading) return;
@@ -2418,42 +2480,136 @@ async function revPick(key) {
   S.chosen = key;
   await doReveal();                       // 取回带答案的完整卡片（顺带落一条作答流水）
   if (!S.full || S.phase !== 'answer') { S._revPicking = false; return; }
-  const ok = String(key).toUpperCase() === String(S.full.answer || '').toUpperCase();
+  const ok = revAnsweredRight(S);
   S._revPicking = false;
   if (!ok) {                              // 答错：留在本题，答案解析已展开，等用户自评
     toast('✗ 没答对 · 看完解析再自评');
     return;
   }
-  toast('✓ 答对 · 记为「' + REV_AUTO_GRADE_NAME + '」（熟悉程度 3）');
-  // 留 350ms 让对勾与绿色高亮看得清，再跳；这期间用户若已自己自评过就不再重复
-  const qid = S.queue[S.idx] && S.queue[S.idx].qid;
-  await new Promise(r => setTimeout(r, 350));
-  if (state.session !== S || S.phase !== 'answer' || S.graded) return;
-  if (!S.queue[S.idx] || S.queue[S.idx].qid !== qid) return;
-  await doGrade(REV_AUTO_GRADE);           // 内部会按复习模式直接 nextCard()
+  toast('✓ 答对 · 记为「' + REV_AUTO_GRADE_NAME + '」，可改档位');
+  await doGrade(REV_AUTO_GRADE, { quiet: true });
 }
 
-async function doGrade(g) {
-  const S = state.session, c = S.queue[S.idx];
-  if (S._grading) return;          // 自评立即跳转后，连按 1/2/3/4 不能重复评分
+/* 复习：这一题是不是「点了选项并且点对了」——用来判断离开本题时要不要按默认档补记 */
+function revAnsweredRight(S) {
+  const f = S && S.full;
+  if (!f || !S.chosen) return false;
+  return String(S.chosen).toUpperCase() === String(f.answer || '').toUpperCase();
+}
+
+/* 复习导航：上一题 / 下一题。离开一题前，答对但没选掌握程度的按默认档「一般」补记，
+   免得复习进度悬空；没答对的一律不擅自写档位（写了会被算成「遗忘」）。 */
+async function revNav(delta) {
+  const S = state.session;
+  if (!S || !isRev(S) || S._revNav) return;
+  S._revNav = true;
+  try {
+    if (S._grading) await new Promise(r => setTimeout(r, 150));   // 上一次评分正在落库，等它写完再走
+    await revSettleCurrent();
+    const i = S.idx + delta;
+    if (i < 0) return;
+    if (i >= S.queue.length) { nextCard(); return; }   // 最后一题再往下 = 收尾 / 续下一批
+    S.idx = i;
+    renderCard();
+    saveSession();
+  } finally { S._revNav = false; }
+}
+async function revSettleCurrent() {
+  const S = state.session; if (!S || !isRev(S)) return;
+  const c = S.queue[S.idx]; if (!c) return;
+  const rec = (S.rev || {})[c.id] || {};
+  if (rec.g) return;                       // 已经记过档位
+  if (!revAnsweredRight(S)) return;        // 没答对：留给用户自己评
+  await doGrade(REV_AUTO_GRADE, { quiet: true });
+}
+
+/* 复习：把「这一题已记成哪一档」标在评分条上，再点其它档位就是改评 */
+function gradeLabel(g) {
+  const x = GRADE_DEF.find(y => y.v === +g);
+  return x ? x.n : '—';
+}
+function syncRevGrade() {
+  const S = state.session; if (!S || !isRev(S)) return;
+  const c = S.queue[S.idx]; if (!c) return;
+  const rec = (S.rev || {})[c.id] || {};
+  const g = rec.g || 0;
+  const bar = document.getElementById('grade-bar');
+  if (bar) bar.querySelectorAll('button').forEach(b => {
+    const on = !!g && +b.dataset.g === g;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    const tag = b.querySelector('.g-cur');
+    if (on && !tag) b.insertAdjacentHTML('beforeend', '<span class="g-cur">已记</span>');
+    else if (!on && tag) tag.remove();
+  });
+  const tip = document.getElementById('rev-tip');
+  if (tip && g) {
+    const iv = typeof rec.iv === 'number' ? rec.iv : null;
+    const nxt = iv === null ? '已写入记忆曲线' : (iv === 0 ? '今天再练' : `下次 ${iv} 天后复习`);
+    tip.textContent = `已记为「${gradeLabel(g)}」· ${nxt} · 点其它档位可直接改，按 → 进下一题`;
+  }
+  syncRevProgress();
+}
+
+/* 复习：记完档位就地刷新顶栏的「已评 n / m」与进度条，不用整页重绘 */
+function syncRevProgress() {
+  const S = state.session; if (!S || !isRev(S)) return;
+  const n = S.queue.length || 1;
+  const revN = S.queue.filter(x => { const r = (S.rev || {})[x.id]; return r && r.g; }).length;
+  const st = document.getElementById('pp-stat');
+  if (st) st.innerHTML = `<span class="mode-badge">复习</span> 已评 <b>${revN}</b> / ${S.queue.length}`;
+  const bar = document.getElementById('pp-bar');
+  if (bar) bar.style.width = (revN / n * 100).toFixed(2) + '%';
+}
+
+/* 评分。复习模式下不再自动跳题：先把档位记在本题上，留在原页可以改，按 → / 点「下一题」才前进。
+   opt.advance 供「评完就前进」的调用方使用；同一题已记过档位的，再评走服务端 revise（撤回上一次再重算）。 */
+async function doGrade(g, opt) {
+  opt = opt || {};
+  const S = state.session; if (!S) return;
+  const c = S.queue[S.idx]; if (!c) return;
+  if (S._grading) return;                     // 连按 1/2/3/4 不能重复评分
+  const rev = isRev(S);
+  S.rev = S.rev || {};
+  const rec = rev ? (S.rev[c.id] = S.rev[c.id] || {}) : null;
+  const prevG = rec ? (rec.g || 0) : 0;
+  if (rev && prevG === g) {                   // 点的是已记的同一档：不重复写库
+    syncRevGrade();
+    if (opt.advance) nextCard();
+    return;
+  }
   S._grading = true;
-  const dur = qElapsed(S);
-  S.times.push(dur); stopLimitTimer();
+  const first = !prevG;                       // 第一次评这题（不是改评）
+  const dur = first ? Math.round(qElapsed(S)) : (rec.ms || Math.round(qElapsed(S)));
+  if (first) S.times.push(dur); else if (rec && !rec.ms) rec.ms = dur;
+  stopLimitTimer();
   let gr = null;
-  try { gr = await POST('/api/grade', { id: c.id, grade: g, choice: S.chosen || '' }); } catch (e) { }
+  try {
+    gr = await POST('/api/grade', { id: c.id, grade: g, choice: S.chosen || '',
+                                    revise: (!first && rev) ? 1 : 0 });
+  } catch (e) { }
   if (gr && typeof gr.interval === 'number') S.lastInterval = gr.interval;
   // 回溯：边答边对记「看答案那一刻」的选择与客观正误；复习模式没有选项，用自评档位判对错
   const ans = (S.full && S.full.answer) || '';
-  const correct = isRev(S)
+  const correct = rev
     ? (g >= 3 ? 1 : 0)
     : ((S.chosen && String(S.chosen).toUpperCase() === String(ans).toUpperCase()) ? 1 : 0);
   markPractice(S, [{ qid: c.qid, choice: S.chosen || '', correct, timeout: 0, ms: dur, pos: S.idx + 1 }]);
   refreshSide();
   S.graded = g;
   S._grading = false;
-  if (isRev(S)) {
-    // 需求：复习自评后立即进入下一题，不再有停留延迟
-    nextCard();
+  if (rev) {
+    rec.g = g; rec.ms = dur;
+    if (gr && typeof gr.interval === 'number') rec.iv = gr.interval;
+    else if (typeof rec.iv !== 'number') rec.iv = null;
+    if (!opt.quiet) toast((first ? '✓ 已记「' : '↻ 已改「') + gradeLabel(g) + '」');
+    if (S.phase === 'question') {
+      await doReveal();                // 凭回忆直接自评：把答案与解析展开，方便核对
+    } else {
+      syncRevGrade();
+    }
+    saveSession();
+    if (opt.advance) nextCard();
     return;
   }
   renderNextBar(false);
@@ -2534,23 +2690,12 @@ async function dropCurrent() {
     : '已丢弃 · 同类题暂时没有可补的');
 }
 
-function renderNextBar(auto) {
+/* 练习（非复习）自评后：把评分区换成「已记录 + 下一题」，答案解析笔记都留在页面上。
+   复习模式不再走这里：档位记在本题上、评分条原地高亮，前进靠「下一题 →」或方向键。 */
+function renderNextBar() {
   const box = document.getElementById('act'); if (!box) return;
   const S = state.session;
   const last = S.idx >= S.queue.length - 1;
-  if (auto) {
-    // 复习模式：自评后自动进入下一题，只提示下次时间，留一个「停留查看」的口子
-    const nxt = S.lastInterval === 0 ? '今天再练'
-      : (S.lastInterval ? `下次 ${S.lastInterval} 天后` : '已记录');
-    const html = `<span class="nx-tip">✓ 已记录 · ${nxt}复习 · 即将进入${last ? '完成页' : '下一题'}…</span>
-      <button class="btn ghost sm nx-stay">停留查看</button>`;
-    const g = box.querySelector('.grade');
-    if (g) { g.classList.add('nextbar'); g.innerHTML = html; }
-    else box.insertAdjacentHTML('beforeend', `<div class="grade nextbar">${html}</div>`);
-    const stay = box.querySelector('.nx-stay');
-    if (stay) stay.onclick = () => { clearTimeout(S._autoT); renderNextBar(false); };
-    return;
-  }
   // 只换掉评分区：答案、解析、笔记都要留在页面上（原先整块替换会让它们消失）
   const html = `<span class="nx-tip">已记录 · 看完解析再继续</span>
     <button class="btn ok nx-go">${last ? '完成本组 →' : '下一题 →'} <small>空格</small></button>`;
@@ -2667,7 +2812,7 @@ function toggleClockPause() {
 
 /* ---------- 学习时长：分三段计时的连续累计 ----------
    不做「题数 × 平均时长」估算，按秒实时累计：只要停留在答题页 / 解析页且标签页可见就计入，
-   点计时胶囊暂停、切到后台、回到总览或设置页则停止。每 20 秒把增量上报一次（离开页面时立刻上报），
+   点计时胶囊暂停、切到后台、回到总览或设置页则停止。每 10 秒把增量上报一次（离开页面时立刻上报），
    服务端按天累加进 study_time 表，总览面板据此显示「今日学习时长 / 总学习时长」。
 
    一天的时间被切成三段（互斥、加起来等于总时长）：
@@ -2683,11 +2828,26 @@ const ST = {
   sent: { answer: 0, analysis: 0, review: 0 },
   last: 0, timer: null, sending: false, p: null,
 };
+/* 答题页是否就在屏幕上：练习是就地渲染的，进入练习大多不改 hash
+   （总览「继续上次刷题」、今日回溯「重做本组」都不改），所以不能只看 hash。
+   以计时胶囊为「答题页已就位」的信号最可靠。 */
+function stOnPracticePage() {
+  const S = state.session;
+  return !!(S && !S.submitted && document.getElementById('qtimer'));
+}
+/* 交卷报告是否在屏幕上：读报告同样是学习（三段里的「看解析」）。
+   练习是就地渲染的，从今日回溯「重做本组」进来的报告 hash 是 #/today，只按 hash 判断会漏计。 */
+function stOnReportPage() { return !!document.getElementById('session-done'); }
 function stCurrentKind() {
+  const S = state.session;
   const h = (location.hash || '#/').split('?')[0];
+  if (stOnPracticePage()) {                                 // 在答题纸上：看题就是做题，展开解析算看解析
+    if (isRev(S) && S.phase !== 'answer') return 'review';
+    return S.phase === 'answer' ? 'analysis' : 'answer';
+  }
+  if (stOnReportPage()) return 'analysis';                  // 交卷报告：在读解析
   if (ST_READ_ONLY_ROUTES.has(h)) return 'analysis';        // 看题/看解析的页面
   if (h === '#/exam') return (state.exam && !state.exam.submitted) ? 'answer' : 'analysis';
-  const S = state.session;
   if (S) {
     if (S.submitted) return 'analysis';                     // 交卷报告：在读解析
     if (isRev(S) && S.phase !== 'answer') return 'review';
@@ -2701,11 +2861,12 @@ function stPending() {
 }
 function stShouldRun() {
   if (document.hidden) return false;
+  const S = state.session;
+  // 答题页在屏幕上就以计时胶囊为准：胶囊被手动暂停才停表
+  if (stOnPracticePage()) return !isClockPaused(S);
+  if (stOnReportPage()) return true;
   const h = (location.hash || '#/').split('?')[0];
   if (!ST_ROUTES.has(h)) return false;                       // 总览 / 统计 / 设置不算学习
-  const S = state.session;
-  // 只有"计时胶囊就在眼前且被手动暂停"时才不计时；离开答题页后暂停状态不该继续影响其它页面
-  if (S && !S.submitted && isClockPaused(S) && document.getElementById('qtimer')) return false;
   return true;
 }
 function stStep() {
@@ -2717,7 +2878,7 @@ function stStep() {
 function stTick() {
   if (!stShouldRun()) { ST.last = Date.now(); return; }
   stStep();
-  if (stPending() >= 20000) stFlush(false);
+  if (stPending() >= 10000) stFlush(false);
 }
 function stBoot() {
   if (ST.timer) return;
@@ -2725,38 +2886,45 @@ function stBoot() {
   ST.timer = setInterval(stTick, 1000);
 }
 function stSync() {
-  const h = (location.hash || '#/').split('?')[0];
-  // 离开学习页 / 切到后台：把还没上报的零头立刻落库，回到总览时数字才对得上
-  if (!stShouldRun() && (!ST_ROUTES.has(h) || document.hidden)) stFlush(false);
+  // 离开学习页 / 切到后台：把还没上报的零头立刻落库（不再等 1 秒门槛、也不再等 10 秒心跳），
+  // 回到总览时数字才对得上——这就是「中途退出后总览学习时长不更新」的那条路。
+  if (!stShouldRun()) stFlush(false, true);
 }
-function stFlush(keepalive) {
+/* keepalive=true：关页面 / 切后台时用（页面销毁后请求仍会发完）；
+   force=true：离开学习页时用，几百毫秒的零头也落库。
+   只有服务端明确回 ok 才把本地增量记成「已上报」，否则下一次连本带利重发——
+   以前非 2xx 也照记已上报，网络抖动一次就白丢一段时间。 */
+function stFlush(keepalive, force) {
   const parts = {};
   let pend = 0;
   Object.keys(ST.acc).forEach(k => {
     const d = Math.round(ST.acc[k] - ST.sent[k]);
     if (d > 0) { parts[k] = d; pend += d; }
   });
-  if (pend < 1000) return Promise.resolve();                // 零头留着，下次一起报
+  if (pend < (force ? 200 : 1000)) return Promise.resolve();   // 零头留着，下次一起报
   if (ST.sending) return ST.p || Promise.resolve();
   const upto = { ...ST.acc };
   ST.sending = true;
-  ST.p = fetch(withU('/api/study-time'), {
-    method: 'POST', keepalive: !!keepalive,
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ms: pend, parts, token: tok() }),
-  }).then(r => (r && r.ok) ? r.json() : null).then(j => {
-    Object.keys(ST.sent).forEach(k => { ST.sent[k] = upto[k]; });
+  // 请求挂死（弱网 / 后端卡住）不能把后续上报全堵住：15 秒没回就当失败，增量留着下轮重发
+  const AC = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const timer = AC ? setTimeout(() => { try { AC.abort(); } catch (e) { } }, 15000) : null;
+  const opt = { method: 'POST', keepalive: !!keepalive, headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ ms: pend, parts, token: tok() }) };
+  if (AC) opt.signal = AC.signal;
+  ST.p = fetch(withU('/api/study-time'), opt).then(r => (r && r.ok) ? r.json() : null).then(j => {
+    if (j && j.ok) Object.keys(ST.sent).forEach(k => { ST.sent[k] = upto[k]; });
     if (j && typeof j.today_ms === 'number') {
       ST.todayMs = j.today_ms; ST.totalMs = j.total_ms || 0;
       ST.todayParts = j.today_parts || null;
     }
-  }).catch(() => { /* 网络失败：增量留着下次重试 */ }).then(() => { ST.sending = false; });
+  }).catch(() => { /* 网络失败 / 超时：增量留着下次重试 */ })
+    .then(() => { if (timer) clearTimeout(timer); ST.sending = false; ST.p = null; });
   return ST.p;
 }
 /* 把手上未上报的时长送出去并等它落库（总览 / 统计页取数前调用，保证卡片数字当场就是准的） */
 async function stSettle() {
   for (let i = 0; i < 3; i++) {
-    try { await stFlush(false); } catch (e) { }
+    try { await stFlush(false, true); } catch (e) { }
     if (!ST.sending) break;
   }
 }
@@ -2910,6 +3078,7 @@ async function timeoutCurrent() {
   S.times.push(dur); stopLimitTimer();
   try { await POST('/api/grade', { id: c.id, grade: 1, timeout: 1, choice: '' }); } catch (e) { }
   markPractice(S, [{ qid: c.qid, choice: '', correct: 0, timeout: 1, ms: dur, pos: S.idx + 1 }]);
+  S._tallyId = c.id;                     // 超时已计入本组「已答」，再看解析不重复计数
   S.tally.done++; S.tally.wrong++; S.timeoutN = (S.timeoutN || 0) + 1;
   refreshSide();
   S.graded = 1;
@@ -3166,7 +3335,7 @@ async function finishSession() {
     } catch (e) { }
     timing = `<p>总用时 ${tm} 分 ${ts} 秒 · 平均单题 ${avg.toFixed(1)}s · 本组正确率 <b style="color:${acc >= 60 ? 'var(--ok)' : 'var(--warn)'}">${acc}%</b>${S.timeoutN ? ` · 超时 <b style="color:var(--bad)">${S.timeoutN}</b> 次` : ''}</p>${cmp}`;
   }
-  app.innerHTML = `<div class="empty"><div class="big">🏁</div>
+  app.innerHTML = `<div class="empty" id="session-done"><div class="big">🏁</div>
     <h2>本组完成！</h2>
     <p>本轮练习 ${total} 题 · 对 ${right} · 错 ${wrong}</p>
     ${timing}
@@ -3186,7 +3355,7 @@ async function finishSession() {
 document.addEventListener('visibilitychange', () => {
   ST.last = Date.now();                            // 先推后基准，隐藏期间的时间不补算
   stSync();
-  if (document.hidden) stFlush(true);              // 切走前把已累计的学习时长报上去
+  if (document.hidden) stFlush(true, true);        // 切走前把已累计的学习时长报上去
   const S = state.session;
   if (!S || S.submitted) return;
   if (document.hidden) { captureInk(); clockPause(S); stopClock(); try { saveSession(); } catch (e) { } }
@@ -3194,7 +3363,7 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => {
   try { flushReportGrades(true); } catch (e) { }   // 关页面：未自评的题也要写进复习计划
-  try { stFlush(true); } catch (e) { }             // 关页面：学习时长立即落库，不等下一次心跳
+  try { stFlush(true, true); } catch (e) { }       // 关页面：学习时长立即落库，不等下一次心跳
   const S = state.session;
   if (!S || S.submitted) return;
   captureInk();
@@ -3224,6 +3393,10 @@ document.addEventListener('keydown', (e) => {
   if (S && document.getElementById('opts')) {
     if (typing) return;
     const answerable = !isRev(S);
+    // 复习：← / → 在题与题之间跳（← 回去改掌握程度，→ 前进）
+    if (!answerable && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
+      e.preventDefault(); revNav(e.key === 'ArrowRight' ? 1 : -1); return;
+    }
     if (isDeferred(S)) {
       if (S.submitted) return;
       const k = e.key.toUpperCase();
@@ -3242,7 +3415,7 @@ document.addEventListener('keydown', (e) => {
       if (!answerable) {
         const gq = GRADE_BY_KEY[e.key];
         if (gq) { e.preventDefault(); doGrade(gq); return; }
-        // 复习模式：A/B/C/D 等同点选项，答对自动进入下一题
+        // 复习模式：A/B/C/D 等同点选项，答对记为「一般」但不跳题（← / → 换题）
         const k2 = e.key.toUpperCase();
         const o2 = 'ABCDEF'.includes(k2) && (S.queue[S.idx].options || []).find(x => String(x.key).toUpperCase() === k2);
         if (o2) { e.preventDefault(); revPick(o2.key); return; }
@@ -3255,6 +3428,13 @@ document.addEventListener('keydown', (e) => {
       // 复习模式：V 键随时展开/收起答案与解析（组合键已在函数开头排除，不会抢 Ctrl+V）
       if (!answerable && e.key === '0' && document.getElementById('ans-line')) {
         e.preventDefault(); toggleAns(); return;
+      }
+      if (!answerable) {
+        // 复习：1/2/3/4 = 记档位 / 改档位；空格 / 回车 = 进下一题（答对但没自评的按「一般」补记）
+        const gq = GRADE_BY_KEY[e.key];
+        if (gq) { e.preventDefault(); doGrade(gq); return; }
+        if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); revNav(1); }
+        return;
       }
       if (S.graded) {   // 已评分：空格/回车进入下一题
         if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); nextCard(); }

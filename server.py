@@ -1121,6 +1121,13 @@ def ensure_tables():
     db().execute("CREATE INDEX IF NOT EXISTS idx_pg_uid_day ON practice_groups(uid, started)")
     db().execute("CREATE INDEX IF NOT EXISTS idx_pi_gid ON practice_items(gid, pos)")
     db().commit()
+    # ---------- 改评用的「上一次评分前」快照 ----------
+    # 复习里跳回上一题改掌握程度时，要先把上一次评分整个撤回（含 SM2 状态与错题本计数），
+    # 再按新档位重算。这里只留每题最新一次评分前的那份状态，review_id 用来确认「撤的就是那条」。
+    db().execute("""CREATE TABLE IF NOT EXISTS grade_undo(
+        qid TEXT NOT NULL, user_id TEXT NOT NULL, prev_json TEXT,
+        review_id INTEGER DEFAULT 0, ts TEXT, PRIMARY KEY(qid, user_id))""")
+    db().commit()
     # ---------- 学习时长拆三段：做题 / 看解析 / 复习 ----------
     # ms 仍是总时长（老版本页面只报总数时全算作做题），三段是它的拆解，用来回答「时间花在哪」。
     for _col, _ddl in (
@@ -1223,10 +1230,11 @@ def get_setting(key, default=None):
 
 
 APP_RELEASE_VERSION = app_ver()
-APP_RELEASE_NOTES = ("每道题的解析区最上方新增「🤖 AI解析」卡片：按「题干骨架 → 逐项判定 → 可迁移方法 → 避坑提醒 → 笔记」"
-                     "的顺序展开，每个选项为什么选、为什么排除都用表格列清楚，绿色 ✓ 入选、红色 ✗ 排除。"
-                     "答题页、交卷报告、完整标注页三处都能看到。"
-                     "还没有 AI 解析的题整块不显示，其余解析和原有功能不变。")
+APP_RELEASE_NOTES = ("本次更新：\n"
+                     "新增：复习时可点「上一题 / 下一题」跳题，跳回去还能改这道题的掌握程度；\n"
+                     "优化：答对不再自动跳题，停在本页看解析、改档位，点「下一题」才前进；\n"
+                     "修复：中途退出练习后总览「今日学习时长」偏少、复习计划今日待复习偶发对不上的问题。\n"
+                     "刷新页面即可生效。")
 
 
 def ensure_release_announcement():
@@ -1304,6 +1312,7 @@ def _delete_account_data(uid):
     for table, col in (("srs", "user_id"), ("reviews", "user_id"), ("notes", "user_id"),
                        ("favorites", "user_id"), ("doubt_status", "user_id"), ("exam_history", "user_id"),
                        ("practice_items", "uid"), ("practice_groups", "uid"), ("study_time", "uid"),
+                       ("grade_undo", "user_id"),
                        ("discarded", "uid"), ("user_settings", "uid"), ("sessions", "uid")):
         db().execute("DELETE FROM %s WHERE %s=?" % (table, col), (uid,))
     db().execute("DELETE FROM teacher_links WHERE teacher_uid=? OR student_uid=?", (uid, uid))
@@ -2939,12 +2948,19 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, {"error": "no api"})
 
     # ---------- POST API ----------
+    _SRS_SNAP = ("status", "ease", "interval", "repetitions", "lapses", "due",
+                 "last_review", "correct", "wrong", "wb_status", "wb_streak", "last_choice")
+
     def _apply_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None):
-        """写入一次评分。含错题本状态机：连续 2 次自评「一般/熟悉」自动移出错题本。"""
+        """写入一次评分。含错题本状态机：连续 2 次自评「一般/熟悉」自动移出错题本。
+
+        评分前把这一题的 srs 状态整份存进 grade_undo，供复习里「改掌握程度」整份撤回。
+        """
         st = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (eqid, uid))
         if not st:
             return None
         before = st["interval"]
+        prev = {k: st[k] for k in self._SRS_SNAP}
         pacing = get_user_setting(uid, "review_pacing", "std") or "std"
         new = sm2.grade_state(st, grade, pacing)
         correct = 1 if grade >= 3 else 0
@@ -2965,10 +2981,45 @@ class Handler(BaseHTTPRequestHandler):
                         WHERE qid=? AND user_id=?""",
                      (new["status"], new["ease"], new["interval"], new["repetitions"], new["lapses"],
                       new["due"], now(), correct, 0 if correct else 1, wb, streak, choice, eqid, uid))
-        db().execute("""INSERT INTO reviews(qid,user_id,grade,ts,interval_before,interval_after,ease,timeout)
+        cur = db().execute("""INSERT INTO reviews(qid,user_id,grade,ts,interval_before,interval_after,ease,timeout)
                         VALUES(?,?,?,?,?,?,?,?)""",
                      (eqid, uid, grade, now(), before, new["interval"], new["ease"], 1 if timeout else 0))
+        try:
+            db().execute("""INSERT OR REPLACE INTO grade_undo(qid,user_id,prev_json,review_id,ts)
+                            VALUES(?,?,?,?,?)""",
+                         (eqid, uid, json.dumps(prev, ensure_ascii=False), cur.lastrowid, now()))
+        except Exception as e:              # 老库还没补上这张表：评分照常，只是当次不能改评
+            print("[grade] 记录改评快照失败:", e)
         return new
+
+    def _revise_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None):
+        """改判：撤回这题最近一次评分（把 srs 整份还原到评分前），再按新档位重算一次。
+
+        只有「grade_undo 记的那条 review 正好是这题最新一条评分」时才允许，避免误撤别人的历史。
+        撤回成功返回新状态并带 revised=True；没得撤返回 None。
+        """
+        try:
+            undo = q_one("SELECT prev_json, review_id FROM grade_undo WHERE qid=? AND user_id=?", (eqid, uid))
+        except Exception:
+            return None
+        last = q_one("SELECT id FROM reviews WHERE qid=? AND user_id=? ORDER BY id DESC LIMIT 1", (eqid, uid))
+        if not undo or not last or int(last["id"] or 0) != int(undo["review_id"] or 0):
+            return None
+        try:
+            prev = json.loads(undo["prev_json"] or "{}")
+        except Exception:
+            return None
+        if not prev:
+            return None
+        db().execute("""UPDATE srs SET status=?,ease=?,interval=?,repetitions=?,lapses=?,due=?,
+                        last_review=?,correct=?,wrong=?,wb_status=?,wb_streak=?,last_choice=?
+                        WHERE qid=? AND user_id=?""",
+                     tuple(prev.get(k) for k in self._SRS_SNAP) + (eqid, uid))
+        db().execute("DELETE FROM reviews WHERE id=?", (int(last["id"]),))
+        db().execute("DELETE FROM grade_undo WHERE qid=? AND user_id=?", (eqid, uid))
+        db().commit()
+        new = self._apply_grade(eqid, grade, uid, timeout, choice)
+        return dict(new or {}, revised=True) if new else None
 
     # ---------- 今日回溯：练习分组 / 逐题对答案状态 ----------
     def api_practice_start(self, p):
@@ -3168,7 +3219,13 @@ class Handler(BaseHTTPRequestHandler):
             ensure_srs_rows(uid, [eqid])
             st = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (eqid, uid))
         with _LOCK:
-            new = self._apply_grade(eqid, grade, uid, timeout, choice)
+            if p.get("revise"):
+                # 复习里改掌握程度：先撤回上一次评分再按新档位重算，不能让 SM2 连推进两次
+                new = self._revise_grade(eqid, grade, uid, timeout, choice)
+                if new is None:               # 没有可撤的记录：退化成一次普通评分
+                    new = self._apply_grade(eqid, grade, uid, timeout, choice)
+            else:
+                new = self._apply_grade(eqid, grade, uid, timeout, choice)
             db().commit()
         return self._send(200, {"ok": True, "eqid": eqid, **(new or {})})
 
@@ -3387,10 +3444,14 @@ class Handler(BaseHTTPRequestHandler):
     def api_review_plan(self, p):
         """复习计划：未来 30 天逐日到期题数 + 区间汇总，让「明天复习多少」看得见。"""
         uid = need_uid(p.get("token"))
+        # 日期一律用本地 today()：SQLite 的 date('now') 是 UTC，和 today() 在东八区
+        # 每天 00:00-08:00 会差一天，导致「复习计划」的今日待复习与总览对不上。
+        t = today()
         rows = q_all("""SELECT due, COUNT(*) n FROM srs WHERE user_id=? AND status!='new'
-                        AND due IS NOT NULL AND due > date('now')
-                        GROUP BY due""", (uid,))
-        today_n = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=date('now')", (uid,))["n"]
+                        AND due IS NOT NULL AND due > ?
+                        GROUP BY due""", (uid, t))
+        today_n = q_one("SELECT COUNT(*) n FROM srs WHERE user_id=? AND status!='new' AND due<=?",
+                        (uid, t))["n"]
         plan = {r["due"]: r["n"] for r in rows}
         return self._send(200, {"today": today_n, "plan": plan,
                                 "pacing": get_user_setting(uid, "review_pacing", "std") or "std"})
@@ -3519,6 +3580,7 @@ class Handler(BaseHTTPRequestHandler):
                     for t in ("srs", "reviews", "notes", "favorites", "doubt_status", "exam_history"):
                         db().execute(f"DELETE FROM {t} WHERE user_id=?", (u["id"],))
                     db().execute("DELETE FROM study_time WHERE uid=?", (u["id"],))
+                    db().execute("DELETE FROM grade_undo WHERE user_id=?", (u["id"],))
                     db().execute("DELETE FROM sessions WHERE uid=?", (u["id"],))
                     db().execute("DELETE FROM user_settings WHERE uid=?", (u["id"],))
                     db().execute("DELETE FROM users WHERE id=?", (u["id"],))
@@ -3797,6 +3859,10 @@ class Handler(BaseHTTPRequestHandler):
                 source.backup(db())
                 db().commit()
                 source.close()
+            try:
+                ensure_tables()      # 旧快照可能缺新表（如 grade_undo），恢复后按当前版本补齐
+            except Exception as e:
+                print("[restore] 补建表结构失败（不影响启动，重启会重试）:", e)
             return self._send(200, {"ok": True, "restored": name, "safety_snapshot": safety})
         except Exception as e:
             return self._send(500, {"error": "恢复失败：%s" % e})
@@ -3923,6 +3989,7 @@ class Handler(BaseHTTPRequestHandler):
             n_exam = db().execute("DELETE FROM exam_history WHERE user_id=?", (uid,)).rowcount
             db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
             db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
+            db().execute("DELETE FROM grade_undo WHERE user_id=?", (uid,))
             n_time = db().execute("DELETE FROM study_time WHERE uid=?", (uid,)).rowcount
             n_drop = db().execute("DELETE FROM discarded WHERE uid=?", (uid,)).rowcount
             # 偏好里还存着「已做题目缓存」，不清掉的话换设备登录又会被拉回来
@@ -4381,6 +4448,7 @@ class Handler(BaseHTTPRequestHandler):
             db().execute("DELETE FROM practice_items WHERE uid=?", (uid,))
             db().execute("DELETE FROM practice_groups WHERE uid=?", (uid,))
             db().execute("DELETE FROM study_time WHERE uid=?", (uid,))
+            db().execute("DELETE FROM grade_undo WHERE user_id=?", (uid,))
             db().execute("DELETE FROM discarded WHERE uid=?", (uid,))
             db().execute("DELETE FROM user_settings WHERE uid=?", (uid,))
             db().execute("DELETE FROM sessions WHERE uid=?", (uid,))
