@@ -175,6 +175,10 @@ const GRADE_DEF = [{ v: 1, n: '忘记' }, { v: 3, n: '困难' }, { v: 4, n: '一
 const GRADE_BY_KEY = { '1': 1, '2': 3, '3': 4, '4': 5 };
 /* 复习模式点选项答对时，自动写进记忆曲线的档位：熟悉程度 3 =「一般」(good)，即 SM2 的 grade 4。
    想改成答对记「困难」就把这里换成 3，记「熟悉」换成 5。 */
+/* 复习键盘：作答前 1-4 选 A-D（作答后同一个键改为选掌握程度） */
+const KEY2OPT = { '1': 'A', '2': 'B', '3': 'C', '4': 'D' };
+/* 复习默认档位「一般」。v1.13.3 起不再自动使用：选完选项必须由用户自己选掌握程度，
+   这里只留作「报告页补写」等兜底场景的默认强度。 */
 const REV_AUTO_GRADE = 4;
 const REV_AUTO_GRADE_NAME = (GRADE_DEF.find(x => x.v === REV_AUTO_GRADE) || {}).n || '一般';
 
@@ -712,11 +716,14 @@ function renderCard() {
   // 这样「跳回去改掌握程度」看到的就是当时的样子，而不是一张空白题。
   let revNeedFull = null;
   if (isRev(S)) {
+    S.revAnaOpen = false;                    // 解析默认收起，作答后再展开
     const rv = (S.rev || {})[c.id];
     if (rv) {
       if (rv.chosen) S.chosen = rv.chosen;
       if (rv.g) S.graded = rv.g;
-      if (rv.rev) {
+      // 看过解析或已经评过档位，都算「已作答」：跳回来要显示答案，而不是一张空白题
+      if (rv.rev || rv.g) {
+        S.revAnaOpen = !!rv.rev;             // 看过解析的跳回来保持展开
         if (S.fulls && S.fulls[c.id]) { S.full = S.fulls[c.id]; S.phase = 'answer'; }
         else revNeedFull = c;
       }
@@ -740,7 +747,7 @@ function renderCard() {
     <div class="pp-side">
       ${isRev(S) ? `<div class="rev-nav">
         <button class="pp-home" id="rev-prev" type="button" title="上一题（←）：回到做过的题，可改掌握程度" ${S.idx === 0 ? 'disabled' : ''}>←<span class="pp-lbl"> 上一题</span></button>
-        <button class="pp-home rev-next" id="rev-next" type="button" title="下一题（→）：还没选掌握程度的，按「一般」记录">→<span class="pp-lbl"> 下一题</span></button>
+        <button class="pp-home rev-next" id="rev-next" type="button" title="下一题（→）：没选掌握程度的题会留着，回来还能评">→<span class="pp-lbl"> 下一题</span></button>
       </div>` : ''}
       <button class="pp-home" id="pp-back" type="button" title="暂时退出：本组进度已保存，回总览点「继续上次刷题」可接着做">⏸<span class="pp-lbl"> 暂时退出</span></button>
       <button class="pp-home pp-quit" id="pp-quit" type="button" title="放弃本组：结束并删除这组记录，不再出现在今日回溯">✕<span class="pp-lbl"> 放弃</span></button>
@@ -1897,26 +1904,47 @@ function renderOptions() {
   }
   if (!opts || !opts.length) { box.innerHTML = ''; }
   else if (!answerable && S.phase === 'question') {
-    // 复习模式也允许直接点选项作答：答对自动记「熟悉程度 3（一般）」并进入下一题，
-    // 答错留在本题看解析、不跳转。不愿作答的，下面自评区仍可凭回忆直接自评。
-    box.innerHTML = `<div class="opts rev-opts">` + opts.map(o => `
-      <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
-        <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
-      </div>`).join('') + `</div>
-      <p class="sub rev-pick-tip">点击选项作答 · 答对先记为「一般」（可改档位，按 → 进下一题），答错留在本题看解析</p>`;
+    // 复习：选项默认收起（先自己回忆，想不起来再展开），空格或点标题展开。
+    // 展开状态在本组内记住，不想每题都按一次空格也不受影响。
+    const open = !!S.revOptOpen;
+    box.innerHTML = `
+      <button class="rev-fold" id="rev-opt-toggle" type="button" aria-expanded="${open}">
+        <span class="rev-fold-ico">${open ? '▾' : '▸'}</span><b>选项</b>
+        <small>${open ? '点这里收起' : '按空格展开'}</small>
+      </button>
+      <div class="rev-fold-body" id="rev-opt-body" ${open ? '' : 'hidden'}>
+        <div class="opts rev-opts">` + opts.map(o => `
+          <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
+            <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
+          </div>`).join('') + `</div>
+      </div>
+      <p class="sub rev-pick-tip">按 1 / 2 / 3 / 4 选 A / B / C / D · 作答后再按 1 / 2 / 3 / 4 选掌握程度，选完自动下一题</p>`;
     box.querySelectorAll('.opt').forEach(el => bindPick(el, () => revPick(el.dataset.key)));
+    const tg = document.getElementById('rev-opt-toggle');
+    if (tg) tg.onclick = () => toggleRevFold('opt');
   } else if (!answerable && S.phase === 'answer') {
-    // 复习模式：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪
-    box.innerHTML = `<div class="opts">` + opts.map(o => {
-      let cls = 'opt';
-      if (o.is_answer) cls += ' ans-key' + (S.chosen === o.key ? ' correct' : '');
-      else if (S.chosen === o.key) cls += ' wrong';
-      return `<div class="${cls}">
-        <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
-        ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>'
-          : (S.chosen === o.key ? '<span style="color:var(--bad);font-weight:800">✗ 你选</span>' : '')}
+    // 复习：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪。
+    // 这一块同样可折叠——想专看解析时可以收起选项，两块互不影响。
+    const open = !!S.revOptOpen;
+    box.innerHTML = `
+      <button class="rev-fold" id="rev-opt-toggle" type="button" aria-expanded="${open}">
+        <span class="rev-fold-ico">${open ? '▾' : '▸'}</span><b>选项</b>
+        <small>${open ? '点这里收起' : '按空格展开'}</small>
+      </button>
+      <div class="rev-fold-body" id="rev-opt-body" ${open ? '' : 'hidden'}>
+        <div class="opts">` + opts.map(o => {
+          let cls = 'opt';
+          if (o.is_answer) cls += ' ans-key' + (S.chosen === o.key ? ' correct' : '');
+          else if (S.chosen === o.key) cls += ' wrong';
+          return `<div class="${cls}">
+            <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
+            ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>'
+              : (S.chosen === o.key ? '<span style="color:var(--bad);font-weight:800">✗ 你选</span>' : '')}
+          </div>`;
+        }).join('') + `</div>
       </div>`;
-    }).join('') + `</div>`;
+    const tg = document.getElementById('rev-opt-toggle');
+    if (tg) tg.onclick = () => toggleRevFold('opt');
   } else {
     box.innerHTML = `<div class="opts">` + opts.map(o => {
       let cls = 'opt';
@@ -1942,27 +1970,74 @@ function renderAct() {
   const S = state.session; const act = document.getElementById('act'); if (!act) return;
   const c = S.queue[S.idx];
   const answerable = !isRev(S);
+  if (!answerable) { renderRevAct(act, c); return; }   // 复习页有自己的作答流程，见 renderRevAct
   if (S.phase === 'question') {
-    if (answerable) {
-      // 笔记常驻：做题时就能看到/补写本题笔记，不用先点按钮
-      act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>${noteBox(c)}`;
-      bindNoteBox(act, c);
-      return;
-    }
-    // 复习模式：先给「答题卡」，与练习「先答后对」一致——能看到本组全部题目并点题号直接跳转
-    act.innerHTML = `${revSheetHtml()}
+    // 笔记常驻：做题时就能看到/补写本题笔记，不用先点按钮
+    act.innerHTML = `<p class="sub" style="margin-top:14px">👆 点击上方选项作答</p>${noteBox(c)}`;
+    bindNoteBox(act, c);
+    return;
+  }
+  const f = S.full;
+  const isRight = String(S.chosen || '').toUpperCase() === String(f.answer || '').toUpperCase();
+  if (S._tallyId !== c.id) {   // 同一题重渲染不重复计数
+    S._tallyId = c.id;
+    S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++;
+  }
+  act.innerHTML = `
+    <div class="qtools">
+      <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
+      <button class="qtool" id="t-detail">🔍 完整标注</button>
+      <button class="qtool" id="t-push">📤 推题</button>
+    </div>
+    <div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}${ansHistHtml(f, S.gid)}</div>
+    ${noteBox(f)}
+    ${revealHtml(f)}
+    <div class="grade" id="grade-bar">
+      <button class="g-again" data-g="1">忘记<small>1 · again 马上重来</small></button>
+      <button class="g-hard" data-g="3">困难<small>2 · hard 有点卡</small></button>
+      <button class="g-good" data-g="4">一般<small>3 · good 记住了</small></button>
+      <button class="g-easy" data-g="5">熟悉<small>4 · easy 轻松</small></button>
+    </div>
+    <p class="sub" id="rev-tip" style="margin-top:10px">按你的真实记忆强度自评（直接按键盘 1 / 2 / 3 / 4）。系统将据此计算下次复习间隔。</p>`;
+  act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
+  bindNoteBox(act, f);
+  bindQtools(act, c, f);
+}
+
+/* 复习页作答区。流程按用户 2026-11-25 的要求重排：
+   题目 → 选项（可折叠）→ 选答案 → 答案 → 掌握程度 ① → 解析（可折叠）→ 掌握程度 ②
+   · 选完选项不再自动定档，等用户自己选；选完档位即自动进入下一题
+   · 解析只在作答后出现，且与选项各自折叠、互不影响
+   · 掌握程度出现两次：不想看解析时用上面那条，看完长解析不用往回滚，用下面那条 */
+function revRateBtns() {
+  return `<button class="g-again" data-g="1">忘记<small>1 · again 完全没印象</small></button>
+    <button class="g-hard" data-g="3">困难<small>2 · hard 想起来一点</small></button>
+    <button class="g-good" data-g="4">一般<small>3 · good 基本记得</small></button>
+    <button class="g-easy" data-g="5">熟悉<small>4 · easy 很稳</small></button>`;
+}
+function revRateHtml(slot, graded) {
+  const tip = graded
+    ? `已记为「${gradeLabel(graded)}」· 点其它档位可直接改`
+    : (slot === 1 ? '按 1 / 2 / 3 / 4 选档位 · 选完自动进入下一题'
+      : '看完解析再评 · 按 1 / 2 / 3 / 4 选档位后自动进入下一题');
+  return `<div class="rev-rate-slot" data-slot="${slot}">
+    <div class="rev-rate-head"><b>掌握程度</b><span class="sub" style="margin:0">${tip}</span></div>
+    <div class="grade" id="grade-bar${slot === 2 ? '-2' : ''}">${revRateBtns()}</div>
+  </div>`;
+}
+function renderRevAct(act, c) {
+  const S = state.session;
+  const sheet = revSheetHtml();
+  if (S.phase === 'question') {
+    // 还没作答：只留一条「凭回忆直接自评」的快路；选项在题干下方，按空格展开
+    act.innerHTML = `${sheet}
       <div class="rev-rate">
         <div class="rev-rate-head">
           <b>这道题现在掌握得怎么样？</b>
-          <span class="sub" style="margin:0">不点选项也可以直接自评；选完停留本题，按 → 进下一题</span>
+          <span class="sub" style="margin:0">先展开选项作答也行，凭回忆直接评也行</span>
         </div>
-        <div class="grade">
-          <button class="g-again" data-g="1">忘记<small>1 · again 完全没印象</small></button>
-          <button class="g-hard" data-g="3">困难<small>2 · hard 想起来一点</small></button>
-          <button class="g-good" data-g="4">一般<small>3 · good 基本记得</small></button>
-          <button class="g-easy" data-g="5">熟悉<small>4 · easy 很稳</small></button>
-        </div>
-        <p class="sub rev-rate-tip">也可以按键盘 1 / 2 / 3 / 4 直接自评。想先核对答案，点下面的「直接看答案与解析」。</p>
+        <div class="grade" id="grade-bar">${revRateBtns()}</div>
+        <p class="sub rev-rate-tip">不想看选项就点上面的档位直接评，评完自动进入下一题；键盘 1 / 2 / 3 / 4 现在用来选 A / B / C / D。想先核对答案，点下面这行。</p>
         <div class="row" style="margin-top:10px"><button class="btn ghost sm" id="btn-reveal" type="button">🙈 直接看答案与解析</button></div>
       </div>${noteBox(c)}`;
     act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
@@ -1972,61 +2047,66 @@ function renderAct() {
     bindNoteBox(act, c);
     return;
   }
-  const f = S.full;
-  // 复习模式点了选项（picked）：按客观作答展示，正确答案不再打码；纯揭晓答案仍走打码那条路
-  const picked = !answerable && !!S.chosen;
-  const isRight = (answerable || picked)
-    ? (String(S.chosen || '').toUpperCase() === String(f.answer || '').toUpperCase())
-    : null;
-  if (answerable && S._tallyId !== c.id) {   // 同一题重渲染不重复计数
-    S._tallyId = c.id;
-    S.tally.done++; if (isRight) S.tally.right++; else S.tally.wrong++;
-  }
-  // 复习模式：解析直接展开可见，正确答案放在解析末尾且默认打码——看解析不影响先自评
-  const ansBlock = (answerable || picked)
-    ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight ? '✓ 答对了，正确答案 ' + esc(f.answer) : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen || '—')}${ansHistHtml(f, S.gid)}</div>`
+  // 已作答：选了选项，或者直接揭晓了答案
+  const f = S.full || {};
+  const picked = !!S.chosen;
+  const rec = (S.rev || {})[c.id] || {};
+  const graded = +rec.g || 0;
+  const isRight = picked ? revAnsweredRight(S) : null;
+  const ansLine = picked
+    ? `<div class="answer-line ${isRight ? 'right' : 'wrong'}">${isRight
+      ? '✓ 答对了，正确答案 ' + esc(f.answer)
+      : '✗ 答错了，正确答案是 ' + esc(f.answer) + '，你选了 ' + esc(S.chosen)}${ansHistHtml(f, S.gid)}</div>`
     : `<div class="ans-open">
-        ${revealHtml(f)}
         <div class="answer-line ans-line" id="ans-line" title="悬停核对答案 · 点击揭晓">
           <span>正确答案：</span><b class="ans-secret">${esc(f.answer)}</b>${ansHistHtml(f, S.gid)}
           <span class="ans-peek-tip"><span class="tip-hover">🙈 悬停核对 · 按 0 揭晓</span><span class="tip-touch">🙈 点这一行揭晓答案</span></span>
         </div>
       </div>`;
-  act.innerHTML = `
-    ${!answerable ? revSheetHtml() : ''}
+  const anaOpen = !!S.revAnaOpen;
+  act.innerHTML = `${sheet}
     <div class="qtools">
       <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
       <button class="qtool" id="t-detail">🔍 完整标注</button>
       <button class="qtool" id="t-push">📤 推题</button>
     </div>
-    ${ansBlock}
-    ${noteBox(f)}
-    ${(answerable || picked) ? revealHtml(f) : ''}
-    <div class="grade" id="grade-bar">
-      <button class="g-again" data-g="1">忘记<small>1 · again 马上重来</small></button>
-      <button class="g-hard" data-g="3">困难<small>2 · hard 有点卡</small></button>
-      <button class="g-good" data-g="4">一般<small>3 · good 记住了</small></button>
-      <button class="g-easy" data-g="5">熟悉<small>4 · easy 轻松</small></button>
+    ${ansLine}
+    ${revRateHtml(1, graded)}
+    <div class="rev-ana">
+      <button class="rev-fold" id="rev-ana-toggle" type="button" aria-expanded="${anaOpen}">
+        <span class="rev-fold-ico">${anaOpen ? '▾' : '▸'}</span><b>解析</b>
+        <small>${anaOpen ? '点这里收起' : '按 0 / 点这里展开'}</small>
+      </button>
+      <div class="rev-fold-body" id="rev-ana-body" ${anaOpen ? '' : 'hidden'}>
+        ${revealHtml(f)}
+        ${revRateHtml(2, graded)}
+      </div>
     </div>
-    <p class="sub" id="rev-tip" style="margin-top:10px">${answerable
-      ? '按你的真实记忆强度自评（直接按键盘 1 / 2 / 3 / 4）。系统将据此计算下次复习间隔。'
-      : (picked
-        ? (isRight ? '答对了 · 按「一般」（熟悉程度 3）记录；点其它档位可改，按 → 进下一题。' : '答错了，先看完解析再自评（键盘 1 / 2 / 3 / 4）；按 → 也可以直接跳过本题。')
-        : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；按 → 进下一题。')}</p>`;
+    ${noteBox(f)}`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
-  if (!answerable) { syncRevGrade(); bindRevSheet(act); }
-  if (!answerable && !picked) bindAnsToggle();
-  bindNoteBox(act, f);            // 笔记常驻：与「完整标注 / 看解析」同一份数据
-  document.getElementById('t-fav').onclick = async (e) => {
+  const tg = document.getElementById('rev-ana-toggle');
+  if (tg) tg.onclick = () => toggleRevFold('ana');
+  bindRevSheet(act);
+  if (!picked) bindAnsToggle();
+  syncRevGrade();
+  bindNoteBox(act, f);
+  bindQtools(act, c, f);
+}
+/* 收藏 / 完整标注 / 推题：练习页与复习页共用一套绑定 */
+function bindQtools(act, c, f) {
+  const favB = document.getElementById('t-fav');
+  if (favB) favB.onclick = async () => {
     const on = !f.fav;
-    await POST('/api/fav', { id: c2id(), on });
+    await POST('/api/fav', { id: c.id, on });
     f.fav = on ? 1 : 0;
-    const btn = document.getElementById('t-fav');
-    btn.classList.toggle('on', !!on); btn.textContent = on ? '★ 已收藏' : '☆ 收藏';
+    favB.classList.toggle('on', !!on);
+    favB.textContent = on ? '★ 已收藏' : '☆ 收藏';
     refreshSide();
   };
-  document.getElementById('t-detail').onclick = () => { location.hash = '#/detail?id=' + c2id(); };
-  document.getElementById('t-push').onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
+  const detailB = document.getElementById('t-detail');
+  if (detailB) detailB.onclick = () => { location.hash = '#/detail?id=' + c.id; };
+  const pushB = document.getElementById('t-push');
+  if (pushB) pushB.onclick = () => openPushDialog(c.id, c.qid, (c.module || '') + (c.category ? ' · ' + c.category : ''));
 }
 
 /* 历史选择：正确答案旁边一行极简回顾（新 → 旧），只在真正揭晓答案后出现。
@@ -2481,6 +2561,7 @@ async function doReveal() {
     const rec = (S.rev[c.id] = S.rev[c.id] || {});
     rec.rev = 1;
     if (S.chosen) rec.chosen = S.chosen;
+    S.revAnaOpen = !S.chosen;              // 选了选项：先看答案选档位，解析自己展开；直接揭晓：解析直接给
   }
   S.phase = 'answer'; renderOptions();
   // 只有真的选了选项才落一条作答流水：复习模式里「直接看答案与解析」不算作答，
@@ -2494,9 +2575,8 @@ async function doReveal() {
   }
 }
 
-/* 复习模式点选项作答：答对先按「熟悉程度 3（一般）」记上，但停在本题不跳（可以改档位、看解析）；
-   答错留在本题看解析，等用户自评。两种结果都会经 doReveal / doGrade 落进 practice_items，
-   因此能在「历史答案」和今日回溯里看到。 */
+/* 复习模式点选项作答：只揭晓答案与对错，不替用户定档（2026-11-25 用户明确要求）。
+   作答后由用户点 / 按 1-4 选掌握程度，选完自动进入下一题。 */
 async function revPick(key) {
   const S = state.session;
   if (!S || S._revPicking || S._grading) return;
@@ -2504,15 +2584,9 @@ async function revPick(key) {
   S._revPicking = true;
   S.chosen = key;
   await doReveal();                       // 取回带答案的完整卡片（顺带落一条作答流水）
-  if (!S.full || S.phase !== 'answer') { S._revPicking = false; return; }
-  const ok = revAnsweredRight(S);
   S._revPicking = false;
-  if (!ok) {                              // 答错：留在本题，答案解析已展开，等用户自评
-    toast('✗ 没答对 · 看完解析再自评');
-    return;
-  }
-  toast('✓ 答对 · 记为「' + REV_AUTO_GRADE_NAME + '」，可改档位');
-  await doGrade(REV_AUTO_GRADE, { quiet: true });
+  if (!S.full || S.phase !== 'answer') return;
+  toast(revAnsweredRight(S) ? '✓ 答对了 · 选掌握程度（1-4）继续' : '✗ 没答对 · 选掌握程度（1-4）继续');
 }
 
 /* 复习：这一题是不是「点了选项并且点对了」——用来判断离开本题时要不要按默认档补记 */
@@ -2520,6 +2594,26 @@ function revAnsweredRight(S) {
   const f = S && S.full;
   if (!f || !S.chosen) return false;
   return String(S.chosen).toUpperCase() === String(f.answer || '').toUpperCase();
+}
+
+/* 复习页两块折叠区：选项（作答前）/ 解析（作答后）。各自独立开关，互不影响。 */
+function toggleRevFold(which, force) {
+  const S = state.session; if (!S) return null;
+  const isOpt = which === 'opt';
+  const cur = isOpt ? !!S.revOptOpen : !!S.revAnaOpen;
+  const next = (force === undefined) ? !cur : !!force;
+  if (isOpt) S.revOptOpen = next; else S.revAnaOpen = next;
+  const btn = document.getElementById(isOpt ? 'rev-opt-toggle' : 'rev-ana-toggle');
+  const body = document.getElementById(isOpt ? 'rev-opt-body' : 'rev-ana-body');
+  if (body) body.hidden = !next;
+  if (btn) {
+    btn.setAttribute('aria-expanded', String(next));
+    const ico = btn.querySelector('.rev-fold-ico');
+    if (ico) ico.textContent = next ? '▾' : '▸';
+    const sm = btn.querySelector('small');
+    if (sm) sm.textContent = next ? '点这里收起' : (isOpt ? '按空格展开' : '按 0 / 点这里展开');
+  }
+  return next;
 }
 
 /* 复习答题卡：和练习「先答后对」的答题卡同一个样子——本组所有题目平铺，
@@ -2543,17 +2637,11 @@ function revSheetHtml() {
   return `<div class="sheet-card rev-sheet">
     <div class="sheet-card-head"><b>答题卡</b><span class="sub rev-sheet-count" style="margin:0">已评 ${revN} / ${n} · 点题号可直接跳到任意一题</span></div>
     <div class="exam-nav">${dots}</div>
-    <div class="rev-sheet-nav">
-      <button class="btn ghost sm" id="rv-prev" type="button" ${S.idx === 0 ? 'disabled' : ''}>← 上一题</button>
-      <button class="btn sm" id="rv-next" type="button" title="这一题答对但没选档位的，按「一般」记上再前进">下一题 →</button>
-    </div>
   </div>`;
 }
 function bindRevSheet(scope) {
   if (!scope) return;
   scope.querySelectorAll('[data-rev-i]').forEach(b => b.onclick = () => revGoto(+b.dataset.revI));
-  const p = scope.querySelector('#rv-prev'); if (p) p.onclick = () => revNav(-1);
-  const nx = scope.querySelector('#rv-next'); if (nx) nx.onclick = () => revNav(1);
 }
 /* 记完/改完档位后就地刷新答题卡的颜色与计数，不重建 DOM（否则按钮事件会丢） */
 function syncRevSheet() {
@@ -2575,7 +2663,6 @@ function syncRevSheet() {
   });
   const cnt = box.querySelector('.rev-sheet-count');
   if (cnt) cnt.textContent = `已评 ${revN} / ${S.queue.length} · 点题号可直接跳到任意一题`;
-  const p = box.querySelector('#rv-prev'); if (p) p.disabled = S.idx === 0;
 }
 
 /* 复习：跳到指定题号（答题卡点号用）。走与「下一题」同一套结算规则。 */
@@ -2614,12 +2701,10 @@ async function revNav(delta) {
   } finally { S._revNav = false; }
 }
 async function revSettleCurrent() {
+  // 离开一题时不再替用户补记掌握程度（不自动定档）：只把已选的选项与解析状态落盘，
+  // 没评档的题就空着，下次进复习还排在计划里，由用户自己评。
   const S = state.session; if (!S || !isRev(S)) return;
-  const c = S.queue[S.idx]; if (!c) return;
-  const rec = (S.rev || {})[c.id] || {};
-  if (rec.g) return;                       // 已经记过档位
-  if (!revAnsweredRight(S)) return;        // 没答对：留给用户自己评
-  await doGrade(REV_AUTO_GRADE, { quiet: true });
+  saveSession();
 }
 
 /* 复习：把「这一题已记成哪一档」标在评分条上，再点其它档位就是改评 */
@@ -2631,21 +2716,26 @@ function syncRevGrade() {
   const S = state.session; if (!S || !isRev(S)) return;
   const c = S.queue[S.idx]; if (!c) return;
   const rec = (S.rev || {})[c.id] || {};
-  const g = rec.g || 0;
-  const bar = document.getElementById('grade-bar');
-  if (bar) bar.querySelectorAll('button').forEach(b => {
-    const on = !!g && +b.dataset.g === g;
-    b.classList.toggle('on', on);
-    b.setAttribute('aria-pressed', on ? 'true' : 'false');
-    const tag = b.querySelector('.g-cur');
-    if (on && !tag) b.insertAdjacentHTML('beforeend', '<span class="g-cur">已记</span>');
-    else if (!on && tag) tag.remove();
+  const g = +rec.g || 0;
+  ['grade-bar', 'grade-bar-2'].forEach(id => {
+    const bar = document.getElementById(id); if (!bar) return;
+    bar.querySelectorAll('button').forEach(b => {
+      const on = !!g && +b.dataset.g === g;
+      b.classList.toggle('on', on);
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      const tag = b.querySelector('.g-cur');
+      if (on && !tag) b.insertAdjacentHTML('beforeend', '<span class="g-cur">已记</span>');
+      else if (!on && tag) tag.remove();
+    });
   });
-  const tip = document.getElementById('rev-tip');
-  if (tip && g) {
+  if (g) {
     const iv = typeof rec.iv === 'number' ? rec.iv : null;
     const nxt = iv === null ? '已写入记忆曲线' : (iv === 0 ? '今天再练' : `下次 ${iv} 天后复习`);
-    tip.textContent = `已记为「${gradeLabel(g)}」· ${nxt} · 点其它档位可直接改，按 → 进下一题`;
+    const txt = `已记为「${gradeLabel(g)}」· ${nxt} · 点其它档位可直接改`;
+    document.querySelectorAll('#act .rev-rate-slot, #act .rev-rate').forEach(slot => {
+      const sm = slot.querySelector('.rev-rate-head .sub');
+      if (sm) sm.textContent = txt;
+    });
   }
   syncRevProgress();
 }
@@ -2703,13 +2793,11 @@ async function doGrade(g, opt) {
     if (gr && typeof gr.interval === 'number') rec.iv = gr.interval;
     else if (typeof rec.iv !== 'number') rec.iv = null;
     if (!opt.quiet) toast((first ? '✓ 已记「' : '↻ 已改「') + gradeLabel(g) + '」');
-    if (S.phase === 'question') {
-      await doReveal();                // 凭回忆直接自评：把答案与解析展开，方便核对
-    } else {
-      syncRevGrade();
-    }
     saveSession();
-    if (opt.advance) nextCard();
+    syncRevGrade();
+    // 首次评分 → 自动进入下一题（用户要求的流程：选项 → 掌握程度 → 自动跳）。
+    // 改评（跳回来换档位）留在本题，让用户看清高亮变了再自己走，免得连点两下跳两题。
+    if (first || opt.advance) { nextCard(); return; }
     return;
   }
   renderNextBar(false);
@@ -2972,7 +3060,10 @@ function stShouldRun() {
 }
 function stStep() {
   const t = Date.now(); const d = t - ST.last; ST.last = t;
-  if (d > 0) ST.acc[stCurrentKind()] += Math.min(d, 10000);   // 休眠 / 后台节流造成的超长间隔不计
+  // 单次最多补 5 分钟：手机浏览器省电时会把手上的 1 秒心跳节流成 30–60 秒一次，
+  // 原来截断在 10 秒，等于每 60 秒只记 10 秒（实测复习 40 分钟只记到 14 分钟）。
+  // 真正「不在学」的时段由 document.hidden / 不在学习页挡住，不靠这个截断。
+  if (d > 0) ST.acc[stCurrentKind()] += Math.min(d, 300000);
 }
 /* 常驻 1 秒心跳：该计时就累加，不该计时只把时间基准推后（不补算），
    这样在答题页 / 解析页 / 报告页之间来回切换都不会漏计或重复计。 */
@@ -2986,6 +3077,11 @@ function stBoot() {
   ST.last = Date.now();
   ST.timer = setInterval(stTick, 1000);
 }
+/* 手机浏览器省电时会把 setInterval 节流到 30–60 秒一次，只靠心跳记账会漏一大截。
+   用户每按一次键 / 点一下屏幕都顺手结一次账，交互越密集误差越小。 */
+['pointerdown', 'keydown', 'touchstart'].forEach(ev => document.addEventListener(ev, () => {
+  try { stTick(); } catch (e) { }
+}, { passive: true, capture: true }));
 function stSync() {
   // 离开学习页 / 切到后台：把还没上报的零头立刻落库（不再等 1 秒门槛、也不再等 10 秒心跳），
   // 回到总览时数字才对得上——这就是「中途退出后总览学习时长不更新」的那条路。
@@ -3507,36 +3603,36 @@ document.addEventListener('keydown', (e) => {
       else if (e.key === 'ArrowLeft') { e.preventDefault(); deferredGoto(S.idx - 1); }
       return;
     }
-    if (S.phase === 'question') {
-      // 复习模式：先回忆阶段按 0 也直接揭示答案（等同于点「显示选项与答案」）
-      if (!answerable && e.key === '0') {
-        e.preventDefault(); doReveal(); return;
-      }
-      // 复习模式：1/2/3/4 直接自评掌握度，不必先看选项与解析
-      if (!answerable) {
-        const gq = GRADE_BY_KEY[e.key];
-        if (gq) { e.preventDefault(); doGrade(gq); return; }
-        // 复习模式：A/B/C/D 等同点选项，答对记为「一般」但不跳题（← / → 换题）
-        const k2 = e.key.toUpperCase();
-        const o2 = 'ABCDEF'.includes(k2) && (S.queue[S.idx].options || []).find(x => String(x.key).toUpperCase() === k2);
-        if (o2) { e.preventDefault(); revPick(o2.key); return; }
-      }
-      if (answerable && 'ABCD'.includes(e.key.toUpperCase())) {
-        const o = S.queue[S.idx].options.find(x => x.key.toUpperCase() === e.key.toUpperCase());
-        if (o) { S.chosen = o.key; doReveal(); }
-      } else if ((e.key === ' ' || e.key === 'Enter') && !answerable) { e.preventDefault(); doReveal(); }
-    } else if (S.phase === 'answer') {
-      // 复习模式：V 键随时展开/收起答案与解析（组合键已在函数开头排除，不会抢 Ctrl+V）
-      if (!answerable && e.key === '0' && document.getElementById('ans-line')) {
-        e.preventDefault(); toggleAns(); return;
-      }
-      if (!answerable) {
-        // 复习：1/2/3/4 = 记档位 / 改档位；空格 / 回车 = 进下一题（答对但没自评的按「一般」补记）
-        const gq = GRADE_BY_KEY[e.key];
-        if (gq) { e.preventDefault(); doGrade(gq); return; }
-        if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); revNav(1); }
+    // —— 复习模式的键盘流（2026-11-25 用户指定）——
+    // 空格：作答前展开 / 收起选项，作答后展开 / 收起解析
+    // 1-4：作答前选 A / B / C / D（选项没展开自动展开），作答后选掌握程度，选完自动下一题
+    // 0：随时展开 / 收起解析；← / → 换题；回车：作答后进下一题
+    if (!answerable) {
+      const c0 = S.queue[S.idx];
+      const opts0 = (S.full && S.full.options) || c0.options || [];
+      const k0 = e.key.toUpperCase();
+      if (S.phase === 'question') {
+        if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); toggleRevFold('opt'); return; }
+        if (e.key === '0') { e.preventDefault(); doReveal(); return; }
+        // 数字 1-4 等同 A-D：先展开选项再按 1 也能选上
+        const optK = (KEY2OPT[e.key] || k0);
+        const o0 = 'ABCDEF'.includes(optK) && opts0.find(x => String(x.key).toUpperCase() === optK);
+        if (o0) {
+          e.preventDefault();
+          if (!S.revOptOpen) toggleRevFold('opt', true);
+          revPick(o0.key); return;
+        }
+        if (e.key === 'Enter') { e.preventDefault(); doReveal(); return; }
         return;
       }
+      if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); toggleRevFold('opt'); return; }
+      if (e.key === '0') { e.preventDefault(); toggleRevFold('ana'); return; }
+      const gq = GRADE_BY_KEY[e.key];
+      if (gq) { e.preventDefault(); doGrade(gq); return; }
+      if (e.key === 'Enter') { e.preventDefault(); revNav(1); return; }
+      return;
+    }
+    if (S.phase === 'answer') {
       if (S.graded) {   // 已评分：空格/回车进入下一题
         if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); nextCard(); }
       } else {
