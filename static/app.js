@@ -276,6 +276,29 @@ function resumeAgo(ts) {
 }
 
 /* ---------- router ---------- */
+/* 回到总览（暂时退出 / 收工）。
+   练习与复习都是「就地渲染」的，不改地址：#/study 进来时 hash 是 #/study，
+   但从总览「继续上次刷题」、今日回溯「重做本组」进来时 hash 本来就是 #/ ——
+   这时只设 location.hash = '#/' 不产生任何变化，也就不会触发 hashchange，
+   按钮看起来「点了没反应」。所以统一走这里：先落盘，再看 hash 决定交给路由
+   还是手动补一遍「离开练习页」的清理、直接渲染总览。 */
+async function backToDashboard() {
+  try { saveSession(); } catch (e) { }   // 本组进度落盘，总览点「继续上次刷题」能接着做
+  const h = (location.hash || '#/').split('?')[0];
+  if (h !== '#/') { location.hash = '#/'; return; }   // hash 变了：交给 route() 正常渲染
+  // hash 已经是 #/：不会再有 hashchange，手动补 route() 离开练习页那一套
+  try { pauseClock(); } catch (e) { }              // 结算并暂停本题计时
+  try { captureInk(); } catch (e) { }              // 本题笔迹留存，回来还看得到
+  try { flushReportGrades(); } catch (e) { }       // 报告页没自评的题按默认强度补写
+  state.gradeCtx = null;
+  try {
+    await viewDashboard();                         // 内部 stSettle 会把学习时长落库
+    stSync();
+  } catch (e) {
+    console.error('[backToDashboard]', e);
+    fatal((e && e.message) || e);
+  }
+}
 /* 任何视图抛错都不能让页面停在"加载中…"：统一兜住并给重试入口。 */
 async function nav() {
   try {
@@ -777,7 +800,7 @@ function renderCard() {
   if (qb) qb.onclick = (e) => { e.preventDefault(); e.stopPropagation(); toggleClockPause(); };
   // 暂时退出：本组进度已随 saveSession 落盘，总览页可「继续上次刷题」
   const backB = document.getElementById('pp-back');
-  if (backB) backB.onclick = () => { try { saveSession(); } catch (e) { } location.hash = '#/'; };
+  if (backB) backB.onclick = () => backToDashboard();
   // 复习：上一题 / 下一题（离开前把「答对但没自评」的题按默认档记上）
   const prevB = document.getElementById('rev-prev');
   if (prevB) prevB.onclick = () => revNav(-1);
@@ -2749,8 +2772,9 @@ async function dropCurrent() {
   }
   if (!S.queue.length) {                        // 一题都补不到：收工回总览
     clearSession();
+    state.session = null;
     toast('本组已全部丢弃');
-    location.hash = '#/';
+    backToDashboard();                          // hash 可能本来就是 #/，不能只设 hash
     return;
   }
   if (S.idx >= S.queue.length) {   // 丢的是最后一题且没补到：按「做完最后一题」继续抽题或收尾
