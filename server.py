@@ -477,6 +477,83 @@ def done_by_day(uid, since=None):
         ) GROUP BY d""", tuple(args))
     return {r["d"]: int(r["n"] or 0) for r in rows if r["d"]}
 
+
+# 学习时长重算口径（2026-11-25 用户确认）：
+#     学习时长 = 逐题作答用时 + 看解析用时（与当天原值取较大者，只补漏记、不改小）
+# · answer_ms / review_ms 来自 practice_items.ms（按组的 mode 分到两段）
+# · analysis_ms 沿用该天已经记下的解析时长
+# 组长计时器 practice_groups.total_ms 会把锁屏 / 挂机时间算进去（实测有一组 13.5 分钟的时间
+# 跨度记出了 49 分钟），所以它只作为回溯里的组内参考，不再参与统计。
+STUDY_RECALC_KEY = "study_recalc_v20261125"
+
+
+def recalc_study_time(uid=None, dry=False):
+    """按练习明细重建 study_time（见上面的口径）。dry=True 只算不写。
+
+    没有逐题用时的日期（旧版没记 per-item ms、或只看了解析）整行跳过，绝不清零。
+    """
+    rows = q_all("""SELECT gp.uid uid, date(gp.started) day,
+                           SUM(CASE WHEN gp.mode='review' THEN IFNULL(it.ms,0) ELSE 0 END) rev_ms,
+                           SUM(CASE WHEN gp.mode='review' THEN 0 ELSE IFNULL(it.ms,0) END) ans_ms
+                    FROM practice_groups gp
+                    LEFT JOIN practice_items it
+                           ON it.gid=gp.gid AND IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                    WHERE (? IS NULL OR gp.uid=?)
+                    GROUP BY gp.uid, date(gp.started)""", (uid, uid))
+    names = {r["id"]: r["username"] for r in q_all("SELECT id,username FROM users")}
+    before_total = after_total = 0
+    changed, preview, stat_rows = 0, [], []
+    for r in rows:
+        u, day = r["uid"], r["day"]
+        if not u or not day:
+            continue
+        rev, ans = int(r["rev_ms"] or 0), int(r["ans_ms"] or 0)
+        if ans + rev <= 0:
+            continue
+        old = q_one("SELECT ms, IFNULL(analysis_ms,0) an FROM study_time WHERE uid=? AND day=?",
+                    (u, day)) or {}
+        an = int(old.get("an") or 0)
+        # 取「原值」与「作答 + 解析」的较大者：只补漏记，绝不把任何一天改小
+        # （早期版本的解析时长没进 parts，按明细算会低于原值，那不是漏记而是缺数据）
+        ms = max(int(old.get("ms") or 0), ans + rev + an)
+        before_total += int(old.get("ms") or 0)
+        after_total += ms
+        if int(old.get("ms") or 0) != ms:
+            changed += 1
+        if len(preview) < 40:
+            preview.append({"user": names.get(u, u), "day": day,
+                            "before_min": round(int(old.get("ms") or 0) / 60000, 1),
+                            "after_min": round(ms / 60000, 1),
+                            "answer_min": round(ans / 60000, 1),
+                            "review_min": round(rev / 60000, 1),
+                            "analysis_min": round(an / 60000, 1)})
+        stat_rows.append((ms, ans, an, rev, u, day))
+    if not dry and stat_rows:
+        with _LOCK:
+            for ms, ans, an, rev, u, day in stat_rows:
+                db().execute("""INSERT INTO study_time(uid,day,ms,answer_ms,analysis_ms,review_ms)
+                                VALUES(?,?,?,?,?,?)
+                                ON CONFLICT(uid,day) DO UPDATE SET
+                                  ms=excluded.ms, answer_ms=excluded.answer_ms,
+                                  analysis_ms=excluded.analysis_ms, review_ms=excluded.review_ms""",
+                             (u, day, ms, ans, an, rev))
+            db().commit()
+    return {"ok": True, "dry": bool(dry), "rows": len(stat_rows), "changed": changed,
+            "before_ms": before_total, "after_ms": after_total, "preview": preview}
+
+
+def ensure_study_time_recalc():
+    """发版后自动跑一次历史重算（只跑一次，标记写进 settings）。"""
+    if get_setting(STUDY_RECALC_KEY) == "1":
+        return
+    res = recalc_study_time()
+    set_setting(STUDY_RECALC_KEY, "1")
+    db().commit()
+    print(f"[study] 学习时长已按新口径重算：{res['rows']} 个「账号×日期」，"
+          f"{res['changed']} 条变化，合计 {round(res['before_ms']/60000)} → "
+          f"{round(res['after_ms']/60000)} 分钟")
+
+
 def answer_flow_sql():
     """统一的「作答流水」子查询：练习分组里的逐题作答 + 分组功能上线前的 reviews 旧记录。
 
@@ -1259,9 +1336,9 @@ def get_setting(key, default=None):
 
 APP_RELEASE_VERSION = app_ver()
 APP_RELEASE_NOTES = ("本次更新：\n"
-                     "新增：复习时选完选项再选掌握程度，选完自动进入下一题；掌握程度在解析前后各给一次；\n"
-                     "优化：选项与解析分成两块可各自折叠，空格展开选项、0 展开解析，1 / 2 / 3 / 4 选 A–D 或掌握程度；\n"
-                     "修复：学习时长明显偏少（复习 40 分钟只记到 14 分钟）的问题。\n"
+                     "优化：复习答题卡移到页面顶部，选项直接展开，作答后自动展开解析，未作答按 0 也能直接看答案解析；\n"
+                     "优化：今日学习时长按「逐题作答 + 看解析」重新统计，总览与今日回溯显示同一口径；\n"
+                     "修复：复习完成页「返回总览」点了没反应、完成页题数显示为 0，以及作答后正确选项没点亮的问题。\n"
                      "刷新页面即可生效。")
 
 
@@ -1942,6 +2019,7 @@ class Handler(BaseHTTPRequestHandler):
             # 管理员：管理其它账号（改名称/用户名/密码、删除）
             "/api/admin/account/update": self.api_admin_account_update,
             "/api/admin/account/delete": self.api_admin_account_delete,
+            "/api/admin/recalc-study": self.api_admin_recalc_study,
             "/api/backup/run": self.api_backup_run,
             "/api/backup/restore": self.api_backup_restore,
             "/api/backup/delete": self.api_backup_delete,
@@ -3753,6 +3831,13 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True})
 
+    def api_admin_recalc_study(self, p):
+        """按练习明细重算学习时长（管理员）。口径见 recalc_study_time。"""
+        need_admin(p.get("token"))
+        dry = str(p.get("dry") or "").strip() in ("1", "true", "yes")
+        res = recalc_study_time(uid=str(p.get("uid") or "").strip() or None, dry=dry)
+        return self._send(200, res)
+
     def api_backup_run(self, p):
         """管理员手动创建一份全库快照（每日 0 点之外随时可加一份）。
 
@@ -4138,6 +4223,11 @@ class Handler(BaseHTTPRequestHandler):
                                           JOIN notes nn ON nn.qid=it.qid AND nn.user_id=?
                                          WHERE it.gid=? AND TRIM(IFNULL(nn.text,''))!=''""",
                                      (uid, x["gid"])) or {}).get("n") or 0)
+        # 该天的「学习时长」与总览同一来源（study_time），答题用时是它的子集：
+        # 逐题用时算作答，看解析的时间单独记在 analysis，页面上把两者一起说明白
+        st_day = q_one("""SELECT IFNULL(ms,0) ms, IFNULL(answer_ms,0) a,
+                                 IFNULL(analysis_ms,0) an, IFNULL(review_ms,0) r
+                          FROM study_time WHERE uid=? AND day=?""", (uid, day)) or {}
         summary = {
             "groups": len(groups),
             "questions": sum(x["n"] for x in groups),
@@ -4146,6 +4236,10 @@ class Handler(BaseHTTPRequestHandler):
             "wrong": sum(x["wrong_n"] for x in groups),
             "timeout": sum(x["timeout_n"] for x in groups),
             "ms": sum(x["spent_ms"] for x in groups),
+            "study_ms": int(st_day.get("ms") or 0),
+            "study_answer_ms": int(st_day.get("a") or 0),
+            "study_review_ms": int(st_day.get("r") or 0),
+            "study_analysis_ms": int(st_day.get("an") or 0),
         }
         return {"ok": True, "date": day, "summary": summary, "groups": groups}
 
@@ -4501,6 +4595,10 @@ def main():
         _migrate_backup_layout()  # 历史备份收归服务端统一目录，并清掉已废弃的路径设置
         ensure_single_admin()      # 只校验/收敛已有管理员，绝不自动新建账号
         ensure_release_announcement()
+        try:
+            ensure_study_time_recalc()   # 只跑一次：按「逐题作答 + 看解析」重建历史学习时长
+        except Exception as e:
+            print(f"[WARN] 学习时长重算失败（不影响启动）: {e}")
         q_one("SELECT COUNT(*) n FROM qdb.questions")   # 兜底：ATTACH 缺文件会静默建空库
         _warm()      # 预热题库 → OS 页缓存（新账号播种、出题查询首次都更快）
         load_qbanks()   # 导入题库元数据（没有 qbanks.json 就当作没有导入题库）

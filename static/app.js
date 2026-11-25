@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261125d';
+const APP_VER = '20261125f';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -738,11 +738,13 @@ function renderCard() {
   const doneN = deferred ? S.queue.filter(x => S.answers[x.id]).length : (isRev(S) ? revN : S.idx);
   const ppStat = deferred
     ? `<span class="mode-badge deferred">先答后对</span> 已答 <b>${doneN}</b> / ${S.queue.length}`
-    : (isRev(S)
-      ? `<span class="mode-badge">复习</span> 已评 <b>${revN}</b> / ${S.queue.length}`
-      : `<span class="mode-badge">边答边对</span> 本次对 <b style="color:var(--ok)">${S.tally.right}</b> 错 <b style="color:var(--bad)">${S.tally.wrong}</b>${S.timeoutN ? ` &nbsp;·&nbsp; <b style="color:var(--warn)">超时 ${S.timeoutN}</b>` : ''}`);
+    : `<span class="mode-badge">边答边对</span> 本次对 <b style="color:var(--ok)">${S.tally.right}</b> 错 <b style="color:var(--bad)">${S.tally.wrong}</b>${S.timeoutN ? ` &nbsp;·&nbsp; <b style="color:var(--warn)">超时 ${S.timeoutN}</b>` : ''}`;
+  // 复习顶栏压短一行（复习条只留「第 x / n 题 · 已评 n / n」），把空间让给下面的答题卡
+  const ppTxt = isRev(S)
+    ? `第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; <span id="pp-stat">已评 <b>${revN}</b> / ${S.queue.length}</span>`
+    : `第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; <span id="pp-stat">${ppStat}</span>`;
   app.innerHTML = `
-  <div class="progress"><div class="pp-main"><span id="pp-txt">第 ${S.idx + 1} / ${S.queue.length} 题 &nbsp;·&nbsp; ${MODE_LABEL[S.mode] || '练习'} &nbsp;·&nbsp; <span id="pp-stat">${ppStat}</span></span>
+  <div class="progress${isRev(S) ? ' rev-progress' : ''}"><div class="pp-main"><span id="pp-txt">${ppTxt}</span>
     <div class="pbar"><i id="pp-bar" style="width:${doneN / S.queue.length * 100}%"></i></div></div>
     <div class="pp-side">
       ${isRev(S) ? `<div class="rev-nav">
@@ -754,6 +756,7 @@ function renderCard() {
       <button class="qtimer" id="qtimer" type="button" title="左键单击这里可暂停计时"><span id="qt-icon" aria-hidden="true">⏱</span><b id="qt-now">0:00</b><small>/ <span id="qt-all">0:00</span></small><span class="qt-hint" id="qt-hint"></span></button>
       <div id="ctime-box"></div>
     </div></div>
+  ${isRev(S) ? revSheetHtml() : ''}
   <div class="draw-toolbar" id="draw-toolbar" aria-label="答题画笔工具">
     <button class="btn sm ghost" id="draw-toggle" type="button" aria-pressed="false">✎ 画笔</button>
     <label class="draw-setting" title="画笔粗细：6 档，最细 1px、最粗 4px">粗细<input id="draw-size" type="range" min="1" max="6" step="1" value="3"><output id="draw-size-value">3 档</output></label>
@@ -822,6 +825,7 @@ function renderCard() {
   initAnswerDrawing();
   initUnderline();                    // 框选划线：容器就位后把本次答题里的划线复原
   renderOptions();
+  if (isRev(S)) bindRevSheet(document.getElementById('rev-deck'));   // 顶部答题卡：点题号跳题
   // 功能3：临时标记按钮（就地切换，不重渲染以免丢失已揭示答案）
   const mb = document.getElementById('t-mark');
   if (mb) mb.onclick = (e) => {
@@ -1904,47 +1908,26 @@ function renderOptions() {
   }
   if (!opts || !opts.length) { box.innerHTML = ''; }
   else if (!answerable && S.phase === 'question') {
-    // 复习：选项默认收起（先自己回忆，想不起来再展开），空格或点标题展开。
-    // 展开状态在本组内记住，不想每题都按一次空格也不受影响。
-    const open = !!S.revOptOpen;
+    // 复习：选项直接展开（2026-11-25 用户要求去掉折叠，默认为展开），点选项或按 A-D 作答
     box.innerHTML = `
-      <button class="rev-fold" id="rev-opt-toggle" type="button" aria-expanded="${open}">
-        <span class="rev-fold-ico">${open ? '▾' : '▸'}</span><b>选项</b>
-        <small>${open ? '点这里收起' : '按空格展开'}</small>
-      </button>
-      <div class="rev-fold-body" id="rev-opt-body" ${open ? '' : 'hidden'}>
-        <div class="opts rev-opts">` + opts.map(o => `
-          <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
-            <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
-          </div>`).join('') + `</div>
-      </div>
+      <div class="opts rev-opts">` + opts.map(o => `
+        <div class="opt" data-key="${o.key}" role="button" tabindex="0" aria-pressed="false">
+          <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
+        </div>`).join('') + `</div>
       <p class="sub rev-pick-tip">按 1 / 2 / 3 / 4 选 A / B / C / D · 作答后再按 1 / 2 / 3 / 4 选掌握程度，选完自动下一题</p>`;
     box.querySelectorAll('.opt').forEach(el => bindPick(el, () => revPick(el.dataset.key)));
-    const tg = document.getElementById('rev-opt-toggle');
-    if (tg) tg.onclick = () => toggleRevFold('opt');
   } else if (!answerable && S.phase === 'answer') {
-    // 复习：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪。
-    // 这一块同样可折叠——想专看解析时可以收起选项，两块互不影响。
-    const open = !!S.revOptOpen;
-    box.innerHTML = `
-      <button class="rev-fold" id="rev-opt-toggle" type="button" aria-expanded="${open}">
-        <span class="rev-fold-ico">${open ? '▾' : '▸'}</span><b>选项</b>
-        <small>${open ? '点这里收起' : '按空格展开'}</small>
-      </button>
-      <div class="rev-fold-body" id="rev-opt-body" ${open ? '' : 'hidden'}>
-        <div class="opts">` + opts.map(o => {
-          let cls = 'opt';
-          if (o.is_answer) cls += ' ans-key' + (S.chosen === o.key ? ' correct' : '');
-          else if (S.chosen === o.key) cls += ' wrong';
-          return `<div class="${cls}">
-            <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
-            ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>'
-              : (S.chosen === o.key ? '<span style="color:var(--bad);font-weight:800">✗ 你选</span>' : '')}
-          </div>`;
-        }).join('') + `</div>
+    // 复习：正确项直接点亮；点过选项的，把选错的那一项也标红，一眼看出错在哪
+    box.innerHTML = `<div class="opts">` + opts.map(o => {
+      let cls = 'opt';
+      if (o.is_answer) cls += ' ans-key' + (S.chosen === o.key ? ' correct' : '');
+      else if (S.chosen === o.key) cls += ' wrong';
+      return `<div class="${cls}">
+        <span class="k">${o.key}</span><span class="body">${o.html || esc(o.label)}</span>
+        ${o.is_answer ? '<span class="ans-badge" style="color:var(--ok);font-weight:800">✔ 正确</span>'
+          : (S.chosen === o.key ? '<span style="color:var(--bad);font-weight:800">✗ 你选</span>' : '')}
       </div>`;
-    const tg = document.getElementById('rev-opt-toggle');
-    if (tg) tg.onclick = () => toggleRevFold('opt');
+    }).join('') + `</div>`;
   } else {
     box.innerHTML = `<div class="opts">` + opts.map(o => {
       let cls = 'opt';
@@ -2027,23 +2010,20 @@ function revRateHtml(slot, graded) {
 }
 function renderRevAct(act, c) {
   const S = state.session;
-  const sheet = revSheetHtml();
   if (S.phase === 'question') {
-    // 还没作答：只留一条「凭回忆直接自评」的快路；选项在题干下方，按空格展开
-    act.innerHTML = `${sheet}
-      <div class="rev-rate">
+    // 还没作答：只留一条「凭回忆直接自评」的快路；选项固定展开在题干下方
+    act.innerHTML = `<div class="rev-rate">
         <div class="rev-rate-head">
           <b>这道题现在掌握得怎么样？</b>
-          <span class="sub" style="margin:0">先展开选项作答也行，凭回忆直接评也行</span>
+          <span class="sub" style="margin:0">点上面的选项作答也行，凭回忆直接评也行</span>
         </div>
         <div class="grade" id="grade-bar">${revRateBtns()}</div>
-        <p class="sub rev-rate-tip">不想看选项就点上面的档位直接评，评完自动进入下一题；键盘 1 / 2 / 3 / 4 现在用来选 A / B / C / D。想先核对答案，点下面这行。</p>
-        <div class="row" style="margin-top:10px"><button class="btn ghost sm" id="btn-reveal" type="button">🙈 直接看答案与解析</button></div>
+        <p class="sub rev-rate-tip">不想看选项就点上面的档位直接评，评完自动进入下一题；键盘 1 / 2 / 3 / 4 现在用来选 A / B / C / D。想先核对答案，点下面这行或直接按 0。</p>
+        <div class="row" style="margin-top:10px"><button class="btn ghost sm" id="btn-reveal" type="button">🙈 直接看答案与解析（按 0）</button></div>
       </div>${noteBox(c)}`;
     act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
     const rv = document.getElementById('btn-reveal');
     if (rv) rv.onclick = doReveal;
-    bindRevSheet(act);
     bindNoteBox(act, c);
     return;
   }
@@ -2064,7 +2044,7 @@ function renderRevAct(act, c) {
         </div>
       </div>`;
   const anaOpen = !!S.revAnaOpen;
-  act.innerHTML = `${sheet}
+  act.innerHTML = `
     <div class="qtools">
       <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
       <button class="qtool" id="t-detail">🔍 完整标注</button>
@@ -2085,8 +2065,10 @@ function renderRevAct(act, c) {
     ${noteBox(f)}`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
   const tg = document.getElementById('rev-ana-toggle');
-  if (tg) tg.onclick = () => toggleRevFold('ana');
-  bindRevSheet(act);
+  if (tg) tg.onclick = () => toggleRevFold();
+  // 答案已公开（选了选项，或直接揭晓）时，把正确项点亮：卷面要能看到对的是哪个
+  const sheetEl = document.getElementById('answer-sheet');
+  if (sheetEl) sheetEl.classList.toggle('ans-visible', picked || !!S.ansShown);
   if (!picked) bindAnsToggle();
   syncRevGrade();
   bindNoteBox(act, f);
@@ -2129,6 +2111,9 @@ function toggleAns(force) {
   S.ansShown = (force === undefined) ? !S.ansShown : !!force;
   const wrap = document.getElementById('ans-line');
   if (wrap) wrap.classList.toggle('ans-visible', !!S.ansShown);
+  // 卷面跟着走：答案打码时连「✔ 正确 / 正确项描边」一起藏起来，别提前剧透
+  const sheetEl = document.getElementById('answer-sheet');
+  if (sheetEl) sheetEl.classList.toggle('ans-visible', !!S.ansShown);
 }
 function bindAnsToggle() {
   // 触屏没有 hover：点答案行也能展开/收起（PC 上悬停仍只是临时看一眼答案）
@@ -2561,7 +2546,8 @@ async function doReveal() {
     const rec = (S.rev[c.id] = S.rev[c.id] || {});
     rec.rev = 1;
     if (S.chosen) rec.chosen = S.chosen;
-    S.revAnaOpen = !S.chosen;              // 选了选项：先看答案选档位，解析自己展开；直接揭晓：解析直接给
+    S.revAnaOpen = true;                   // 揭晓答案就把解析一起展开（选没选选项都一样），按 0 可再收起
+    if (!S.chosen) S.ansShown = true;      // 直接揭晓：答案不再打码，和自动展开的解析保持一致
   }
   S.phase = 'answer'; renderOptions();
   // 只有真的选了选项才落一条作答流水：复习模式里「直接看答案与解析」不算作答，
@@ -2596,29 +2582,27 @@ function revAnsweredRight(S) {
   return String(S.chosen).toUpperCase() === String(f.answer || '').toUpperCase();
 }
 
-/* 复习页两块折叠区：选项（作答前）/ 解析（作答后）。各自独立开关，互不影响。 */
-function toggleRevFold(which, force) {
+/* 复习页解析折叠（选项已固定展开，2026-11-25 用户要求去掉选项折叠） */
+function toggleRevFold(force) {
   const S = state.session; if (!S) return null;
-  const isOpt = which === 'opt';
-  const cur = isOpt ? !!S.revOptOpen : !!S.revAnaOpen;
-  const next = (force === undefined) ? !cur : !!force;
-  if (isOpt) S.revOptOpen = next; else S.revAnaOpen = next;
-  const btn = document.getElementById(isOpt ? 'rev-opt-toggle' : 'rev-ana-toggle');
-  const body = document.getElementById(isOpt ? 'rev-opt-body' : 'rev-ana-body');
+  const next = (force === undefined) ? !S.revAnaOpen : !!force;
+  S.revAnaOpen = next;
+  const btn = document.getElementById('rev-ana-toggle');
+  const body = document.getElementById('rev-ana-body');
   if (body) body.hidden = !next;
   if (btn) {
     btn.setAttribute('aria-expanded', String(next));
     const ico = btn.querySelector('.rev-fold-ico');
     if (ico) ico.textContent = next ? '▾' : '▸';
     const sm = btn.querySelector('small');
-    if (sm) sm.textContent = next ? '点这里收起' : (isOpt ? '按空格展开' : '按 0 / 点这里展开');
+    if (sm) sm.textContent = next ? '点这里收起' : '按 0 / 点这里展开';
   }
   return next;
 }
 
-/* 复习答题卡：和练习「先答后对」的答题卡同一个样子——本组所有题目平铺，
+/* 复习答题卡：置顶放在复习条下面（2026-11-25 用户要求），本组所有题目平铺，
    已评的题按档位着色、当前题高亮，点任意题号直接跳过去（跳过去还能改掌握程度）。
-   之前跳题只有顶栏两个小箭头，窄屏只露 ← →，等于没有；题目一多也没法定位。 */
+   手机端一屏放不下，CSS 里整块隐藏（.rev-deck），靠顶栏的上一题 / 下一题换题。 */
 function revSheetHtml() {
   const S = state.session; if (!S) return '';
   const rec = S.rev || {};
@@ -2634,9 +2618,9 @@ function revSheetHtml() {
     const t = g ? '已记「' + gradeLabel(g) + '」' : (r.rev ? '已看解析，未评档' : '未评档');
     return `<button type="button" class="${cls.join(' ')}" data-rev-i="${i}" title="第 ${i + 1} 题 · ${t}">${i + 1}</button>`;
   }).join('');
-  return `<div class="sheet-card rev-sheet">
-    <div class="sheet-card-head"><b>答题卡</b><span class="sub rev-sheet-count" style="margin:0">已评 ${revN} / ${n} · 点题号可直接跳到任意一题</span></div>
-    <div class="exam-nav">${dots}</div>
+  return `<div class="sheet-card rev-sheet rev-deck" id="rev-deck">
+    <div class="rev-deck-head"><b>答题卡</b><span class="sub rev-sheet-count">已评 ${revN} / ${n}</span></div>
+    <div class="exam-nav rev-deck-nav">${dots}</div>
   </div>`;
 }
 function bindRevSheet(scope) {
@@ -2662,7 +2646,7 @@ function syncRevSheet() {
     b.title = `第 ${i + 1} 题 · ${g ? '已记「' + gradeLabel(g) + '」' : (r.rev ? '已看解析，未评档' : '未评档')}`;
   });
   const cnt = box.querySelector('.rev-sheet-count');
-  if (cnt) cnt.textContent = `已评 ${revN} / ${S.queue.length} · 点题号可直接跳到任意一题`;
+  if (cnt) cnt.textContent = `已评 ${revN} / ${S.queue.length}`;
 }
 
 /* 复习：跳到指定题号（答题卡点号用）。走与「下一题」同一套结算规则。 */
@@ -2746,7 +2730,7 @@ function syncRevProgress() {
   const n = S.queue.length || 1;
   const revN = S.queue.filter(x => { const r = (S.rev || {})[x.id]; return r && r.g; }).length;
   const st = document.getElementById('pp-stat');
-  if (st) st.innerHTML = `<span class="mode-badge">复习</span> 已评 <b>${revN}</b> / ${S.queue.length}`;
+  if (st) st.innerHTML = `已评 <b>${revN}</b> / ${S.queue.length}`;
   const bar = document.getElementById('pp-bar');
   if (bar) bar.style.width = (revN / n * 100).toFixed(2) + '%';
   syncRevSheet();                       // 答题卡上的题号颜色 / 已评计数跟着更新
@@ -3471,6 +3455,19 @@ function analysisPage(rows, filter, pos, ctx) {
     state.gradeCtx = r.rated ? null : (g => rateReportItem(r, g, gbox));
   }
 }
+/* 「返回总览」兜底：练习报告 / 复习完成页 / 交卷结果都是在 #app 里就地渲染的，不改 hash。
+   如果当前 hash 已经是 #/（例如从总览点「继续复习」进来），<a href="#/"> 不会触发 hashchange，
+   点了没有任何反应。这里统一接管：只要还在答题 / 报告 / 交卷结果里，就走 backToDashboard()。 */
+document.addEventListener('click', (e) => {
+  const a = e.target && e.target.closest ? e.target.closest('a[href="#/"]') : null;
+  if (!a) return;
+  if ((location.hash || '#/').split('?')[0] !== '#/') return;   // hash 会变，交给路由
+  if (!state.session && !state.exam) return;                    // 已经在总览页，正常跳
+  e.preventDefault();
+  state.exam = null;
+  backToDashboard();
+});
+
 /* 练习报告的解析入口（行为与改造前一致） */
 function renderReportAnalysis(filter, pos) {
   const S = state.session; if (!S || !S.report) return;
@@ -3509,8 +3506,15 @@ async function finishSession() {
   clearInkStore();
   clearUlStore();
   const S = state.session;
-  const total = S.tally.done, right = S.tally.right, wrong = S.tally.wrong;
+  // 练习模式看对错；复习模式不记对错（tally 一直是 0），改看「本组几题、评了几题」
+  const revMode = isRev(S);
+  const total = revMode ? S.queue.length : S.tally.done;
+  const right = S.tally.right, wrong = S.tally.wrong;
+  const revGraded = revMode ? S.queue.filter(x => ((S.rev || {})[x.id] || {}).g).length : 0;
   const acc = total ? Math.round(right / total * 100) : 0;
+  const doneLine = revMode
+    ? `本轮复习 ${total} 题 · 已评掌握程度 ${revGraded} 题${revGraded < total ? ` · 还有 ${total - revGraded} 题没评（会留在复习计划里）` : ' · 全部评完 👍'}`
+    : `本轮练习 ${total} 题 · 对 ${right} · 错 ${wrong}`;
   const marked = S.marked ? Array.from(S.marked) : [];
   let timing = '';
   if (S.limitOn && S.times && S.times.length) {
@@ -3534,7 +3538,7 @@ async function finishSession() {
   }
   app.innerHTML = `<div class="empty" id="session-done"><div class="big">🏁</div>
     <h2>本组完成！</h2>
-    <p>本轮练习 ${total} 题 · 对 ${right} · 错 ${wrong}</p>
+    <p>${doneLine}</p>
     ${timing}
     ${marked.length ? `<div class="card" style="max-width:560px;margin:10px auto 0;text-align:left">
       <h3 style="margin:0 0 6px">⚑ 本组标记的题（${marked.length}）</h3>
@@ -3604,29 +3608,22 @@ document.addEventListener('keydown', (e) => {
       return;
     }
     // —— 复习模式的键盘流（2026-11-25 用户指定）——
-    // 空格：作答前展开 / 收起选项，作答后展开 / 收起解析
-    // 1-4：作答前选 A / B / C / D（选项没展开自动展开），作答后选掌握程度，选完自动下一题
-    // 0：随时展开 / 收起解析；← / → 换题；回车：作答后进下一题
+    // 选项固定展开，不再有「空格展开选项」；空格在复习页不做任何事，避免误吞页面滚动
+    // 1-4：作答前选 A / B / C / D，作答后选掌握程度，选完自动下一题
+    // 0：展开 / 收起解析；← / → 换题；回车：作答前揭晓答案，作答后进下一题
     if (!answerable) {
       const c0 = S.queue[S.idx];
       const opts0 = (S.full && S.full.options) || c0.options || [];
       const k0 = e.key.toUpperCase();
       if (S.phase === 'question') {
-        if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); toggleRevFold('opt'); return; }
         if (e.key === '0') { e.preventDefault(); doReveal(); return; }
-        // 数字 1-4 等同 A-D：先展开选项再按 1 也能选上
         const optK = (KEY2OPT[e.key] || k0);
         const o0 = 'ABCDEF'.includes(optK) && opts0.find(x => String(x.key).toUpperCase() === optK);
-        if (o0) {
-          e.preventDefault();
-          if (!S.revOptOpen) toggleRevFold('opt', true);
-          revPick(o0.key); return;
-        }
+        if (o0) { e.preventDefault(); revPick(o0.key); return; }
         if (e.key === 'Enter') { e.preventDefault(); doReveal(); return; }
         return;
       }
-      if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); toggleRevFold('opt'); return; }
-      if (e.key === '0') { e.preventDefault(); toggleRevFold('ana'); return; }
+      if (e.key === '0') { e.preventDefault(); toggleRevFold(); return; }
       const gq = GRADE_BY_KEY[e.key];
       if (gq) { e.preventDefault(); doGrade(gq); return; }
       if (e.key === 'Enter') { e.preventDefault(); revNav(1); return; }
@@ -4302,7 +4299,7 @@ function rvGroupCard(g) {
         <div class="rv-g-meta">
           <span>${rvClock(g.started)}${done && g.ended ? ' – ' + rvClock(g.ended) : ''}</span>
           <span>${answered < n ? `已答 ${answered}/${n} 题` : `${n} 题`}</span>
-          <span>用时 ${durTight(g.total_ms || g.spent_ms)}</span>
+          <span title="逐题作答用时合计（与上方「答题用时」同一口径）">用时 ${durTight(g.spent_ms || g.total_ms)}</span>
           ${g.timeout_n ? `<span style="color:var(--warn)">超时 ${g.timeout_n}</span>` : ''}
           ${g.dropped_n ? `<span style="color:var(--ink-3)">丢弃 ${g.dropped_n}</span>` : ''}
           ${g.scope ? `<span>${esc(g.scope)}</span>` : ''}
@@ -4368,8 +4365,9 @@ async function viewToday() {
     <div class="card kpi brand"><div class="n">${sum.groups || 0}</div><div class="l">练习组数</div></div>
     <div class="card kpi" title="今日完成（已作答判分）的题数，和总览面板的「今日已练习」同一口径；同一道题在不同组各做一次算两题"><div class="n">${sum.answered || 0}</div><div class="l">完成题数</div></div>
     <div class="card kpi ok"><div class="n">${acc}%</div><div class="l">正确率 (${sum.right || 0}/${sum.answered || 0})</div></div>
-    <div class="card kpi warn"><div class="n">${durTight(sum.ms || 0)}</div><div class="l">答题用时</div></div>
+    <div class="card kpi warn" title="逐题作答用时合计；看解析的时间不算在内，见下面一行"><div class="n">${durTight(sum.ms || 0)}</div><div class="l">答题用时</div></div>
   </div>
+  <p class="sub" style="margin:8px 0 0">学习时长合计 <b>${durTight(sum.study_ms || 0)}</b>（含看解析 ${durTight(sum.study_analysis_ms || 0)}），与总览的「今日学习时长」同一口径。</p>
   ${(sum.questions || 0) > (sum.answered || 0)
       ? `<p class="sub" style="margin:10px 0 0">本页 ${sum.questions} 个题位中 <b>${sum.answered}</b> 题已完成，剩下 ${sum.questions - sum.answered} 题没作答（含中途退出、没交卷的组），在下面的组里能看到是哪几道。</p>` : ''}
   <div class="rv-list">
@@ -5288,7 +5286,7 @@ function coachRvCard(g) {
         <div class="rv-g-meta">
           <span>${rvClock(g.started)}${done && g.ended ? ' – ' + rvClock(g.ended) : ''}</span>
           <span>${answered < n ? `已答 ${answered}/${n} 题` : `${n} 题`}</span>
-          <span>用时 ${durTight(g.total_ms || g.spent_ms)}</span>
+          <span title="逐题作答用时合计（与上方「答题用时」同一口径）">用时 ${durTight(g.spent_ms || g.total_ms)}</span>
           ${g.timeout_n ? `<span style="color:var(--warn)">超时 ${g.timeout_n}</span>` : ''}
           ${g.dropped_n ? `<span style="color:var(--ink-3)">丢弃 ${g.dropped_n}</span>` : ''}
         </div>

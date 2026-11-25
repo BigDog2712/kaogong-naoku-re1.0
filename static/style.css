@@ -485,10 +485,10 @@ html[data-theme="dark"] img{background:oklch(28% 0.010 80)}
 .rev-rate-head b{font-size:15px;font-weight:700;color:inherit}
 .rev-rate .grade{margin-top:var(--s4)}
 .rev-rate-tip{margin-top:10px;font-size:12.5px}
-/* 复习模式：选项默认收起（先自己回忆），按空格或点标题展开 */
+/* 复习模式：选项固定展开（2026-11-25 去掉了折叠），点一下即作答 */
 .rev-pick-tip{margin:10px 0 0;font-size:12.5px}
 .rev-opts .opt:active{background:var(--surface-2)}
-/* 折叠区：选项（作答前）与解析（作答后）各自独立开合，互不影响 */
+/* 折叠区：只剩解析（作答后）可开合，选项不再折叠 */
 .rev-fold{display:flex;align-items:center;gap:8px;width:100%;max-width:var(--measure);margin:var(--s4) 0 0;
   padding:9px 12px;border:1px dashed var(--rule);border-radius:10px;background:var(--surface-2);
   color:inherit;font:inherit;text-align:left;cursor:pointer}
@@ -514,8 +514,6 @@ html[data-theme="dark"] .answer-sheet .grade button.on{background:#16281c;color:
 .pp-home:disabled{opacity:.4;cursor:not-allowed}
 .pp-home.rev-next{border-color:var(--brand);color:var(--brand)}
 /* 复习答题卡：与练习「先答后对」同款，本组题目全部平铺，已评的题按档位着色 */
-.rev-sheet{margin:14px 0 6px}
-.rev-sheet .sheet-card-head{padding:0;margin-bottom:2px}
 .exam-dot.g1,.answer-sheet .exam-dot.g1{background:rgba(192,57,43,.10);border-color:#c0392b;color:#a93226}
 .exam-dot.g3,.answer-sheet .exam-dot.g3{background:rgba(176,118,31,.12);border-color:#b0761f;color:#8f5f13}
 .exam-dot.g4,.answer-sheet .exam-dot.g4{background:rgba(47,93,154,.10);border-color:#2f5d9a;color:#2f5d9a}
@@ -1469,3 +1467,24 @@ html[data-theme="dark"] .tq-full .material img[flag="tex"]{
 
 /* 陪伴圈卡片上的角色标记 */
 .tstu-top{flex-wrap:wrap;gap:6px}
+
+/* ===== 复习答题卡置顶（2026-11-25）=====
+   顶栏压短成一行「第 x / n 题 · 已评 n / n」，答题卡紧贴在它下面：
+   PC 端一屏内同时看到进度、本组题号、当前题；手机端横向放不下，整块隐藏，
+   换题走顶栏的上一题 / 下一题。 */
+.sheet-card.rev-deck{display:flex;align-items:center;gap:var(--s4);margin:0 0 var(--s4);
+  padding:8px 12px;border:1px solid var(--rule);border-radius:10px;background:var(--surface-2)}
+.rev-deck-head{display:flex;flex-direction:column;justify-content:center;gap:1px;flex:0 0 auto;line-height:1.3}
+.rev-deck-head b{font-size:12.5px;letter-spacing:.02em}
+.rev-deck-head .sub{font-size:11.5px;color:var(--ink-3);white-space:nowrap}
+.sheet-card.rev-deck .rev-deck-nav{flex:1 1 auto;margin:0;gap:5px;flex-wrap:wrap}
+.sheet-card.rev-deck .exam-dot{width:28px;height:28px;font-size:12px}
+.rev-progress{margin-bottom:10px;font-size:12.5px}
+.rev-progress .pbar{height:4px;margin-top:4px}
+@media(min-width:761px){.rev-deck ~ .answer-viewport{max-height:calc(100vh - 206px)}}
+@media(max-width:760px){.sheet-card.rev-deck{display:none}}
+/* 窄屏：答题卡已隐藏，顶栏只留「第 x / n 题」，避免和按钮挤成两行 */
+@media(max-width:560px){
+  .rev-progress #pp-txt{white-space:nowrap}
+  .rev-progress #pp-stat{display:none}
+}
