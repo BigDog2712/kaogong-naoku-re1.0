@@ -553,10 +553,38 @@ def app_ver():
     except Exception:
         return _APP_VER["v"] or "0"
 
+
+def sync_frontend_version():
+    """发版时只手改 index.html 的 kg-app-ver，其余版本号自动对齐。
+
+    教训（v1.13.0）：版本号一共散在 5 处——index.html 的 meta、style.css?v=、app.js?v=、
+    「强制加载最新版本」链接、以及 app.js 自愈逻辑里的 APP_VER。只改 meta 会让自愈逻辑
+    拿着旧 APP_VER 把页面跳回旧地址，用户刷新多少次看到的都还是旧界面（按钮/新功能"没出现"）。
+    这里以 meta 为唯一来源，启动时把其余几处改成同一个值，只在真的不一致时才写盘。"""
+    v = app_ver()
+    if not v or v == "0":
+        return
+    for fp, pat, rep in (
+        (os.path.join(STATIC, "index.html"), r'\?v=[0-9A-Za-z._-]+', "?v=" + v),
+        (os.path.join(STATIC, "app.js"), r"const APP_VER = '[^']*'", "const APP_VER = '" + v + "'"),
+    ):
+        try:
+            with open(fp, encoding="utf-8") as f:
+                s = f.read()
+            s2 = re.sub(pat, rep, s)
+            if s2 == s:
+                continue
+            tmp = fp + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="") as f:
+                f.write(s2)
+            os.replace(tmp, fp)
+            print("[version] 已把 %s 的版本号对齐到 %s" % (os.path.basename(fp), v))
+        except Exception as e:
+            print("[version] 对齐 %s 失败（忽略）：%s" % (fp, e))
+
 def q_one(sql, args=()):
     r = db().execute(sql, args).fetchone()
     return dict(r) if r else None
-
 def _int(v, d):
     """query 参数安全取整：非数字/空 → 默认值（防 ?size=abc 直接 500）"""
     try:
@@ -1231,8 +1259,8 @@ def get_setting(key, default=None):
 
 APP_RELEASE_VERSION = app_ver()
 APP_RELEASE_NOTES = ("本次更新：\n"
-                     "新增：复习时可点「上一题 / 下一题」跳题，跳回去还能改这道题的掌握程度；\n"
-                     "优化：答对不再自动跳题，停在本页看解析、改档位，点「下一题」才前进；\n"
+                     "新增：复习页答题卡，能看到本组全部题目并点题号直接跳题；\n"
+                     "优化：复习可改掌握程度，答对不再自动跳题，停在本页看解析、改档位；\n"
                      "修复：中途退出练习后总览「今日学习时长」偏少、复习计划今日待复习偶发对不上的问题。\n"
                      "刷新页面即可生效。")
 
@@ -4465,6 +4493,7 @@ def main():
     if not os.path.exists(DB_PATH):
         print("[ERR] 数据库不存在，请先运行: python parse.py")
         sys.exit(1)
+    sync_frontend_version()   # 以 index.html 的 kg-app-ver 为准对齐其余版本号（发版只改一处）
     ensure_split()
     borrow()   # 启动期整段复用一个连接：建表迁移 → 题库校验
     try:

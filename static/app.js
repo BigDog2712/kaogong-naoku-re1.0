@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261124g';
+const APP_VER = '20261125b';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -1926,8 +1926,8 @@ function renderAct() {
       bindNoteBox(act, c);
       return;
     }
-    // 复习模式：选项已在上面列出（可直接点选），掌握程度也仍然可以凭回忆直接给。
-    act.innerHTML = `
+    // 复习模式：先给「答题卡」，与练习「先答后对」一致——能看到本组全部题目并点题号直接跳转
+    act.innerHTML = `${revSheetHtml()}
       <div class="rev-rate">
         <div class="rev-rate-head">
           <b>这道题现在掌握得怎么样？</b>
@@ -1945,6 +1945,7 @@ function renderAct() {
     act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
     const rv = document.getElementById('btn-reveal');
     if (rv) rv.onclick = doReveal;
+    bindRevSheet(act);
     bindNoteBox(act, c);
     return;
   }
@@ -1969,6 +1970,7 @@ function renderAct() {
         </div>
       </div>`;
   act.innerHTML = `
+    ${!answerable ? revSheetHtml() : ''}
     <div class="qtools">
       <button class="qtool ${f.fav ? 'on' : ''}" id="t-fav">${f.fav ? '★ 已收藏' : '☆ 收藏'}</button>
       <button class="qtool" id="t-detail">🔍 完整标注</button>
@@ -1989,7 +1991,7 @@ function renderAct() {
         ? (isRight ? '答对了 · 按「一般」（熟悉程度 3）记录；点其它档位可改，按 → 进下一题。' : '答错了，先看完解析再自评（键盘 1 / 2 / 3 / 4）；按 → 也可以直接跳过本题。')
         : '解析已展开，核对后再自评（键盘 1 / 2 / 3 / 4）；按 → 进下一题。')}</p>`;
   act.querySelectorAll('.grade button').forEach(b => b.onclick = () => doGrade(+b.dataset.g));
-  if (!answerable) syncRevGrade();
+  if (!answerable) { syncRevGrade(); bindRevSheet(act); }
   if (!answerable && !picked) bindAnsToggle();
   bindNoteBox(act, f);            // 笔记常驻：与「完整标注 / 看解析」同一份数据
   document.getElementById('t-fav').onclick = async (e) => {
@@ -2497,6 +2499,80 @@ function revAnsweredRight(S) {
   return String(S.chosen).toUpperCase() === String(f.answer || '').toUpperCase();
 }
 
+/* 复习答题卡：和练习「先答后对」的答题卡同一个样子——本组所有题目平铺，
+   已评的题按档位着色、当前题高亮，点任意题号直接跳过去（跳过去还能改掌握程度）。
+   之前跳题只有顶栏两个小箭头，窄屏只露 ← →，等于没有；题目一多也没法定位。 */
+function revSheetHtml() {
+  const S = state.session; if (!S) return '';
+  const rec = S.rev || {};
+  const n = S.queue.length;
+  let revN = 0;
+  const dots = S.queue.map((c, i) => {
+    const r = rec[c.id] || {};
+    const g = +r.g || 0;
+    if (g) revN++;
+    const cls = ['exam-dot'];
+    if (g) cls.push('answered', 'g' + g);
+    if (i === S.idx) cls.push('cur');
+    const t = g ? '已记「' + gradeLabel(g) + '」' : (r.rev ? '已看解析，未评档' : '未评档');
+    return `<button type="button" class="${cls.join(' ')}" data-rev-i="${i}" title="第 ${i + 1} 题 · ${t}">${i + 1}</button>`;
+  }).join('');
+  return `<div class="sheet-card rev-sheet">
+    <div class="sheet-card-head"><b>答题卡</b><span class="sub rev-sheet-count" style="margin:0">已评 ${revN} / ${n} · 点题号可直接跳到任意一题</span></div>
+    <div class="exam-nav">${dots}</div>
+    <div class="rev-sheet-nav">
+      <button class="btn ghost sm" id="rv-prev" type="button" ${S.idx === 0 ? 'disabled' : ''}>← 上一题</button>
+      <button class="btn sm" id="rv-next" type="button" title="这一题答对但没选档位的，按「一般」记上再前进">下一题 →</button>
+    </div>
+  </div>`;
+}
+function bindRevSheet(scope) {
+  if (!scope) return;
+  scope.querySelectorAll('[data-rev-i]').forEach(b => b.onclick = () => revGoto(+b.dataset.revI));
+  const p = scope.querySelector('#rv-prev'); if (p) p.onclick = () => revNav(-1);
+  const nx = scope.querySelector('#rv-next'); if (nx) nx.onclick = () => revNav(1);
+}
+/* 记完/改完档位后就地刷新答题卡的颜色与计数，不重建 DOM（否则按钮事件会丢） */
+function syncRevSheet() {
+  const S = state.session; if (!S || !isRev(S)) return;
+  const box = document.querySelector('.rev-sheet'); if (!box) return;
+  const rec = S.rev || {};
+  let revN = 0;
+  box.querySelectorAll('[data-rev-i]').forEach(b => {
+    const i = +b.dataset.revI;
+    const c = S.queue[i]; if (!c) return;
+    const r = rec[c.id] || {};
+    const g = +r.g || 0;
+    if (g) revN++;
+    b.classList.toggle('answered', !!g);
+    ['g1', 'g3', 'g4', 'g5'].forEach(k => b.classList.remove(k));
+    if (g) b.classList.add('g' + g);
+    b.classList.toggle('cur', i === S.idx);
+    b.title = `第 ${i + 1} 题 · ${g ? '已记「' + gradeLabel(g) + '」' : (r.rev ? '已看解析，未评档' : '未评档')}`;
+  });
+  const cnt = box.querySelector('.rev-sheet-count');
+  if (cnt) cnt.textContent = `已评 ${revN} / ${S.queue.length} · 点题号可直接跳到任意一题`;
+  const p = box.querySelector('#rv-prev'); if (p) p.disabled = S.idx === 0;
+}
+
+/* 复习：跳到指定题号（答题卡点号用）。走与「下一题」同一套结算规则。 */
+async function revGoto(i) {
+  const S = state.session;
+  if (!S || !isRev(S) || S._revNav) return;
+  if (!(i >= 0 && i < S.queue.length) || i === S.idx) return;
+  S._revNav = true;
+  try {
+    if (S._grading) await new Promise(r => setTimeout(r, 150));
+    await revSettleCurrent();
+    S.idx = i;
+    renderCard();
+    saveSession();
+    const vp = document.getElementById('answer-viewport');
+    if (vp && vp.scrollTo) vp.scrollTo({ top: 0 });
+    else window.scrollTo({ top: 0 });
+  } finally { S._revNav = false; }
+}
+
 /* 复习导航：上一题 / 下一题。离开一题前，答对但没选掌握程度的按默认档「一般」补记，
    免得复习进度悬空；没答对的一律不擅自写档位（写了会被算成「遗忘」）。 */
 async function revNav(delta) {
@@ -2560,6 +2636,7 @@ function syncRevProgress() {
   if (st) st.innerHTML = `<span class="mode-badge">复习</span> 已评 <b>${revN}</b> / ${S.queue.length}`;
   const bar = document.getElementById('pp-bar');
   if (bar) bar.style.width = (revN / n * 100).toFixed(2) + '%';
+  syncRevSheet();                       // 答题卡上的题号颜色 / 已评计数跟着更新
 }
 
 /* 评分。复习模式下不再自动跳题：先把档位记在本题上，留在原页可以改，按 → / 点「下一题」才前进。

@@ -497,6 +497,19 @@ html[data-theme="dark"] .answer-sheet .grade button.on{background:#16281c;color:
 .rev-nav{display:inline-flex;gap:6px}
 .pp-home:disabled{opacity:.4;cursor:not-allowed}
 .pp-home.rev-next{border-color:var(--brand);color:var(--brand)}
+/* 复习答题卡：与练习「先答后对」同款，本组题目全部平铺，已评的题按档位着色 */
+.rev-sheet{margin:14px 0 6px}
+.rev-sheet .sheet-card-head{padding:0;margin-bottom:2px}
+.rev-sheet-nav{display:flex;gap:8px;margin-top:10px}
+.rev-sheet-nav .btn{flex:1 1 auto;justify-content:center}
+.exam-dot.g1,.answer-sheet .exam-dot.g1{background:rgba(192,57,43,.10);border-color:#c0392b;color:#a93226}
+.exam-dot.g3,.answer-sheet .exam-dot.g3{background:rgba(176,118,31,.12);border-color:#b0761f;color:#8f5f13}
+.exam-dot.g4,.answer-sheet .exam-dot.g4{background:rgba(47,93,154,.10);border-color:#2f5d9a;color:#2f5d9a}
+.exam-dot.g5,.answer-sheet .exam-dot.g5{background:rgba(46,139,87,.12);border-color:#2e8b57;color:#1f6b41}
+html[data-theme="dark"] .exam-dot.g1{background:rgba(192,57,43,.22);color:#f0a49c}
+html[data-theme="dark"] .exam-dot.g3{background:rgba(176,118,31,.22);color:#e8c07a}
+html[data-theme="dark"] .exam-dot.g4{background:rgba(47,93,154,.26);color:#9dc0ef}
+html[data-theme="dark"] .exam-dot.g5{background:rgba(46,139,87,.24);color:#8fd9b0}
 .answer-sheet .rev-rate{border-top-color:#d9dee2}
 .answer-sheet .rev-rate-head .sub,.answer-sheet .rev-rate-tip{color:#6b757e}
 html[data-theme="dark"] .answer-sheet .rev-rate{border-top-color:#34373b}
