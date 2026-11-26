@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261125g';
+const APP_VER = '20261126c';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -39,13 +39,59 @@ function setTok(t) {
   TOKEN = t || '';
   try { if (t) localStorage.setItem('kg_token', t); else localStorage.removeItem('kg_token'); } catch (e) { }
 }
-function withU(p) { return p + (p.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(tok()); }
+/* ---------- 代看：陪伴者以只读视角看对方 ----------
+   进入后每个 GET 自动带 as=目标账号，服务端把 need_uid 换成目标，
+   于是总览 / 统计 / 错题本 / 收藏 / 浏览 / 考点这些数据页**不用改任何一行**就变成「他的数据」。
+   写操作两道锁：这里 POST 直接抛，服务端 do_POST 也拒。
+   用 sessionStorage 而不是 localStorage：同一台电脑开两个标签，一个看自己一个看对方不会互相串。 */
+const VIEWAS_KEY = 'kg_viewas';
+let VIEWAS = '', VIEWAS_NAME = '';
+try {
+  VIEWAS = sessionStorage.getItem(VIEWAS_KEY) || '';
+  VIEWAS_NAME = sessionStorage.getItem(VIEWAS_KEY + '_n') || '';
+} catch (e) { }
+function viewAsOn() { return !!VIEWAS; }
+function clearExpiredViewAs() {
+  setViewAs('', '');
+  if (VAS_TIMER) { clearInterval(VAS_TIMER); VAS_TIMER = null; }
+  const h = (location.hash || '#/').split('?')[0];
+  if (h === '#/') viewDashboard().catch(e => fatal((e && e.message) || e));
+  else location.hash = '#/coach';
+}
+function setViewAs(uid, name) {
+  VIEWAS = uid || ''; VIEWAS_NAME = name || '';
+  try {
+    if (uid) {
+      sessionStorage.setItem(VIEWAS_KEY, uid);
+      sessionStorage.setItem(VIEWAS_KEY + '_n', VIEWAS_NAME);
+    } else {
+      sessionStorage.removeItem(VIEWAS_KEY);
+      sessionStorage.removeItem(VIEWAS_KEY + '_n');
+    }
+  } catch (e) { }
+  document.documentElement.setAttribute('data-viewas', VIEWAS ? '1' : '');
+  // 顶栏 / 侧栏立刻跟着切换：退出查看或切人时不用等下一次路由
+  try { renderCoachShell(); } catch (e) { }
+  try { renderNav(); } catch (e) { }
+}
+/* 代看时侧栏只留「看数据」的入口：答题类（练习/复习/模考）、设置、陪伴者本身都收起来，
+   避免点进去一个注定不能用的页面。 */
+const VIEWAS_NAV_OK = ['#/', '#/wrongbook', '#/favorites', '#/browse', '#/kadian', '#/stats'];
+const VIEWAS_BLOCK = ['#/study', '#/review', '#/exam', '#/settings', '#/coach', '#/coach/encourage'];
+
+function withU(p) {
+  let s = p + (p.indexOf('?') >= 0 ? '&' : '?') + 'token=' + encodeURIComponent(tok());
+  if (VIEWAS) s += '&as=' + encodeURIComponent(VIEWAS);   // 代看：读接口一律改成查对方
+  return s;
+}
 
 /* 统一的失败语义：接口不通就抛异常，交给 nav() 的 catch 显示"重试"。
    以前这里返回 {}，调用方直接取字段就抛 TypeError，而异常没人接，
    页面永远停在"加载中…"——这正是线上偶发空白的真实原因。 */
 class ApiError extends Error {
-  constructor(msg, status) { super(msg); this.status = status; }
+  constructor(msg, status) { super(msg); this.status = status; this.name = 'ApiError'; }
+  // 很多地方写的是 '收藏失败：' + e，默认会拼成「ApiError: xxx」。统一只留人话。
+  toString() { return this.message; }
 }
 async function API(p) {
   let r;
@@ -58,12 +104,24 @@ async function API(p) {
     catch (e2) { throw new ApiError('网络连接失败，请检查网络后重试', 0); }
   }
   if (r.status === 401) { onExpired(); throw new ApiError('登录已失效', 401); }
+  if (r.status === 403) {
+    const body = await r.json().catch(() => ({}));
+    if (body.code === 'viewas_expired') {
+      if (VIEWAS) clearExpiredViewAs();
+      const error = new ApiError(body.error || '代看权限已失效，请返回陪伴页重新进入', 403);
+      error.viewasExpired = true;
+      throw error;
+    }
+  }
   if (r.status === 414) throw new ApiError('请求内容过长，请刷新页面后重试', 414);
   if (!r.ok) throw new ApiError('服务器返回 ' + r.status + '，请稍后重试', r.status);
   try { return await r.json(); }
   catch (e) { throw new ApiError('服务器返回数据异常，请重试', r.status); }
 }
 async function POST(p, b) {
+  // 代看只读：这里先拦一道，用户点到的写操作会立刻得到明确提示，
+  // 也保证不会把「看着他的界面」写成「动了我自己的数据」。
+  if (VIEWAS) throw new ApiError('查看视角下只能看，不能修改（答题、笔记、收藏都会写进对方账号）', 403);
   let r;
   try {
     r = await fetch(p, {
@@ -78,7 +136,9 @@ async function POST(p, b) {
 }
 function onExpired() { setTok(''); showLogin('登录已失效，请重新登录'); }
 const esc = (s) => (s || '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
-const app = document.getElementById('app');
+/* 视图容器：所有 viewXxx 都往这里写。外层 #app 只负责宽度与内边距，
+   代看时的只读条 / 实时卡（#coach-shell）挂在它上面，因此不会被视图重绘冲掉。 */
+const app = document.getElementById('app-body');
 let BOOT = null;
 
 const state = { session: null, exam: null, ink: Object.create(null), inkTxt: Object.create(null), inkRef: null, ul: Object.create(null), gradeCtx: null };
@@ -191,6 +251,9 @@ const REV_AUTO_GRADE_NAME = (GRADE_DEF.find(x => x.v === REV_AUTO_GRADE) || {}).
 
 /* ---------- 练习 session 本地快照（继续上次刷题） ---------- */
 const SS_KEY = 'kg_session_v1';
+/* 快照按「自己 / 代看的谁」分键：否则陪伴者点进练习页会覆盖自己未交的卷子，
+   或者把对方的半套卷当成自己的接着做（快照里带 gid，服务端会认它）。 */
+function ssKey() { return VIEWAS ? SS_KEY + ':as:' + VIEWAS : SS_KEY; }
 /* 答题模式：instant = 边答边对（选完立即显示答案与解析）；deferred = 先答后对（整组做完统一判分出报告） */
 const ANSWER_MODE_KEY = 'kg_answer_mode';
 function getAnswerMode() { try { return localStorage.getItem(ANSWER_MODE_KEY) === 'deferred' ? 'deferred' : 'instant'; } catch (e) { return 'instant'; } }
@@ -210,7 +273,7 @@ const ANSWER_MODE_TIP = {
 function saveSession() {
   try {
     const S = state.session; if (!S || !S.queue || !S.queue.length || S.submitted) return;
-    localStorage.setItem(SS_KEY, JSON.stringify({
+    localStorage.setItem(ssKey(), JSON.stringify({
       mode: S.mode, cfg: S.cfg, queue: S.queue, idx: S.idx,
       tally: S.tally, marked: Array.from(S.marked || []),
       answerMode: S.answerMode, answers: S.answers || {}, spent: S.spent || {},
@@ -222,7 +285,7 @@ function saveSession() {
 }
 function loadSession() {
   try {
-    const s = localStorage.getItem(SS_KEY); if (!s) return null;
+    const s = localStorage.getItem(ssKey()); if (!s) return null;
     const o = JSON.parse(s);
     if (!o || o.kind !== 'study' || !o.queue || !o.queue.length) return null;
     if (o.idx >= o.queue.length) return null; // 已全部做完
@@ -242,7 +305,7 @@ function addSeen(qids) {
   } catch (e) { /* 隐私模式降级 */ }
 }
 
-function clearSession() { try { localStorage.removeItem(SS_KEY); } catch (e) { } }
+function clearSession() { try { localStorage.removeItem(ssKey()); } catch (e) { } }
 function resumeSession() {
   const o = loadSession();
   if (!o) { clearSession(); return; }
@@ -318,6 +381,7 @@ async function nav() {
     return r;
   } catch (e) {
     if (e && e.status === 401) return;          // 已跳登录，无需重复提示
+    if (e && e.viewasExpired) return;           // 已清除视角并返回自己的页面
     console.error('[nav]', e);
     fatal((e && e.message) || e);
   }
@@ -334,9 +398,19 @@ function route() {
   captureInk();          // 离开练习页：本题笔迹留在本次答题里，回来还能看到
   try { flushReportGrades(); } catch (e) { }   // 离开报告：没自评的题按默认强度补写
   state.gradeCtx = null;
+  // 代看中不放开答题 / 设置 / 陪伴者本身：这些页面要么注定不能用，要么属于我的私有设置
+  if (VIEWAS && VIEWAS_BLOCK.indexOf(h) >= 0) {
+    toast('查看视角下只看数据，答题与设置请先退出');
+    location.hash = '#/';
+    return;
+  }
   document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('active', a.getAttribute('href').split('?')[0] === h));
   if (h === '#/coach') return viewCoach();
-  if (h === '#/coach/peer') return viewTeacherStudent(new URLSearchParams(location.hash.split('?')[1] || '').get('uid'));
+  if (h === '#/coach/peer') {
+    const sid = new URLSearchParams(location.hash.split('?')[1] || '').get('uid');
+    if (sid && sid === VIEWAS) return viewDashboard();     // 刷新 / 返回时还停在他的视角
+    return enterViewAs(sid);
+  }
   if (h === '#/coach/encourage') return viewTeacherEncourage();
   if (h === '#/') return viewDashboard();
   if (h === '#/study') return viewStudy();
@@ -451,13 +525,14 @@ async function viewDashboard() {
   </div>
   <div class="center" style="padding:24px">
     ${resumeBtn}
+    ${VIEWAS ? `<div class="ro-hint">👁 <b>${esc(VIEWAS_NAME || '对方')}</b> 的答题与复习入口已收起 —— 查看视角只读，需要时请他本人操作</div>` : ''}
     <div class="row">
-      <a class="btn big ok" href="#/review">开始复习到期 (${s.due_review})</a>
-      <a class="btn big" href="#/study">练习新题</a>
+      ${VIEWAS ? '' : `<a class="btn big ok" href="#/review">开始复习到期 (${s.due_review})</a>
+      <a class="btn big" href="#/study">练习新题</a>`}
       <a class="btn big ghost" href="#/browse">浏览真题库</a>
       <a class="btn big ghost" href="#/kadian">考点导航</a>
-      <a class="btn big ghost" href="#/materials">材料组题</a>
-      <a class="btn big ghost" href="#/doubts">疑点复核</a>
+      ${VIEWAS ? '' : `<a class="btn big ghost" href="#/materials">材料组题</a>
+      <a class="btn big ghost" href="#/doubts">疑点复核</a>`}
     </div>
   </div>
   <h2>各模块进度</h2>
@@ -468,8 +543,8 @@ async function viewDashboard() {
         <b>${esc(m.m)}</b><span class="tag">已学 ${m.learned}/${m.total} (${pct}%)</span></div>
         <div class="bar"><i style="width:${pct}%"></i></div>
         <div class="sub" style="margin:8px 0 0">今日待复习：${dueMod[m.m] || 0}</div>
-        <div class="row" style="margin-top:12px">
-          <a class="btn ghost" href="#/study?module=${encodeURIComponent(m.m)}">练习该模块</a></div>
+        ${VIEWAS ? '' : `<div class="row" style="margin-top:12px">
+          <a class="btn ghost" href="#/study?module=${encodeURIComponent(m.m)}">练习该模块</a></div>`}
       </div>`;
     }).join('')}
   </div>
@@ -652,6 +727,9 @@ const TODAY_REDO = {
   wrongredo: ['today_wrong', '↻ 再练今天答错的题'],
 };
 async function startSession(cfg) {
+  // 全站唯一的答题入口：代看时在这里一刀切住，错题本「只练错题」、收藏「只练收藏」、
+  // 今日回溯「重做本组」、考点导航、材料组题都不会漏。
+  if (VIEWAS) { toast('查看视角下不能答题，请先退出查看'); return; }
   loading('拉取题目…');
   const p = new URLSearchParams();
   p.set('mode', cfg.mode); p.set('size', String(cfg.size || loadSessionSize()));
@@ -3019,7 +3097,7 @@ const ST_READ_ONLY_ROUTES = new Set(['#/detail', '#/browse', '#/kadian', '#/doub
 const ST = {
   acc: { answer: 0, analysis: 0, review: 0 },
   sent: { answer: 0, analysis: 0, review: 0 },
-  last: 0, timer: null, sending: false, p: null,
+  last: 0, timer: null, sending: false, p: null, pack: null,
 };
 /* 答题页是否就在屏幕上：练习是就地渲染的，进入练习大多不改 hash
    （总览「继续上次刷题」、今日回溯「重做本组」都不改），所以不能只看 hash。
@@ -3053,6 +3131,7 @@ function stPending() {
     + (ST.acc.analysis - ST.sent.analysis) + (ST.acc.review - ST.sent.review)));
 }
 function stShouldRun() {
+  if (VIEWAS) return false;                                  // 看别人的数据不算我的学习时长
   if (document.hidden) return false;
   const S = state.session;
   // 答题页在屏幕上就以计时胶囊为准：胶囊被手动暂停才停表
@@ -3095,30 +3174,42 @@ function stSync() {
    force=true：离开学习页时用，几百毫秒的零头也落库。
    只有服务端明确回 ok 才把本地增量记成「已上报」，否则下一次连本带利重发——
    以前非 2xx 也照记已上报，网络抖动一次就白丢一段时间。 */
+/* 每次「未确认的增量」一个随机 id；网络失败重发时复用，服务端据此只记一次 */
+function stRid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
 function stFlush(keepalive, force) {
-  const parts = {};
-  let pend = 0;
-  Object.keys(ST.acc).forEach(k => {
-    const d = Math.round(ST.acc[k] - ST.sent[k]);
-    if (d > 0) { parts[k] = d; pend += d; }
-  });
-  if (pend < (force ? 200 : 1000)) return Promise.resolve();   // 零头留着，下次一起报
   if (ST.sending) return ST.p || Promise.resolve();
-  const upto = { ...ST.acc };
+  // 上一次「发出去了但没收到 ok」的整包优先重发：rid 保持不变，服务端按 rid 去重。
+  // 弱网下请求可能已经落库、只是响应丢了，重发若换个 rid 就会被记成第二遍。
+  let pack = ST.pack;
+  if (!pack) {
+    const parts = {};
+    let pend = 0;
+    Object.keys(ST.acc).forEach(k => {
+      const d = Math.round(ST.acc[k] - ST.sent[k]);
+      if (d > 0) { parts[k] = d; pend += d; }
+    });
+    if (pend < (force ? 200 : 1000)) return Promise.resolve();   // 零头留着，下次一起报
+    pack = ST.pack = { rid: stRid(), ms: pend, parts, upto: { ...ST.acc } };
+  }
   ST.sending = true;
   // 请求挂死（弱网 / 后端卡住）不能把后续上报全堵住：15 秒没回就当失败，增量留着下轮重发
   const AC = (typeof AbortController !== 'undefined') ? new AbortController() : null;
   const timer = AC ? setTimeout(() => { try { AC.abort(); } catch (e) { } }, 15000) : null;
   const opt = { method: 'POST', keepalive: !!keepalive, headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ ms: pend, parts, token: tok() }) };
+                body: JSON.stringify({ ms: pack.ms, parts: pack.parts, rid: pack.rid, token: tok() }) };
   if (AC) opt.signal = AC.signal;
   ST.p = fetch(withU('/api/study-time'), opt).then(r => (r && r.ok) ? r.json() : null).then(j => {
-    if (j && j.ok) Object.keys(ST.sent).forEach(k => { ST.sent[k] = upto[k]; });
+    if (j && j.ok) {
+      Object.keys(ST.sent).forEach(k => { ST.sent[k] = pack.upto[k]; });
+      ST.pack = null;                       // 已确认落库，下一轮重新算增量
+    }
     if (j && typeof j.today_ms === 'number') {
       ST.todayMs = j.today_ms; ST.totalMs = j.total_ms || 0;
       ST.todayParts = j.today_parts || null;
     }
-  }).catch(() => { /* 网络失败 / 超时：增量留着下次重试 */ })
+  }).catch(() => { /* 网络失败 / 超时：pack 留着，下次用同一个 rid 重发 */ })
     .then(() => { if (timer) clearTimeout(timer); ST.sending = false; ST.p = null; });
   return ST.p;
 }
@@ -3541,13 +3632,12 @@ async function finishSession() {
     const sum = S.times.reduce((a, b) => a + b, 0);
     const avg = sum / S.times.length / 1000;
     const tm = Math.floor(sum / 1000 / 60), ts = Math.round(sum / 1000 % 60);
-    // 功能2：正确率对比（本次限时 vs 平时不限时整体）
+    // 功能2：正确率对比（本次限时 vs 平时不限时整体）；平时口径取「首次作答」，复习成绩不混进来
     let cmp = '';
     try {
-      const accData = await API('/api/accuracy');
-      let c = 0, w = 0;
-      (accData.module || []).forEach(m => { c += (m.c || 0); w += (m.w || 0); });
-      const baseAcc = (c + w) ? Math.round(c / (c + w) * 100) : null;
+      const accData = await API('/api/accuracy/v2');
+      const f = accData.first || {};
+      const baseAcc = f.n ? Math.round(f.acc) : null;
       if (baseAcc !== null) {
         const diff = acc - baseAcc;
         const cls = diff >= 0 ? 'var(--ok)' : 'var(--bad)';
@@ -4470,11 +4560,120 @@ async function viewToday() {
   });
 }
 
+/* ===== 正确率：首次作答 vs 复习 =====
+   口径（服务端 /api/accuracy/v2）：首次 = 每道题第一次做（不含复习）时选了选项的作答，
+   按客观选项判对错；复习 = 复习时重新选选项的作答。直接看答案的题不进分母。
+   分开看才有参考价值：首次反映真实水平，复习反映巩固效果。 */
+function kgDay(dt) {
+  return `${dt.getFullYear()}-${String(dt.getMonth() + 1).padStart(2, '0')}-${String(dt.getDate()).padStart(2, '0')}`;
+}
+function accPct(a) { return a && a.n ? Math.round(a.c / a.n * 100) : null; }
+
+/* 折线：每日首次正确率 + 7 日题量加权平滑 + 当天题量背景柱 */
+function accLineSvg(days) {
+  const pts = (days || []).filter(d => d.n > 0);
+  if (!pts.length) return '<div class="acc-empty">这段时间还没有首次作答记录</div>';
+  // 窄屏换一套更小的坐标系：同样的 12px 文字在 720 宽的画布里缩到手机只有 6px
+  const narrow = (window.innerWidth || 1024) < 620;
+  const W = narrow ? 384 : 720, H = narrow ? 196 : 206;
+  const PL = narrow ? 28 : 34, PR = narrow ? 10 : 14, PT = 12, PB = 22;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const ts = s => new Date(s + 'T00:00:00').getTime();
+  const t0 = ts(pts[0].d), t1 = ts(pts[pts.length - 1].d);
+  const span = Math.max(864e5, t1 - t0);
+  const lone = pts.length === 1;                  // 只有一天数据时把点放中间，别挤在左边的 Y 轴上
+  const X = s => lone ? PL + iw / 2 : PL + (ts(s) - t0) / span * iw;
+  let lo = Math.floor((Math.min(...pts.map(d => d.acc)) - 8) / 10) * 10;
+  lo = Math.max(0, Math.min(60, lo));
+  const Y = v => PT + (1 - (v - lo) / (100 - lo)) * ih;
+  const maxN = Math.max(...pts.map(d => d.n));
+  const bw = Math.max(2.5, Math.min(12, iw / (span / 864e5) * 0.45));
+  const bars = pts.map(d => {
+    const h = Math.max(1.5, d.n / maxN * ih * 0.38);
+    return `<rect class="acc-bar" x="${(X(d.d) - bw / 2).toFixed(1)}" y="${(PT + ih - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="1"><title>${d.d} · 首次 ${d.n} 题</title></rect>`;
+  }).join('');
+  const line = pts.map((d, i) => `${i ? 'L' : 'M'}${X(d.d).toFixed(1)},${Y(d.acc).toFixed(1)}`).join(' ');
+  const area = `${line} L${X(pts[pts.length - 1].d).toFixed(1)},${PT + ih} L${X(pts[0].d).toFixed(1)},${PT + ih} Z`;
+  // 7 日平滑：按题量加权，单日只做两三题不会把整条线拽下来
+  const sm = [];
+  for (const d of pts) {
+    const hi = ts(d.d), low = hi - 6 * 864e5;
+    let n = 0, c = 0;
+    for (const x of pts) { const xt = ts(x.d); if (xt >= low && xt <= hi) { n += x.n; c += x.c; } }
+    if (n >= 8) sm.push(X(d.d).toFixed(1) + ',' + Y(c / n * 100).toFixed(1));
+  }
+  const smooth = sm.length > 1 ? 'M' + sm.join(' L') : '';
+  const grids = [0, 0.5, 1].map(f => {
+    const v = lo + (100 - lo) * f, y = Y(v).toFixed(1);
+    return `<line class="acc-grid" x1="${PL}" y1="${y}" x2="${W - PR}" y2="${y}"/>
+      <text class="acc-axis" x="${PL - 6}" y="${(+y + 3.5).toFixed(1)}" text-anchor="end">${Math.round(v)}</text>`;
+  }).join('');
+  const dense = pts.length > 45;                  // 点位太密时缩小圆点，让线本身成为主角
+  const dots = pts.map((d, i) => `<circle class="acc-dot${d.n < 5 && !lone ? ' thin' : ''}${i === pts.length - 1 ? ' now' : ''}" cx="${X(d.d).toFixed(1)}" cy="${Y(d.acc).toFixed(1)}" r="${lone ? 3.4 : d.n < 5 ? 1.6 : dense ? 1.9 : 2.4}"><title>${d.d} · ${Math.round(d.acc)}%（${d.c}/${d.n} 题）</title></circle>`).join('');
+  const marks = (narrow ? [0, pts.length - 1] : [0, Math.floor((pts.length - 1) / 2), pts.length - 1])
+    .filter((v, i, a) => a.indexOf(v) === i);
+  const xlab = marks.map(i => `<text class="acc-axis" x="${X(pts[i].d).toFixed(1)}" y="${H - 6}" text-anchor="${lone ? 'middle' : i === 0 ? 'start' : i === pts.length - 1 ? 'end' : 'middle'}">${pts[i].d.slice(5).replace('-', '/')}</text>`).join('');
+  return `<svg class="acc-svg" viewBox="0 0 ${W} ${H}" role="img" aria-label="首次作答正确率走势">
+    <defs><linearGradient id="accFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" style="stop-color:var(--brand);stop-opacity:.26"/>
+      <stop offset="1" style="stop-color:var(--brand);stop-opacity:0"/></linearGradient></defs>
+    ${grids}${bars}
+    <path class="acc-area" d="${area}"/>
+    ${smooth ? `<path class="acc-smooth" d="${smooth}"/>` : ''}
+    <path class="acc-line" d="${line}"/>
+    ${dots}${xlab}</svg>`;
+}
+
+/* 每个模块/大类一行：实色条 = 首次正确率，竖线 = 复习正确率（同一把尺子上直接对比） */
+function accPairList(firstList, reviewList, limit) {
+  const rmap = {};
+  (reviewList || []).forEach(x => rmap[x.k] = x);
+  const rows = (firstList || []).filter(x => x.n > 0).slice(0, limit);
+  if (!rows.length) return '<div class="acc-empty">练习后这里会显示正确率</div>';
+  return rows.map(f => {
+    const r = rmap[f.k];
+    const fa = Math.round(f.acc), ra = r ? Math.round(r.acc) : null;
+    const nm = f.k.length > 12 ? f.k.slice(0, 12) + '…' : f.k;
+    return `<div class="accp">
+      <div class="accp-h"><span class="nm" title="${esc(f.k)}">${esc(nm)}</span>
+        <span class="nums"><b>${fa}%</b>${ra !== null ? `<span class="rv">复习 ${ra}%</span>` : ''}<span class="qn">${f.n} 题</span></span></div>
+      <div class="accp-tr"><i style="width:${fa}%"></i>${ra !== null ? `<span class="mk" style="left:${Math.max(0, Math.min(100, ra))}%"></span>` : ''}</div>
+    </div>`;
+  }).join('');
+}
+
+/* 天 × 模块（大类）矩阵：颜色分 5 档，格子里写当天该模块的首次正确率 */
+function accMatrix(srcRows, days, totalList, limit) {
+  const cellOf = {}, tot = {};
+  (srcRows || []).forEach(r => { (cellOf[r.k] = cellOf[r.k] || {})[r.d] = r; });
+  (totalList || []).forEach(r => tot[r.k] = r);
+  const keys = Object.keys(cellOf).sort((a, b) => (tot[b] ? tot[b].n : 0) - (tot[a] ? tot[a].n : 0))
+    .slice(0, limit || 12);
+  if (!keys.length) return '<div class="acc-empty">练习后这里会显示每天各模块的正确率</div>';
+  const todayKey = days[days.length - 1];
+  const head = `<div class="acc-mname"></div>` + days.map(d =>
+    `<div class="acc-mhead${d === todayKey ? ' today' : ''}">${d.slice(5).replace('-', '/')}</div>`).join('');
+  const body = keys.map(k => {
+    const cells = days.map(d => {
+      const c = (cellOf[k] || {})[d];
+      if (!c || !c.n) return `<div class="acc-cell a0"></div>`;
+      const a = Math.round(c.c / c.n * 100);
+      const lv = a >= 80 ? 4 : a >= 65 ? 3 : a >= 50 ? 2 : 1;
+      // 样本 1-2 题的格子颜色调淡：偶然性太大，别和做了十几题的同色看待
+      return `<div class="acc-cell a${lv}${c.n < 3 ? ' thin' : ''}" title="${d} ${esc(k)} · 首次 ${c.n} 题 · 对 ${c.c} 题 · ${a}%">${a}</div>`;
+    }).join('');
+    const t = tot[k];
+    return `<div class="acc-mname" title="${esc(k)}"><em>${esc(k)}</em>${t ? `<span>${Math.round(t.acc)}%</span>` : ''}</div>${cells}`;
+  }).join('');
+  const labelW = (window.innerWidth || 1024) < 620 ? 104 : 136;
+  return `<div class="acc-matrix" style="grid-template-columns:${labelW}px repeat(${days.length},minmax(26px,1fr))">${head}${body}</div>`;
+}
+
 async function viewStats() {
   loading('统计中…');
   await stSettle();                 // 同上：学习时长先落库再取数
-  const [st, heat, sk, acc, weak, tstat] = await Promise.all([
-    API('/api/stats'), API('/api/heatmap?days=180'), API('/api/streak'), API('/api/accuracy'), API('/api/weak'),
+  const [st, heat, sk, accv, weak, tstat] = await Promise.all([
+    API('/api/stats'), API('/api/heatmap?days=180'), API('/api/streak'), API('/api/accuracy/v2'), API('/api/weak'),
     API('/api/study-time/stat?days=14').catch(() => null),
   ]);
   const hm = {}; heat.days.forEach(d => hm[d.d] = d.n);
@@ -4504,7 +4703,23 @@ async function viewStats() {
   const heatDays = activeN.length, heatMax = activeN.length ? activeN[activeN.length - 1] : 0;
   const heatTotal = activeN.reduce((a, b) => a + b, 0);
   const goalPct = sk.goal ? Math.min(100, Math.round(sk.today / sk.goal * 100)) : 0;
-  const maxAcc = (a) => { const t = (a.c || 0) + (a.w || 0); return t ? Math.round(a.c / t * 100) : 0; };
+  // ---- 正确率口径：首次 vs 复习（见 accLineSvg 上方注释） ----
+  const F = accv.first || {}, R = accv.review || {};
+  const fAcc = accPct(F), rAcc = accPct(R);
+  const dayOf = back => { const d = new Date(); d.setDate(d.getDate() - back); return kgDay(d); };
+  // 窗口汇总：日期是 ISO 字符串，直接比大小即可
+  const winAgg = (from, to) => {
+    const rows = (F.by_day || []).filter(x => x.d > from && x.d <= to);
+    const n = rows.reduce((s, x) => s + x.n, 0), c = rows.reduce((s, x) => s + x.c, 0);
+    return n ? { n, acc: c / n * 100 } : null;
+  };
+  const w30 = winAgg(dayOf(30), dayOf(0)), wPrev = winAgg(dayOf(60), dayOf(30));
+  const accDelta = w30 && wPrev ? w30.acc - wPrev.acc : null;
+  const mCols = (window.innerWidth || 1024) < 620 ? 8 : 14;   // 手机放不下 14 天，收成 8 天免得横向滚动
+  const mDays = [];                              // 矩阵的列：最近 N 天（含今天）
+  for (let i = mCols - 1; i >= 0; i--) mDays.push(dayOf(i));
+  const chartDays = r => (F.by_day || []).filter(x => x.d >= dayOf(r - 1));
+
   app.innerHTML = `
   <h1>数据统计</h1><p class="sub">学习节奏 · 正确率 · 薄弱考点，一眼看清</p>
   <div class="grid g4">
@@ -4512,6 +4727,54 @@ async function viewStats() {
     <div class="card kpi purple"><div class="n">${sk.best}</div><div class="l">🏆 最长连续(天)</div></div>
     <div class="card kpi brand"><div class="n">${st.studied_today}</div><div class="l">✅ 今日已练</div></div>
     <div class="card kpi warn"><div class="n">${st.wrong}</div><div class="l">📕 错题总数</div></div>
+  </div>
+  <h2>正确率 · 首次作答</h2>
+  <div class="card acc-card">
+    <div class="acc-kpis">
+      <div class="acc-kpi"><span class="lab">首次正确率</span>
+        <b>${fAcc === null ? '—' : fAcc + '<i>%</i>'}</b>
+        <span class="meta">${F.n ? F.n + ' 题 · 真实水平' : '还没有首次作答'}</span></div>
+      <div class="acc-kpi"><span class="lab">复习正确率</span>
+        <b class="rv">${rAcc === null ? '—' : rAcc + '<i>%</i>'}</b>
+        <span class="meta">${R.n ? R.n + ' 题 · 巩固效果' : '复习时选选项才有统计'}</span></div>
+      <div class="acc-kpi"><span class="lab">近 30 天首次</span>
+        <b>${w30 ? Math.round(w30.acc) + '<i>%</i>' : '—'}</b>
+        <span class="meta ${accDelta > 0 ? 'up' : accDelta < 0 ? 'down' : ''}">${accDelta === null ? '暂无环比'
+          : Math.abs(accDelta) < 0.05 ? '与前 30 天持平'
+            : (accDelta > 0 ? '↑ ' : '↓ ') + Math.abs(accDelta).toFixed(1) + ' pt 较前 30 天'}</span></div>
+    </div>
+    <div class="acc-bar-head">
+      <span class="acc-cap">每日首次正确率</span>
+      <div class="seg" id="acc-range" role="group" aria-label="时间范围">
+        <button type="button" class="seg-btn" data-r="30">30 天</button>
+        <button type="button" class="seg-btn on" data-r="60">60 天</button>
+        <button type="button" class="seg-btn" data-r="120">120 天</button>
+      </div>
+    </div>
+    <div id="acc-chart">${accLineSvg(chartDays(60))}</div>
+    <div class="acc-legend"><span class="lg"><i class="ln"></i>每日首次</span><span class="lg"><i class="sm"></i>7 日平滑</span><span class="lg"><i class="br"></i>当天首次题量</span></div>
+    <p class="acc-note">首次 = 每道题第一次做时的客观对错（复习不计）；复习 = 复习时重新选选项的对错。直接看答案的题不进统计，两个数字互不干扰。</p>
+  </div>
+  <h2>各模块 / 各大类正确率</h2>
+  <div class="card">
+    <div class="seg" id="acc-dim" role="group" aria-label="统计维度">
+      <button type="button" class="seg-btn on" data-d="module">按模块</button>
+      <button type="button" class="seg-btn" data-d="category">按大类</button>
+    </div>
+    <div id="acc-pairs" style="margin-top:14px">${accPairList(F.by_module, R.by_module, 12)}</div>
+    <div class="acc-legend"><span class="lg"><i class="ln solid"></i>首次正确率</span><span class="lg"><i class="mk"></i>复习正确率（同一标尺上的位置）</span></div>
+  </div>
+  <h2>按天 · 各模块首次正确率</h2>
+  <div class="card">
+    <div class="seg" id="acc-heat-dim" role="group" aria-label="矩阵维度">
+      <button type="button" class="seg-btn on" data-d="module">按模块</button>
+      <button type="button" class="seg-btn" data-d="category">按大类</button>
+    </div>
+    <div class="acc-matrix-wrap" id="acc-heat" style="margin-top:14px">${accMatrix(F.by_day_module, mDays, F.by_module, 8)}</div>
+    <div class="acc-legend"><span class="lg">首次正确率</span>
+      <span class="lg"><i class="sw a1"></i>＜50%</span><span class="lg"><i class="sw a2"></i>50–64</span>
+      <span class="lg"><i class="sw a3"></i>65–79</span><span class="lg"><i class="sw a4"></i>≥80%</span>
+      <span class="lg tip">格内数字 = 当天该模块的首次正确率（1–2 题的格子已调淡）</span></div>
   </div>
   <div class="grid g2" style="margin-top:16px">
     <div class="card kpi brand time" title="今日学习时长 = 做题 + 看解析 + 复习：${durText(st.today_ms)}"><div class="n">${durHtml(st.today_ms)}</div><div class="l">⏱️ 今日学习时长</div>${tpLine(st.today_parts, st.today_ms)}</div>
@@ -4540,18 +4803,6 @@ async function viewStats() {
       <span class="heat-cell"></span><span class="heat-cell l1"></span><span class="heat-cell l2"></span><span class="heat-cell l3"></span><span class="heat-cell l4"></span><span class="heat-cell l5"></span><span class="heat-cell l6"></span><span class="heat-cell l7"></span><span class="heat-cell l8"></span>
       多 <span class="heat-legend-tip">每格一天，颜色越暖表示当天练得越多</span></div>
   </div>
-  <h2>各模块正确率</h2>
-  <div class="card">
-    ${acc.module.map(a => { const pc = maxAcc(a); return `<div class="acc-row">
-      <span class="name">${esc(a.k)}</span><div class="track"><i style="width:${pc}%"></i></div>
-      <span class="pct">${pc}% · 对${a.c}/错${a.w}</span></div>`; }).join('') || '<div class="sub" style="margin:0">练习后这里会显示正确率</div>'}
-  </div>
-  <h2>各大类正确率</h2>
-  <div class="card">
-    ${acc.category.slice(0, 12).map(a => { const pc = maxAcc(a); return `<div class="acc-row">
-      <span class="name" title="${esc(a.k)}">${esc((a.k || '').slice(0, 14))}</span><div class="track"><i style="width:${pc}%"></i></div>
-      <span class="pct">${pc}% · 对${a.c}/错${a.w}</span></div>`; }).join('') || '<div class="sub" style="margin:0">暂无数据</div>'}
-  </div>
   <h2>薄弱考点（错误 / 遗忘最多）</h2>
   <div class="grid g2">
     ${weak.rows.slice(0, 12).map(r => `<div class="card kd-card" onclick="goKadianBrowse('${enc(r.kd)}')">
@@ -4561,6 +4812,24 @@ async function viewStats() {
       <div class="sub" style="margin:4px 0 0">正确率 ${r.acc}%</div>
     </div>`).join('') || '<div class="sub">还没有练过错题，暂无薄弱点</div>'}
   </div>`;
+  // 正确率三块图的切换：只换视图，不重新取数
+  const bindSeg = (sel, fn) => document.querySelectorAll(sel + ' .seg-btn').forEach(b => {
+    b.onclick = () => {
+      document.querySelectorAll(sel + ' .seg-btn').forEach(x => x.classList.toggle('on', x === b));
+      fn(b.dataset.r || b.dataset.d);
+    };
+  });
+  bindSeg('#acc-range', r => { document.getElementById('acc-chart').innerHTML = accLineSvg(chartDays(+r)); });
+  bindSeg('#acc-dim', dim => {
+    document.getElementById('acc-pairs').innerHTML = dim === 'module'
+      ? accPairList(F.by_module, R.by_module, 12)
+      : accPairList((F.by_category || []).filter(x => x.n >= 8), R.by_category, 14);
+  });
+  bindSeg('#acc-heat-dim', dim => {
+    document.getElementById('acc-heat').innerHTML = dim === 'module'
+      ? accMatrix(F.by_day_module, mDays, F.by_module, 8)
+      : accMatrix(F.by_day_category, mDays, F.by_category, 10);
+  });
   document.getElementById('g-set').onclick = async () => {
     const v = Math.max(1, Math.min(500, +document.getElementById('g-in').value || GOAL_DEFAULT));
     await POST('/api/goal', { value: v }); viewStats();
@@ -4646,7 +4915,7 @@ function openAnnouncementPreview(title, content) {
 }
 
 async function showAnnouncementIfNeeded() {
-  if (!ME || sessionStorage.getItem('kg_announcement_open') === '1') return;
+  if (!ME || VIEWAS || sessionStorage.getItem('kg_announcement_open') === '1') return;
   try {
     const data = await API('/api/announcement');
     const item = data.announcement;
@@ -5208,7 +5477,9 @@ function isTeacher() { return false; }   // 陪伴者已融合为普通账号功
 function renderNav() {
   const navEl = document.getElementById('nav'); if (!navEl) return;
   const cur = (location.hash || '#/').split('?')[0];
-  navEl.innerHTML = getNavOrder().map(href => {
+  // 代看时只留数据类入口：练习 / 复习 / 模考 / 设置 / 陪伴者都收起来
+  const order = VIEWAS ? getNavOrder().filter(h => VIEWAS_NAV_OK.indexOf(h) >= 0) : getNavOrder();
+  navEl.innerHTML = order.map(href => {
     const it = navItemByHref(href) || { href, label: href };
     const dot = it.dot ? `<span class="nav-dot" id="${it.dot}" style="display:none"></span>` : '';
     return `<a href="${it.href}"${it.href === cur ? ' class="active"' : ''}>${esc(it.label)}${dot}</a>`;
@@ -5276,130 +5547,104 @@ function tStuCard(s) {
       <div title="累计学习时长（做题 + 看解析 + 复习）"><span class="sub">总学习时长</span><b>${durTight(s.total_ms)}</b></div>
     </div>
     <div class="tstu-live">${line}</div>
+    <div class="tstu-go">进入他的视角看数据 →</div>
   </a>`;
 }
 
-/* ---------- 陪伴者视角的「今日回溯」 ----------
-   与陪读自己看到的今日回溯是同一份数据（服务端 /api/coach/today 复用 _today_payload），
-   区别只有两点：① 一切只读，没有删除 / 重做；② 每题的陪读笔记直接摊在题干下面。
-   样式复用陪读端那套 rv-* 卡片，手机端同样是「点组头展开、点行看原题」。 */
-function coachRvCard(g) {
-  const n = g.n || 0, answered = g.answered || 0;
-  const pct = n ? Math.round(answered / n * 100) : 0;
-  const acc = answered ? Math.round((g.right_n || 0) / answered * 100) : 0;
-  const done = g.state === 'done', aborted = g.state === 'aborted';
-  const stateTag = g.legacy ? '<span class="tag" style="color:var(--ink-3)">旧记录</span>'
-    : done ? '<span class="tag">已交卷</span>'
-      : aborted ? '<span class="tag" style="color:var(--bad)">已放弃</span>'
-        : '<span class="tag" style="color:var(--warn)">未完成</span>';
-  const modeTag = g.legacy ? ''
-    : g.mode === 'review' ? '<span class="mode-badge">复习作答</span>'
-      : g.answer_mode === 'deferred' ? '<span class="mode-badge deferred">先答后对</span>'
-        : '<span class="mode-badge">边答边对</span>';
-  return `<section class="card rv-g" data-gid="${esc(g.gid)}">
-    <div class="rv-g-head" role="button" tabindex="0" aria-expanded="false">
-      <div class="rv-g-main">
-        <div class="rv-g-title">
-          <b>${esc(g.title || RV_MODE[g.mode] || '练习')}</b>${modeTag}${stateTag}
-          ${g.note_n ? `<span class="mode-badge" style="background:var(--paper-2);color:var(--brand)">📝 笔记 ${g.note_n}</span>` : ''}
-        </div>
-        <div class="rv-g-meta">
-          <span>${rvClock(g.started)}${done && g.ended ? ' – ' + rvClock(g.ended) : ''}</span>
-          <span>${answered < n ? `已答 ${answered}/${n} 题` : `${n} 题`}</span>
-          <span title="逐题作答用时合计（与上方「答题用时」同一口径）">用时 ${durTight(g.spent_ms || g.total_ms)}</span>
-          ${g.timeout_n ? `<span style="color:var(--warn)">超时 ${g.timeout_n}</span>` : ''}
-          ${g.dropped_n ? `<span style="color:var(--ink-3)">丢弃 ${g.dropped_n}</span>` : ''}
-        </div>
-        <div class="pbar rv-pbar"><i style="width:${pct}%"></i></div>
-      </div>
-      <div class="rv-g-acc">
-        <b style="color:${!answered ? 'var(--ink-3)' : acc >= 80 ? 'var(--ok)' : acc >= 60 ? 'var(--brand)' : 'var(--bad)'}">${answered ? acc + '%' : '—'}</b>
-        <span>${g.right_n || 0}/${answered}</span>
-      </div>
-      <span class="rv-caret" aria-hidden="true">▾</span>
-    </div>
-    <div class="rv-g-body" hidden></div>
-  </section>`;
-}
 
-function coachRvItemsHtml(g, items) {
-  if (!items.length) return '<p class="sub" style="padding:14px">这组还没有作答记录。</p>';
-  const review = g.mode === 'review';
-  return `<p class="sub" style="margin:8px 2px 6px">点任意一题看完整原题、答案与解析；陪读写过的笔记直接显示在题干下面。</p>
-    <div class="tbl-wrap cards rv-tbl"><table>
-    <thead><tr><th>#</th><th>模块</th><th>题干</th><th>选择</th><th>正确答案</th><th>结果</th><th>用时</th></tr></thead>
-    <tbody>${items.map((it, i) => {
-    const choice = it.dropped ? '<span class="sub">—</span>'
-      : it.choice ? `<b>${esc(it.choice)}</b>`
-        : (review ? '<span class="sub">—</span>' : '<span class="rv-none">未答</span>');
-    const note = String(it.note || '').trim();
-    return `<tr class="rv-row${it.dropped ? ' is-dropped' : ''}" data-qid="${esc(it.qid)}"
-        data-id="${it.id || ''}" data-choice="${esc(it.choice || '')}" title="点击查看原题">
-        <td data-label="" data-inline>${it.pos || i + 1}</td>
-        <td data-label="模块">${esc(it.module || '')}${it.category ? `<span class="sub">${esc(it.category)}</span>` : ''}</td>
-        <td data-label="题干">${esc(it.stem || '（题目已下架）')}${note ? `<div class="rv-note"><b>📝 陪读笔记</b>${esc(note)}</div>` : ''}</td>
-        <td data-label="选择" data-inline>${choice}</td>
-        <td data-label="正确答案" data-inline><b style="color:var(--ok)">${esc(it.answer || '')}</b></td>
-        <td data-label="结果" data-inline>${rvResult(it, g)}</td>
-        <td data-label="用时" data-inline>${it.ms ? durTight(it.ms) : '—'}</td>
-      </tr>`;
-  }).join('')}</tbody></table></div>`;
-}
 
-async function loadCoachToday(uid) {
-  const body = document.getElementById('tl-today-body');
-  if (!body || !uid) return;
-  const subEl = document.getElementById('tl-today-sub');
-  let d = null;
-  try { d = await API('/api/coach/today?uid=' + encodeURIComponent(uid)); }
-  catch (e) {
-    body.innerHTML = `<p class="sub" style="color:var(--bad);margin:0">加载失败：${esc(e.message || e)}</p>`;
-    if (subEl) subEl.textContent = '';
+/* ---------- 代看外壳：进入某人的视角后，页面顶部这一条 + 实时卡 ----------
+   数据区完全复用他自己的视图（总览 / 统计 / 错题本 / 收藏 / 浏览 / 考点），
+   这里只补两件他自己页面上没有的东西：只读提示条、他的实时答题状态。 */
+let VAS_TIMER = null;
+
+async function enterViewAs(uid) {
+  if (!uid) { location.hash = '#/coach'; return; }
+  loading('正在打开…');
+  let name = '对方';
+  try {
+    const d = await API('/api/teacher/student?uid=' + encodeURIComponent(uid));
+    const s = d.student || {};
+    name = s.name || s.username || '对方';
+  } catch (e) {
+    fatal((e && e.message) || '打不开这位陪伴对象的视角');
     return;
   }
-  const sum = d.summary || {}, groups = d.groups || [];
-  const acc = sum.answered ? Math.round((sum.right || 0) / sum.answered * 100) : 0;
-  if (subEl) subEl.textContent = groups.length ? `${d.date || ''} · 与陪读自己看到的完全一致` : '';
-  body.innerHTML = groups.length ? `
-    <div class="tl-today-sum">
-      <span><b>${sum.groups || 0}</b> 组</span>
-      <span><b>${sum.answered || 0}</b> 题已完成</span>
-      <span><b>${acc}%</b> 正确率</span>
-      <span><b>${durTight(sum.ms || 0)}</b> 答题用时</span>
-    </div>
-    <div class="rv-list">${groups.map(coachRvCard).join('')}</div>`
-    : '<p class="sub" style="margin:0">这位陪读今天还没有练习记录。等他开始做题，这里会按组列出每一道题。</p>';
+  setViewAs(uid, name);
+  clearSession();                    // 不继承任何人的半套卷
+  const before = (location.hash || '#/').split('?')[0];
+  if (before === '#/') route();      // 已经在总览：hash 不会再变，手动补一次
+  else location.hash = '#/';         // 交给 route() 渲染「他的总览」
+}
 
-  const byGid = {}; groups.forEach(g => byGid[g.gid] = g);
-  body.querySelectorAll('.rv-g').forEach(box => {
-    const g = byGid[box.dataset.gid]; if (!g) return;
-    const head = box.querySelector('.rv-g-head');
-    const b = box.querySelector('.rv-g-body');
-    head.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); head.click(); } };
-    head.onclick = async () => {
-      const open = !box.classList.contains('open');
-      box.classList.toggle('open', open);
-      head.setAttribute('aria-expanded', String(open));
-      b.hidden = !open;
-      if (!open || b.dataset.loaded) return;
-      let items = g.items;
-      if (!items) {
-        b.innerHTML = '<div class="loading">加载题目…</div>';
-        try {
-          const dd = await API('/api/coach/group?uid=' + encodeURIComponent(uid) + '&gid=' + encodeURIComponent(g.gid));
-          items = dd.items || [];
-        } catch (e) {
-          b.innerHTML = `<p class="sub" style="color:var(--bad);padding:12px">加载失败：${esc(e.message || e)}</p>`;
-          return;
-        }
-      }
-      b.dataset.loaded = '1';
-      b.innerHTML = coachRvItemsHtml(g, items);
-      b.querySelectorAll('tr.rv-row').forEach(tr => {
-        tr.onclick = () => tQPop(uid, { id: tr.dataset.id, qid: tr.dataset.qid, choice: tr.dataset.choice });
-      });
-    };
+function exitViewAs() {
+  if (VAS_TIMER) { clearInterval(VAS_TIMER); VAS_TIMER = null; }
+  setViewAs('', '');
+  refreshSide().catch(() => { });    // 侧栏那六个数字换回我自己的，别留着对方的
+  const before = (location.hash || '#/').split('?')[0];
+  if (before === '#/') viewDashboard().catch(e => fatal((e && e.message) || e));
+  else if (before === '#/coach') viewCoach();
+  else location.hash = '#/coach';
+}
+
+function renderCoachShell() {
+  const box = document.getElementById('coach-shell');
+  if (!box) return;
+  if (!VIEWAS) {
+    box.hidden = true; box.innerHTML = ''; box.dataset.h = '';
+    document.documentElement.removeAttribute('data-viewas');
+    if (VAS_TIMER) { clearInterval(VAS_TIMER); VAS_TIMER = null; }
+    return;
+  }
+  box.hidden = false;
+  document.documentElement.setAttribute('data-viewas', '1');
+  box.innerHTML = `
+    <div class="vas-bar">
+      <span class="vas-eye" aria-hidden="true">👁</span>
+      <div class="vas-txt">
+        <b>正在以「${esc(VIEWAS_NAME || '对方')}」的视角查看</b>
+        <span class="vas-sub">数字全部来自对方账号 · 只读，不能替他答题、记笔记或改设置</span>
+      </div>
+      <button class="btn ghost sm" id="vas-exit" type="button">退出查看</button>
+    </div>
+    <div class="card tlive vas-live" id="vas-live"><div class="loading">读取对方的答题状态…</div></div>`;
+  const ex = document.getElementById('vas-exit');
+  if (ex) ex.onclick = exitViewAs;
+  const live = document.getElementById('vas-live');
+  if (live) live.addEventListener('click', ev => {
+    const t = ev.target.closest('[data-open]');
+    if (!t) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed && String(sel).trim()) return;   // 正在选字，不算点击
+    tQPop(t.getAttribute('data-uid'), {
+      id: t.getAttribute('data-id'), qid: t.getAttribute('data-qid'),
+      choice: t.getAttribute('data-choice') || '',
+    });
   });
+  pollLiveAs();
+}
+
+/* 实时卡：只读服务端内存里的答题心跳，3 秒一次；内容没变不重绘（免得翻材料时被打断） */
+async function pollLiveAs() {
+  if (VAS_TIMER) { clearInterval(VAS_TIMER); VAS_TIMER = null; }
+  if (!VIEWAS) return;
+  const tick = async () => {
+    if (document.hidden || !VIEWAS) return;
+    try {
+      const r = await API('/api/coach/live?uid=' + encodeURIComponent(VIEWAS));
+      const box = document.getElementById('vas-live');
+      if (!box) return;
+      const name = (r.student && (r.student.name || r.student.username)) || VIEWAS_NAME;
+      const html = tLiveHtml(r.live, name, VIEWAS);
+      if (box.dataset.h === html) return;
+      const prev = (box.querySelector('.tlive-mat-b') || {}).scrollTop || 0;
+      box.innerHTML = html; box.dataset.h = html;
+      const nb = box.querySelector('.tlive-mat-b');
+      if (nb && prev) nb.scrollTop = prev;
+    } catch (e) { /* 掉线就安静等下一轮 */ }
+  };
+  await tick();
+  VAS_TIMER = setInterval(tick, 3000);
 }
 
 /* 陪伴者模块：普通账号的一个功能（不再是独立只读角色）
@@ -5420,7 +5665,7 @@ async function viewCoach() {
   app.innerHTML = `
   <h1 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">陪伴者
     <a class="btn ghost" href="#/coach/encourage" style="font-size:13px;padding:5px 12px">💌 鼓励信息</a></h1>
-  <p class="sub">和信任的人互相陪伴：把自己的链接码给对方，或录入对方的链接码，就能互看学习情况、互相推题。查看对方数据始终只读，不会改动对方任何记录。</p>
+  <p class="sub">和信任的人互相陪伴：把自己的链接码给对方，或录入对方的链接码，就能互看学习情况、互相推题。<b>点任意一张卡就进入他的视角</b>——看到的总览、统计、错题本、收藏都和他自己打开时一模一样，区别只有一个：不能替他答题、记笔记或改设置。</p>
 
   <div class="card" style="max-width:760px">
     <h2 style="margin-top:0">🔑 我的链接码</h2>
@@ -5582,177 +5827,6 @@ function tLiveHtml(live, name, uid) {
       <span class="sub">累计用时 <b>${mmss(lv.all_ms)}</b></span>
       ${choice ? `<span class="sub">陪读已选 <b>${esc(choice)}</b></span>` : '<span class="sub">还没选答案</span>'}
     </div>`;
-}
-
-async function viewTeacherStudent(uid) {
-  loading();
-  if (!uid) { location.hash = '#/coach'; return; }
-  const d = await API('/api/teacher/student?uid=' + encodeURIComponent(uid));
-  const s = d.student || {}; const b = d.brief || {};
-  const days = d.days || []; const recent = d.recent || []; const wrong = d.wrong || []; const exams = d.exams || [];
-  const dayMap = {}; days.forEach(x => dayMap[x.day] = +x.ms || 0);
-  const axis = [];
-  for (let i = 13; i >= 0; i--) {
-    const dt = new Date(); dt.setDate(dt.getDate() - i);
-    axis.push(dt.getFullYear() + '-' + String(dt.getMonth() + 1).padStart(2, '0') + '-' + String(dt.getDate()).padStart(2, '0'));
-  }
-  const maxMs = Math.max(1, ...axis.map(a => dayMap[a] || 0));
-  // 与被看护陪读自己的总览面板一致：模块进度 + 掌握度分布
-  const dueMod = {}; (b.due_by_module || []).forEach(x => dueMod[x.m] = x.n);
-  const mastery = b.mastery || {}; const mkeys = ['学习中', '初记', '短期', '长期', '稳固'];
-  const maxM = Math.max(1, ...mkeys.map(k => mastery[k] || 0));
-  const bars = axis.map(a => {
-    const ms = dayMap[a] || 0;
-    const h = ms ? Math.max(3, Math.round(ms * 76 / maxMs)) : 2;
-    return `<div class="tbar-col" title="${a} · ${durText(ms)}">
-      <i style="height:${h}px;${ms ? '' : 'opacity:.25'}"></i>
-      <span>${+a.slice(8)}</span></div>`;
-  }).join('');
-
-  app.innerHTML = `
-  <a class="back-link" href="#/coach">← 返回陪伴者</a>
-  <h1 style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">${esc(s.name || s.username || '陪读')}
-    <span class="tag">${esc(s.username || '')}</span>${liveDot(b.live)}</h1>
-  <p class="sub">查看视图：所有数字直接来自对方的账号数据，且不能修改对方任何记录。可用下方「推题」把自己觉得有价值的题推给对方。</p>
-
-  <div class="card tlive" id="tlive">${tLiveHtml(b.live, s.name || s.username, uid)}</div>
-
-  <div class="grid g4" style="margin-top:16px">
-    <div class="card kpi warn"><div class="n">${b.due_review || 0}</div><div class="l">🔔 今日待复习</div></div>
-    <div class="card kpi brand"><div class="n">${(b.new || 0).toLocaleString()}</div><div class="l">✨ 未学新题</div></div>
-    <div class="card kpi ok kpi-link" id="kpi-today" role="button" tabindex="0" style="cursor:pointer" title="点开看陪读今天每一道题的作答与笔记"><div class="n">${b.studied_today || 0}</div><div class="l">✅ 今日已练习</div><div class="kpi-more">看今日回溯 →</div></div>
-    <div class="card kpi purple"><div class="n">${(b.learned || 0).toLocaleString()}</div><div class="l">📈 已纳入复习</div></div>
-  </div>
-  <div class="grid g4" style="margin-top:12px">
-    <div class="card kpi"><div class="n" style="color:var(--bad)">${b.wrong || 0}</div><div class="l">📕 错题本</div></div>
-    <div class="card kpi"><div class="n" style="color:var(--purple)">${b.fav || 0}</div><div class="l">⭐ 我的收藏</div></div>
-    <div class="card kpi brand time" title="今日学习时长（做题 + 看解析 + 复习）：${durText(b.today_ms)}"><div class="n">${durHtml(b.today_ms)}</div><div class="l">⏱️ 今日学习时长</div></div>
-    <div class="card kpi purple time" title="累计学习时长（做题 + 看解析 + 复习）：${durText(b.total_ms)}"><div class="n">${durHtml(b.total_ms)}</div><div class="l">⏳ 总学习时长</div></div>
-  </div>
-
-  <div class="card" id="tl-today" style="margin-top:16px">
-    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
-      <h2 style="margin:0">🗓 今日回溯</h2>
-      <span class="sub" style="margin:0" id="tl-today-sub"></span>
-    </div>
-    <p class="sub" style="margin:6px 0 12px">和陪读自己点开的「今日回溯」是同一份记录：按组列出今天做过的每一道题，他选了什么、对没对、用了多久，写过的笔记也在这里。<b>只读</b>，不能替他改任何东西。</p>
-    <div id="tl-today-body"><div class="loading">加载中…</div></div>
-  </div>
-
-  <div class="card" style="margin-top:16px">
-    <h2 style="margin-top:0">近 14 天学习时长</h2>
-    <div class="tbars">${bars}</div>
-  </div>
-
-  <h2>各模块进度</h2>
-  <div class="grid g2">
-    ${(b.by_module || []).map(m => {
-      const pct = m.total ? Math.round(m.learned / m.total * 100) : 0;
-      return `<div class="card"><div class="row" style="justify-content:space-between">
-        <b>${esc(m.m)}</b><span class="tag">已学 ${m.learned}/${m.total} (${pct}%)</span></div>
-        <div class="bar"><i style="width:${pct}%"></i></div>
-        <div class="sub" style="margin:8px 0 0">今日待复习：${dueMod[m.m] || 0}</div>
-      </div>`;
-    }).join('')}
-  </div>
-
-  <h2>掌握度分布（按复习间隔）</h2>
-  <div class="card">
-    ${mkeys.map(k => `<div class="row" style="justify-content:space-between;margin:6px 0">
-      <span>${k}</span><span><b>${(mastery[k] || 0).toLocaleString()}</b>
-      <span style="display:inline-block;vertical-align:middle;width:180px;height:8px;background:var(--panel2);border-radius:9px;margin-left:10px">
-      <span style="display:block;height:100%;width:${(mastery[k] || 0) / maxM * 100}%;background:linear-gradient(90deg,var(--brand),var(--purple));border-radius:9px"></span></span></span>
-    </div>`).join('')}
-  </div>
-
-  <div class="card" style="margin-top:16px">
-    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
-      <h2 style="margin:0">最近作答</h2>
-      <span class="sub" style="margin:0">累计 ${b.answered || 0} 题 · 正确率 ${b.answered ? b.accuracy + '%' : '—'} · 带 📝 的题写过笔记 · 点任意一行看原题</span>
-    </div>
-    ${recent.length ? `<div class="tbl-wrap cards"><table><thead><tr><th>时间</th><th>模块</th><th>题型</th><th>题干</th><th>结果</th></tr></thead><tbody>
-      ${recent.map(r => `<tr class="qrow" data-id="${r.id || ''}" data-qid="${esc(r.qid || '')}" data-choice="${esc(r.choice || '')}" title="点击查看原题">
-        <td class="nowrap" data-label="时间">${agoIso(r.ts)}</td><td class="nowrap" data-label="模块">${esc(r.module || '')}</td>
-        <td class="nowrap" data-label="题型">${esc(r.category || '')}</td><td data-label="题干">${esc(r.stem || '')}…${r.has_note ? ' <span class="tag" style="color:var(--brand)">📝</span>' : ''}</td>
-        <td data-label="结果">${r.right ? '<span class="tag vbadge">正确</span>' : '<span class="tag" style="background:var(--paper-2);color:var(--bad)">错误</span>'}${r.timeout ? ' <span class="tag">超时</span>' : ''}</td></tr>`).join('')}
-      </tbody></table></div>` : '<p class="sub" style="margin:8px 0 0">还没有作答记录。</p>'}
-  </div>
-
-  <div class="card" style="margin-top:16px">
-    <div class="row" style="justify-content:space-between;flex-wrap:wrap;gap:8px">
-      <h2 style="margin:0">错题（按错误次数）</h2>
-      ${wrong.length ? '<span class="sub" style="margin:0">点任意一行看原题</span>' : ''}
-    </div>
-    ${wrong.length ? `<div class="tbl-wrap cards"><table><thead><tr><th>模块</th><th>题干</th><th>错误</th><th>下次复习</th></tr></thead><tbody>
-      ${wrong.map(w => `<tr class="qrow" data-id="${w.id || ''}" data-qid="${esc(w.qid || '')}" title="点击查看原题">
-        <td class="nowrap" data-label="模块">${esc(w.module || '')}<br><span class="sub">${esc(w.category || '')}</span></td>
-        <td data-label="题干">${esc(w.stem || '')}…</td><td class="nowrap" data-label="错误">${w.wrong} 次</td><td class="nowrap" data-label="下次复习">${esc(w.due || '—')}</td></tr>`).join('')}
-      </tbody></table></div>` : '<p class="sub" style="margin:8px 0 0">暂无错题。</p>'}
-  </div>
-
-  <div class="card" style="margin-top:16px">
-    <h2 style="margin-top:0">模拟考试</h2>
-    ${exams.length ? `<div class="tbl-wrap cards"><table><thead><tr><th>时间</th><th>试卷</th><th>得分</th><th>正确</th><th>用时</th></tr></thead><tbody>
-      ${exams.map(x => `<tr><td class="nowrap" data-label="时间">${agoIso(x.ts)}</td><td data-label="试卷">${esc(x.title || '')}</td>
-        <td class="nowrap" data-label="得分">${x.score}</td><td class="nowrap" data-label="正确">${x.correct}/${x.total}</td><td class="nowrap" data-label="用时">${durText((x.duration || 0) * 1000)}</td></tr>`).join('')}
-      </tbody></table></div>` : '<p class="sub" style="margin:0">还没有模考记录。</p>'}
-  </div>
-
-  <div class="card" style="margin-top:16px">
-    <div class="row" style="justify-content:space-between">
-      <span class="sub" style="margin:0">需要取消对这位陪读的查看权限？</span>
-      <button class="btn ghost" id="t-unlink">解除绑定</button>
-    </div>
-  </div>`;
-
-  app.querySelectorAll('tr.qrow').forEach(tr => {
-    tr.onclick = () => tQPop(uid, { id: tr.dataset.id, qid: tr.dataset.qid, choice: tr.dataset.choice || '' });
-  });
-
-  // 「今日已练习」点一下就滚到下面的今日回溯
-  const kpiToday = document.getElementById('kpi-today');
-  if (kpiToday) {
-    const jump = () => { const t = document.getElementById('tl-today'); if (t) t.scrollIntoView({ behavior: 'smooth', block: 'start' }); };
-    kpiToday.onclick = jump;
-    kpiToday.onkeydown = e => { if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); jump(); } };
-  }
-  loadCoachToday(uid);
-
-  // 实时卡：点「完整习题」或题干区都直接开整题视图（浏览器里选字复制时不算点击）
-  const tliveBox = document.getElementById('tlive');
-  if (tliveBox) tliveBox.addEventListener('click', (ev) => {
-    const t = ev.target.closest('[data-open]');
-    if (!t) return;
-    const sel = window.getSelection();
-    if (sel && !sel.isCollapsed && String(sel).trim()) return;
-    const c = t.getAttribute('data-choice') || '';
-    tQPop(t.getAttribute('data-uid'), { id: t.getAttribute('data-id'), qid: t.getAttribute('data-qid'), choice: c });
-  });
-
-  document.getElementById('t-unlink').onclick = async () => {
-    if (!confirm('解除后你将看不到该陪读的任何记录，确定吗？')) return;
-    await POST('/api/teacher/unlink', { uid: s.id });
-    location.hash = '#/coach';
-  };
-
-  state.tpoll = setInterval(async () => {
-    if (document.hidden) return;
-    if ((location.hash || '').split('?')[0] !== '#/coach/peer') return;
-    try {
-      const r = await API('/api/teacher/live?uid=' + encodeURIComponent(uid));
-      const box = document.getElementById('tlive');
-      if (box) {
-        // 只在内容真的变化时重绘：否则陪伴者读到材料一半会被 3 秒轮询打断
-        const html = tLiveHtml(r.live, (r.student && r.student.name) || s.name, uid);
-        if (box.dataset.h !== html) {
-          const prevTop = (box.querySelector('.tlive-mat-b') || {}).scrollTop || 0;
-          box.innerHTML = html; box.dataset.h = html;
-          const nb = box.querySelector('.tlive-mat-b');
-          if (nb && prevTop) nb.scrollTop = prevTop;
-        }
-      }
-    } catch (e) { }
-  }, 3000);
 }
 
 /* 点开陪读正在做/做过的题：与练习页同一套排版，完整材料 + 题干 + 选项 + 答案 + 解析 */
@@ -5998,6 +6072,8 @@ async function openEncThread(rid, opt) {
     </div>
   </div>`;
   document.body.appendChild(mask);
+  // 代看只读：寄语是两个人的私密对话，查看视角下既不能看别人收到的、也不能以他的名义发。
+  if (VIEWAS) { try { mask.querySelector('.enc-foot').remove(); } catch (e) { } }
   const close = () => {
     mask.remove(); document.removeEventListener('keydown', onEsc);
     const cb = ENC_CUR && ENC_CUR.onclose; ENC_CUR = null;
@@ -6100,7 +6176,7 @@ async function refreshEncBlock() {
 /* 侧栏未读角标：陪读看陪伴者回了几条，陪伴者看陪读回了几条 */
 async function refreshEncDot() {
   const el = document.getElementById('nav-enc-dot'); if (!el) return;
-  if (!tok()) { el.style.display = 'none'; return; }
+  if (!tok() || VIEWAS) { el.style.display = 'none'; return; }
   try {
     const d = await API('/api/encourage/unread');
     if (d && d.n > 0) { el.textContent = d.n > 99 ? '99+' : d.n; el.style.display = 'inline-flex'; }
@@ -6111,7 +6187,7 @@ async function refreshEncDot() {
 /* 侧栏推题未读角标 */
 async function refreshPushDot() {
   const el = document.getElementById('nav-push-dot'); if (!el) return;
-  if (!tok()) { el.style.display = 'none'; return; }
+  if (!tok() || VIEWAS) { el.style.display = 'none'; return; }
   try {
     const d = await API('/api/push/list?box=in');
     const n = (d && d.unread) || 0;
@@ -6418,6 +6494,7 @@ async function logoutUser() {
     body: JSON.stringify({ token: tok() }),
   }).catch(() => { });
   setTok(''); ME = null;
+  try { setViewAs('', ''); } catch (e) { }   // 换了账号就别再停在上一个人的视角里
   location.reload();
 }
 
@@ -6580,6 +6657,7 @@ async function prefsFlush() {
   const un = document.getElementById('user-name'); if (un) un.onclick = () => openUserMenu();
   syncUserChip();
   renderNav();       // 陪伴者账号只显示「陪读看板 / 鼓励信息」，陪读显示原有导航
+  if (VIEWAS) { try { renderCoachShell(); } catch (e) { } }   // 刷新后仍停在上次查看的那个人
   showAnnouncementIfNeeded();
   if (!isTeacher()) {
     stBoot();          // 学习时长心跳：登录后开始按秒累计（做题 / 看解析 / 复习 三段分开记）

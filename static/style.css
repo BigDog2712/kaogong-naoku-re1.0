@@ -629,6 +629,110 @@ html[data-theme="dark"] .answer-sheet .qtool-drop:hover{border-color:#d9755c;col
 .acc-row .pct{min-width:84px;text-align:right;font-size:13px;font-variant-numeric:tabular-nums;color:var(--ink-2)}
 .chipset{display:flex;gap:var(--s2);flex-wrap:wrap;margin-bottom:var(--s4)}
 
+/* ===== 正确率：首次 vs 复习 ===== */
+.acc-card{padding:var(--s5)}
+.acc-kpis{display:flex;gap:var(--s6);flex-wrap:wrap;margin-bottom:var(--s4)}
+.acc-kpi{display:flex;flex-direction:column;gap:2px;min-width:132px}
+.acc-kpi+.acc-kpi{border-left:1px solid var(--rule);padding-left:var(--s6)}
+.acc-kpi .lab{font-size:12px;color:var(--ink-3);letter-spacing:.02em}
+.acc-kpi b{font-family:var(--font-serif);font-size:2rem;line-height:1.1;font-weight:700;
+  font-variant-numeric:tabular-nums;color:var(--ink)}
+.acc-kpi b i{font-style:normal;font-size:.95rem;font-weight:400;color:var(--ink-3);
+  margin-left:1px;position:relative;top:-.32em}
+.acc-kpi b.rv{color:var(--accent)}
+.acc-kpi .meta{font-size:12px;color:var(--ink-3)}
+.acc-kpi .meta.up{color:var(--ok)}
+.acc-kpi .meta.down{color:var(--bad)}
+.acc-bar-head{display:flex;align-items:center;justify-content:space-between;gap:var(--s3);flex-wrap:wrap;margin-bottom:var(--s2)}
+.acc-cap{font-size:13px;font-weight:600;color:var(--ink-2)}
+.acc-svg{display:block;width:100%;height:auto;overflow:visible}
+.acc-grid{stroke:var(--rule);stroke-width:1}
+.acc-axis{fill:var(--ink-3);font-size:10.5px;font-family:var(--font-sans);font-variant-numeric:tabular-nums}
+.acc-bar{fill:var(--rule)}
+.acc-area{fill:url(#accFill)}
+.acc-line{fill:none;stroke:var(--brand);stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round}
+.acc-smooth{fill:none;stroke:var(--accent);stroke-width:1.6;stroke-dasharray:4 3;stroke-linecap:round;opacity:.85}
+.acc-dot{fill:var(--surface);stroke:var(--brand);stroke-width:1.6}
+.acc-dot.thin{opacity:.55;stroke-width:1.2}
+.acc-dot.now{fill:var(--brand);stroke:var(--surface);stroke-width:1.6}
+.acc-dot:hover{fill:var(--brand);stroke-width:2}
+.acc-legend{display:flex;gap:var(--s4);flex-wrap:wrap;align-items:center;margin-top:var(--s3);
+  font-size:12px;color:var(--ink-3)}
+.acc-legend .lg{display:inline-flex;align-items:center;gap:6px}
+.acc-legend .lg.tip{opacity:.85}
+.acc-legend i{display:inline-block;font-style:normal}
+.acc-legend i.ln{width:16px;height:2px;background:var(--brand);border-radius:2px}
+.acc-legend i.ln.solid{height:8px;width:22px;border-radius:3px}
+.acc-legend i.sm{width:16px;height:0;border-top:2px dashed var(--accent)}
+.acc-legend i.br{width:8px;height:10px;background:var(--rule);border-radius:2px}
+.acc-legend i.mk{width:2px;height:12px;background:var(--accent);border-radius:2px}
+.acc-legend i.sw{width:14px;height:14px;border-radius:4px}
+.acc-legend i.sw.a1{background:oklch(88% 0.058 32)}
+.acc-legend i.sw.a2{background:oklch(90% 0.070 70)}
+.acc-legend i.sw.a3{background:oklch(89% 0.075 128)}
+.acc-legend i.sw.a4{background:oklch(80% 0.100 152)}
+.acc-note{margin:var(--s3) 0 0;font-size:12px;line-height:1.65;color:var(--ink-3);
+  border-top:1px dashed var(--rule);padding-top:var(--s3)}
+.acc-empty{padding:var(--s6) 0;text-align:center;font-size:13px;color:var(--ink-3)}
+
+/* 模块/大类：实色条=首次，竖线=复习 */
+.accp{margin:13px 0}
+.accp-h{display:flex;justify-content:space-between;align-items:baseline;gap:var(--s3);margin-bottom:6px}
+.accp-h .nm{font-size:13px;color:var(--ink);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.accp-h .nums{display:flex;align-items:baseline;gap:var(--s3);flex-shrink:0;font-variant-numeric:tabular-nums}
+.accp-h .nums b{font-size:14px;color:var(--ink)}
+.accp-h .nums .rv{font-size:12px;color:var(--accent)}
+.accp-h .nums .qn{font-size:11.5px;color:var(--ink-3)}
+.accp-tr{position:relative;height:12px;background:var(--rule);border-radius:var(--radius-pill)}
+.accp-tr>i{display:block;height:100%;border-radius:var(--radius-pill);
+  background:linear-gradient(90deg,var(--brand-2),var(--brand))}
+.accp-tr .mk{position:absolute;top:-3px;width:2.5px;height:18px;background:var(--accent);
+  border-radius:2px;box-shadow:0 0 0 1.5px var(--surface);z-index:1}
+
+/* 天 × 模块矩阵 */
+.acc-matrix-wrap{overflow-x:auto;padding-bottom:2px}
+.acc-matrix{display:grid;gap:3px;min-width:520px}
+.acc-mhead{font-size:10.5px;color:var(--ink-3);text-align:center;line-height:18px;font-variant-numeric:tabular-nums}
+.acc-mhead.today{color:var(--ink);font-weight:700}
+.acc-mname{display:flex;align-items:center;justify-content:space-between;gap:6px;padding-right:8px;
+  font-size:12px;color:var(--ink-2);height:24px;min-width:0}
+.acc-mname em{font-style:normal;flex:1 1 0;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.acc-mname span{flex-shrink:0;font-size:11px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.acc-cell{height:24px;border-radius:5px;display:flex;align-items:center;justify-content:center;
+  font-size:11px;color:oklch(28% 0.02 70);font-variant-numeric:tabular-nums;
+  transition:transform .12s var(--ease)}
+.acc-cell.thin{opacity:.5}
+.acc-cell:hover{transform:scale(1.08);box-shadow:0 0 0 1.5px var(--ink-3);position:relative;z-index:2;opacity:1}
+.acc-cell.a0{background:var(--paper-2)}
+.acc-cell.a1{background:oklch(88% 0.058 32)}
+.acc-cell.a2{background:oklch(90% 0.070 70)}
+.acc-cell.a3{background:oklch(89% 0.075 128)}
+.acc-cell.a4{background:oklch(80% 0.100 152);color:oklch(26% 0.045 150)}
+html[data-theme="dark"] .acc-cell{color:oklch(94% 0.010 80)}
+html[data-theme="dark"] .acc-cell.a0{background:var(--paper-2)}
+html[data-theme="dark"] .acc-cell.a1{background:oklch(36% 0.062 32)}
+html[data-theme="dark"] .acc-cell.a2{background:oklch(40% 0.070 70)}
+html[data-theme="dark"] .acc-cell.a3{background:oklch(42% 0.072 130)}
+html[data-theme="dark"] .acc-cell.a4{background:oklch(48% 0.092 152)}
+html[data-theme="dark"] .acc-legend i.sw.a1{background:oklch(36% 0.062 32)}
+html[data-theme="dark"] .acc-legend i.sw.a2{background:oklch(40% 0.070 70)}
+html[data-theme="dark"] .acc-legend i.sw.a3{background:oklch(42% 0.072 130)}
+html[data-theme="dark"] .acc-legend i.sw.a4{background:oklch(48% 0.092 152)}
+@media (max-width:560px){
+  .acc-card{padding:var(--s4)}
+  /* 手机上一行一个：标签 + 数字 + 说明压成一行，比三块并排更好读 */
+  .acc-kpis{flex-direction:column;gap:6px}
+  .acc-kpi{flex-direction:row;align-items:baseline;gap:8px;min-width:0}
+  .acc-kpi+.acc-kpi{padding-left:0;border-left:0}
+  .acc-kpi .lab{flex:0 0 auto;font-size:11.5px}
+  .acc-kpi b{font-size:1.375rem}
+  .acc-kpi .meta{margin-left:auto;text-align:right;font-size:11.5px}
+  .accp-h .nm{max-width:130px}
+  .accp-h .nums .qn{display:none}
+  .acc-matrix{min-width:0}
+  .acc-legend{gap:var(--s3)}
+}
+
 /* ===== 专注模式 ===== */
 html[data-focus="1"] #sidebar{display:none}
 html[data-focus="1"] #app{max-width:760px;margin:0 auto}
@@ -1487,4 +1591,41 @@ html[data-theme="dark"] .tq-full .material img[flag="tex"]{
 @media(max-width:560px){
   .rev-progress #pp-txt{white-space:nowrap}
   .rev-progress #pp-stat{display:none}
+}
+
+/* ===== 代看外壳（陪伴者以只读视角查看对方）=====
+   进入某人的视角后，#coach-shell 挂在 #app 顶部（视图写在 #app-body 里，重绘不会冲掉它）：
+   上面一条只读提示，下面是他的实时答题状态。数据区完全复用他自己的页面。 */
+.coach-shell{margin:0 0 var(--s5)}
+.coach-shell[hidden]{display:none}
+.vas-bar{display:flex;align-items:center;gap:var(--s3);margin-bottom:var(--s3);
+  padding:10px var(--s4);border-radius:var(--radius);
+  background:color-mix(in oklab, var(--accent) 10%, var(--surface));
+  border:1px solid color-mix(in oklab, var(--accent) 34%, var(--rule))}
+.vas-eye{font-size:18px;line-height:1;flex:0 0 auto}
+.vas-txt{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.vas-txt b{font-size:14px;color:var(--ink);font-weight:600;line-height:1.4}
+.vas-sub{font-size:12px;color:var(--ink-3);line-height:1.5}
+.vas-live{margin:0}
+.vas-live .tlive-q{margin-top:8px}
+.tstu-go{margin-top:10px;padding-top:8px;border-top:1px dashed var(--rule);
+  font-size:12px;color:var(--brand);font-weight:600;letter-spacing:.01em}
+.tstu:hover .tstu-go{color:var(--accent)}
+@media (max-width:560px){
+  .vas-bar{flex-wrap:wrap;padding:10px var(--s3)}
+  .vas-bar>.btn{width:100%}
+  .vas-sub{font-size:11.5px}
+}
+/* 代看时总览里替代「开始复习 / 练习新题」的一行说明 */
+.ro-hint{display:inline-flex;align-items:center;gap:6px;margin:0 0 var(--s3);
+  padding:8px 14px;border-radius:var(--radius-pill);font-size:12.5px;color:var(--ink-2);
+  background:var(--paper-2);border:1px dashed var(--rule-2)}
+/* 实时卡里的题干/选项可能很长（图形题整图就是几百像素），限高滚动，
+   别让"我来看数据"变成"先刷完别人这道题"；完整内容点「完整习题」看。 */
+.vas-live .tlive-stem-body{max-height:190px;overflow:auto}
+.vas-live .tlive-opts{max-height:170px;overflow:auto}
+.vas-live .tlive-mat-b{max-height:200px}
+@media (max-width:560px){
+  .vas-live .tlive-stem-body{max-height:150px}
+  .vas-live .tlive-opts{max-height:140px}
 }

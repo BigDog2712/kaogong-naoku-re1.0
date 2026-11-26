@@ -378,6 +378,16 @@ _LOCAL_IMG = os.path.join(HERE, "90-图片")
 IMG_ROOT = _LOCAL_IMG if os.path.isdir(_LOCAL_IMG) else os.path.join(VAULT_ROOT, "90-图片")
 STATIC = os.path.join(HERE, "static")
 OPS_DIR = os.path.join(HERE, "ops")          # 运营面板静态页（与用户端完全分离）
+
+
+def _is_within_directory(path, directory):
+    """Return whether the resolved path is directory itself or one of its descendants."""
+    root = os.path.realpath(directory)
+    target = os.path.realpath(path)
+    try:
+        return os.path.commonpath((root, target)) == root
+    except ValueError:  # Different drives on Windows cannot share a common path.
+        return False
 PORT = int(os.environ.get("PORT") or os.environ.get("KAOGONG_PORT") or "8300")
 mimetypes.add_type("image/webp", ".webp")
 
@@ -441,6 +451,38 @@ def unborrow():
                 c.rollback()
         finally:
             c.close()
+
+class read_tx:
+    """把几条 SELECT 圈进同一个读事务，拿到同一时刻的快照。
+
+    没有它时，「组状态」和「逐题作答」是两条独立语句：一个人在交卷、另一个人在回溯页刷新，
+    就可能读到「组已结束、逐题还是旧的」这种混合状态。SQLite 的读事务在 BEGIN 后
+    第一次 SELECT 时建立快照，直到 commit 都看到同一份数据；期间写请求会等这几十毫秒
+    （busy_timeout 30s），换来读出去的数字自洽。
+    只包住要一致的查询，解析卡片等重活放在事务外，别把写请求堵太久。
+    """
+
+    def __enter__(self):
+        c = db()
+        self.c = c
+        self.started = False
+        if not c.in_transaction:       # 已经在事务里（调用方自己开的）就沿用，不嵌套
+            c.execute("BEGIN")
+            self.started = True
+        return c
+
+    def __exit__(self, et, ev, tb):
+        if not self.started:
+            return False
+        try:
+            if et is None:
+                self.c.commit()
+            else:
+                self.c.rollback()
+        except Exception:
+            pass
+        return False
+
 
 def today():
     return datetime.date.today().isoformat()
@@ -695,8 +737,55 @@ def auth_uid(token):
     return r["id"] if r else None
 
 
+# ---------- 代看：陪伴者以只读视角查看对方的数据 ----------
+# 每个请求线程各自独立，do_GET 进 /api/ 时设置、finally 里清掉，
+# 绝不能让上一个请求残留的 uid 串到下一个请求上（线程是复用的）。
+_VIEW = threading.local()
+
+# 代看时只开放已审查的只读接口；新路由默认拒绝，避免意外暴露账号或私密数据。
+VIEWAS_READ_ALLOW = frozenset({
+    "/api/announcement",
+    "/api/coach/live",
+    "/api/bootstrap",
+    "/api/browse",
+    "/api/accuracy/v2",
+    "/api/doubts",
+    "/api/facets",
+    "/api/heatmap",
+    "/api/idseq",
+    "/api/kadian",
+    "/api/materials",
+    "/api/practice/group",
+    "/api/practice/today",
+    "/api/question",
+    "/api/review/plan",
+    "/api/search",
+    "/api/stats",
+    "/api/streak",
+    "/api/study-time/stat",
+    "/api/weak",
+    "/api/wrongbook/stats",
+})
+
+
+def viewas_uid():
+    """当前请求代看的目标账号；没在代看则为 None。"""
+    return getattr(_VIEW, "uid", None)
+
+
+def viewas_clear():
+    _VIEW.uid = None
+    _VIEW.me = None
+
+
 def need_uid(token):
-    """解析 token → 账号 id；失败抛 Unauthorized（上层转 401）。"""
+    """解析 token → 账号 id；失败抛 Unauthorized（上层转 401）。
+
+    代看中（陪伴者只读查看对方）直接返回对方 uid：所有读接口据此改查对方数据。
+    写接口在 do_POST 一律拒绝，所以不会写到对方账号上。"""
+    v = getattr(_VIEW, "uid", None)
+    if v:
+        return v
     uid = auth_uid(token)
     if not uid:
         raise Unauthorized()
@@ -736,6 +825,22 @@ def link_ok(a, b):
     return bool(q_one("""SELECT 1 FROM teacher_links
                          WHERE (teacher_uid=? AND student_uid=?)
                             OR (teacher_uid=? AND student_uid=?)""", (a, b, b, a)))
+
+
+def viewas_enter(me, sid):
+    """进入代看：对方存在且与我有陪伴关系才生效。返回是否生效。
+
+    注意必须用真实 uid 判断（不能用 need_uid，否则会把自己当成对方再校验一次）。"""
+    sid = (sid or "").strip()
+    if not sid or not me or sid == me:
+        return False
+    if not q_one("SELECT 1 FROM users WHERE id=?", (sid,)):
+        return False
+    if not link_ok(me, sid):
+        return False
+    _VIEW.uid = sid
+    _VIEW.me = me
+    return True
 
 
 # ---------- 陪读"正在答题"的实时状态（进程内存，单进程够用；120 秒没心跳即视为离线） ----------
@@ -1115,6 +1220,12 @@ def ensure_tables():
     CREATE TABLE IF NOT EXISTS study_time(
         uid TEXT NOT NULL, day TEXT NOT NULL, ms INTEGER DEFAULT 0,
         PRIMARY KEY(uid, day));
+    -- 学习时长的上报流水（只用来去重，不参与统计）。
+    -- 弱网下那笔请求可能已经写进 study_time、响应却没回来，前端按设计会连本带利重发；
+    -- 没有这张表就会把同一段时间记两次。rid 由前端每次增量生成，重发时保持不变。
+    CREATE TABLE IF NOT EXISTS study_credit(
+        uid TEXT NOT NULL, rid TEXT NOT NULL, day TEXT, ms INTEGER DEFAULT 0, ts TEXT,
+        PRIMARY KEY(uid, rid));
     -- 丢弃的题：练习题里「我不想再做这道」的题，抽题时全部排除；
     -- 记录保留在这里，真题浏览的「已丢弃」列表里随时能找回并恢复。
     CREATE TABLE IF NOT EXISTS discarded(
@@ -1336,7 +1447,11 @@ def get_setting(key, default=None):
 
 APP_RELEASE_VERSION = app_ver()
 APP_RELEASE_NOTES = ("本次更新：\n"
-                     "修复：练习新题偶发提示「网络连接失败」，以及做题较多后点「练习新题」进不去的问题。\n"
+                     "新增：数据统计新增「首次正确率」曲线与按天模块矩阵，第一次做题的水平变化一眼可见；\n"
+                     "新增：陪伴者点开某个人就能进入他的视角，总览、数据统计、错题本、收藏、真题浏览都和他自己打开时一样，页顶保留他的实时答题状态；\n"
+                     "优化：各模块、大类正确率拆成「首次」与「复习」两个数字，复习成绩不再混进真实水平；\n"
+                     "优化：查看视角下答题与复习入口自动收起，不会误改对方记录，退出即回到陪伴者页；\n"
+                     "修复：网络不佳时学习时长可能被重复记录，以及交卷瞬间打开今日回溯会看到一半新一半旧的数据。\n"
                      "刷新页面即可生效。")
 
 
@@ -1796,6 +1911,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    def handle_one_request(self):
+        """用户刷新 / 切走 / 锁屏时浏览器会直接掐断连接，标准库会打一整屏 traceback。
+        这不是服务端错误，静默掉即可；其它异常照旧抛出，不掩盖真问题。"""
+        try:
+            super().handle_one_request()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            self.close_connection = True
+
+    def handle_error(self, request, client_address):
+        """兜住 finish() 阶段（写响应尾巴）的断连：异常不在 handle_one_request 里，
+        但同样是用户侧断开，不该刷 traceback。"""
+        import sys as _sys
+        et = _sys.exc_info()[0]
+        if et and issubclass(et, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
     # gzip 压缩结果缓存（静态文件按 path+mtime 复用，避免每请求重复压缩）
     _GZ_CACHE = {}
     _GZ_TYPES = ("text/", "application/json", "application/javascript")
@@ -1929,8 +2061,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, data, "application/javascript; charset=utf-8",
                               extra={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"})
         if path.startswith("/static/"):
-            fp = os.path.normpath(os.path.join(STATIC, path[len("/static/"):]))
-            if not fp.startswith(STATIC):
+            fp = os.path.join(STATIC, path[len("/static/"):])
+            if not _is_within_directory(fp, STATIC):
                 return self._send(403, {"error": "forbidden"})
             # 页面脚本/样式：内容随 ?v= 版本串变化 → 强缓存 30 天，版本升级即换 URL 必回源，
             # 日常访问零协商 RTT（此前 no-cache 每次都多付一个往返）
@@ -1939,15 +2071,25 @@ class Handler(BaseHTTPRequestHandler):
             return self._file(fp, cache=True, max_age=600)
         if path.startswith("/90-图片/"):
             rel = path[len("/90-图片/"):]
-            fp = os.path.normpath(os.path.join(IMG_ROOT, rel))
-            if not fp.startswith(IMG_ROOT):
+            fp = os.path.join(IMG_ROOT, rel)
+            if not _is_within_directory(fp, IMG_ROOT):
                 return self._send(403, {"error": "forbidden"})
             if not os.path.exists(fp):  # 缺图兜底：返回"图片暂缺"占位 WebP，避免破图图标
                 fp = os.path.join(IMG_ROOT, "__missing__.webp")
             return self._file(fp, cache=True, max_age=2592000)  # 图片内容不变，长缓存省回源
         if path.startswith("/api/"):
             borrow()   # 本请求独占一条连接（多线程不再共用，杜绝 database is locked）
+            viewas_clear()          # 线程会复用：先清掉上一次可能残留的代看身份
             try:
+                sid = (g("as") or "").strip()
+                if sid:
+                    me = auth_uid(g("token"))
+                    if not me:
+                        raise Unauthorized()
+                    if not viewas_enter(me, sid):
+                        return self._send(403, {"error": "代看权限已失效，请返回陪伴页重新进入", "code": "viewas_expired"})
+                    if path not in VIEWAS_READ_ALLOW:
+                        return self._send(403, {"error": "此接口不支持代看视角", "code": "viewas_denied"})
                 return self.api(path, g)
             except Unauthorized:
                 return self._send(401, {"error": "未登录或登录已失效，请重新登录"})
@@ -1957,6 +2099,7 @@ class Handler(BaseHTTPRequestHandler):
                 import traceback; traceback.print_exc()
                 return self._send(500, {"error": str(e)})
             finally:
+                viewas_clear()
                 unborrow()
         return self._send(404, {"error": "no route"})
 
@@ -1971,6 +2114,10 @@ class Handler(BaseHTTPRequestHandler):
             payload = {}
         if path in ("/ops/api/login", "/ops/api/logout"):
             return self.ops_post(path, payload)
+        # 代看是只读的：任何写请求都不接受 as（URL 或 body 都不收）。
+        # 若不拦，请求会以「我以为在改他」的印象写进自己的账号，数据就错位了。
+        if payload.get("as") or "as=" in (u.query or ""):
+            return self._send(403, {"error": "查看视角为只读，不能修改数据"})
 
         routes = {
             "/api/grade": self.api_grade,
@@ -2295,6 +2442,19 @@ class Handler(BaseHTTPRequestHandler):
                                     "code": (q_one("SELECT IFNULL(link_code,'') c FROM users WHERE id=?",
                                                    (uid,)) or {}).get("c", "")})
 
+        if path == "/api/coach/live":
+            # 代看时的实时卡：只读进程内存里的答题心跳，权限同样来自双向陪伴关系。
+            # 用真实 token 解析 uid（不能用 need_uid：代看中它会返回对方，等于自己校验自己）。
+            me = auth_uid(g("token"))
+            sid = (g("uid") or "").strip()
+            if not me or not sid or not link_ok(me, sid):
+                return self._send(403, {"error": "没有该陪读的查看权限"})
+            u = q_one("SELECT id,name,username FROM users WHERE id=?", (sid,))
+            if not u:
+                return self._send(404, {"error": "账号不存在"})
+            live = live_get(sid) or {"online": False, "status": "idle"}
+            return self._send(200, {"ok": True, "live": live, "student": u})
+
         if path == "/api/coach/today":
             # 陪伴者看某位陪读的「今日回溯」：只读，权限来自双向陪伴关系。
             # 与陪读自己的 /api/practice/today 用同一个 _today_payload，口径完全一致。
@@ -2599,7 +2759,8 @@ class Handler(BaseHTTPRequestHandler):
             if not r:
                 return self._send(404, {"error": "no such question"})
             srs = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (r["qid"], uid))
-            if not srs:   # 按需生成：直接看某题也补一条空白进度，详情页/收藏才能正常标状态
+            if not srs and not viewas_uid():
+                # 代看时不要给对方补空白进度行——只读就是不写，哪怕只是一行 new
                 ensure_srs_rows(uid, [r["qid"]])
                 srs = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (r["qid"], uid))
             dropped = bool(q_one("SELECT 1 x FROM discarded WHERE uid=? AND qid=?", (uid, r["qid"])))
@@ -2783,6 +2944,102 @@ class Handler(BaseHTTPRequestHandler):
                 "module": agg("module"), "category": agg("category"),
                 "region": agg("region"), "year": agg("year"),
             })
+
+        if path == "/api/accuracy/v2":
+            """正确率拆成「首次」与「复习」两套口径。
+
+            老 /api/accuracy 拿 srs 里累计的 correct/wrong 直接相除：复习时自评「会了」
+            也算答对，复习越多数字越漂亮，跟真实水平脱钩。这里改用 practice_items 里
+            客观的选项判定（choice 与 answer 比对）：
+              · 首次 = 每道题最早一次「非复习组」的作答，按首次那天归日；
+              · 复习 = 复习组里重新选了选项的作答。
+            没选选项的（直接看答案 / 超时跳过）不进分母——把「不想做」算成「做错」
+            同样会让数字失真。
+            """
+            uid = need_uid(g("token"))
+            first_rows = q_all("""
+                WITH cand AS (
+                    SELECT it.qid qid,
+                           TRIM(IFNULL(it.choice, '')) ch,
+                           TRIM(IFNULL(it.answer, '')) an,
+                           substr(IFNULL(it.graded_at, gp.started), 1, 10) d,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY it.qid
+                               ORDER BY IFNULL(it.graded_at, gp.started), it.gid) rn
+                      FROM practice_items it
+                      JOIN practice_groups gp ON gp.gid = it.gid
+                     WHERE gp.uid = ? AND it.graded_at IS NOT NULL
+                       AND IFNULL(it.dropped, 0) = 0
+                       AND IFNULL(gp.mode, '') <> 'review'
+                       AND TRIM(IFNULL(it.choice, '')) <> ''
+                       AND TRIM(IFNULL(it.answer, '')) <> ''
+                )
+                SELECT c.d d, q.module m, q.category cat,
+                       CASE WHEN UPPER(c.ch) = UPPER(c.an) THEN 1 ELSE 0 END ok
+                  FROM cand c JOIN qdb.questions q ON q.qid = c.qid
+                 WHERE c.rn = 1""", (uid,))
+            review_rows = q_all("""
+                SELECT substr(IFNULL(it.graded_at, gp.started), 1, 10) d,
+                       q.module m, q.category cat,
+                       CASE WHEN UPPER(TRIM(it.choice)) = UPPER(TRIM(it.answer)) THEN 1 ELSE 0 END ok
+                  FROM practice_items it
+                  JOIN practice_groups gp ON gp.gid = it.gid
+                  JOIN qdb.questions q ON q.qid = it.qid
+                 WHERE gp.uid = ? AND gp.mode = 'review' AND it.graded_at IS NOT NULL
+                   AND IFNULL(it.dropped, 0) = 0
+                   AND TRIM(IFNULL(it.choice, '')) <> ''
+                   AND TRIM(IFNULL(it.answer, '')) <> ''""", (uid,))
+
+            def _pack(rows, keep_day_matrix=False):
+                by_day, by_mod, by_cat, by_day_mod, by_day_cat = {}, {}, {}, {}, {}
+                for r in rows:
+                    ok = int(r["ok"] or 0)
+                    d = (r["d"] or "")[:10]
+                    m = r["m"] or "未分类"
+                    cat = r["cat"] or "未分类"
+                    for box, k in ((by_day, d), (by_mod, m), (by_cat, cat)):
+                        a = box.get(k)
+                        if a is None:
+                            box[k] = [1, ok]
+                        else:
+                            a[0] += 1
+                            a[1] += ok
+                    if keep_day_matrix and d:
+                        for box, k in ((by_day_mod, (d, m)), (by_day_cat, (d, cat))):
+                            a = box.get(k)
+                            if a is None:
+                                box[k] = [1, ok]
+                            else:
+                                a[0] += 1
+                                a[1] += ok
+
+                def as_list(box, with_key="k"):
+                    out = [{"k": k, "n": v[0], "c": v[1],
+                            "acc": round(v[1] / v[0] * 100, 1) if v[0] else 0}
+                           for k, v in box.items()]
+                    out.sort(key=lambda x: (-x["n"], x["k"]))
+                    return out
+
+                days = [{"d": k, "n": v[0], "c": v[1],
+                         "acc": round(v[1] / v[0] * 100, 1) if v[0] else 0}
+                        for k, v in sorted(by_day.items()) if k]
+                # 曲线只留最近 400 天：够 90 天窗口和环比，也不至于把十年的碎日子全塞给前端
+                if len(days) > 400:
+                    days = days[-400:]
+                total_n = sum(v[0] for v in by_day.values())
+                total_c = sum(v[1] for v in by_day.values())
+                res = {"n": total_n, "c": total_c,
+                       "acc": round(total_c / total_n * 100, 1) if total_n else 0,
+                       "by_day": days, "by_module": as_list(by_mod), "by_category": as_list(by_cat)}
+                if keep_day_matrix:
+                    dm = [{"d": d, "k": k, "n": v[0], "c": v[1]} for (d, k), v in by_day_mod.items()]
+                    dc = [{"d": d, "k": k, "n": v[0], "c": v[1]} for (d, k), v in by_day_cat.items()]
+                    res["by_day_module"] = dm
+                    res["by_day_category"] = dc
+                return res
+
+            return self._send(200, {"first": _pack(first_rows, True),
+                                    "review": _pack(review_rows)})
 
         if path == "/api/weak":
             uid = need_uid(g("token"))
@@ -3921,6 +4178,8 @@ class Handler(BaseHTTPRequestHandler):
                 announcement = json.loads(row["value"])
             except Exception:
                 pass
+        if viewas_uid():
+            return self._send(200, {"announcement": announcement, "seen": False})
         read = q_one("SELECT value FROM user_settings WHERE uid=? AND key='announcement_read_id'", (uid,))
         return self._send(200, {"announcement": announcement,
                                 "seen": bool(announcement and read and read["value"] == announcement.get("id"))})
@@ -4067,15 +4326,30 @@ class Handler(BaseHTTPRequestHandler):
             parts["answer"] = ms                   # 老页面 / 只报总数：算作做题
         add = sum(parts.values())
         d = today()
+        # 前端每次「未确认的增量」带同一个 rid，重发时不变：弱网下请求已落库、响应却丢了的
+        # 那一次，重发会被这里认出来，只返回当前值，不再累加第二遍。
+        rid = (p.get("rid") or "").strip()[:48]
         if add:
             with _LOCK:
-                db().execute("""INSERT OR IGNORE INTO study_time(uid,day,ms,answer_ms,analysis_ms,review_ms)
-                                VALUES(?,?,0,0,0,0)""", (uid, d))
-                db().execute("""UPDATE study_time SET ms=ms+?, answer_ms=answer_ms+?,
-                                       analysis_ms=analysis_ms+?, review_ms=review_ms+?
-                                WHERE uid=? AND day=?""",
-                             (add, parts["answer"], parts["analysis"], parts["review"], uid, d))
+                dup = False
+                if rid:
+                    cur = db().execute(
+                        "INSERT OR IGNORE INTO study_credit(uid,rid,day,ms,ts) VALUES(?,?,?,?,?)",
+                        (uid, rid, d, add, now()))
+                    dup = (cur.rowcount == 0)
+                if not dup:
+                    db().execute("""INSERT OR IGNORE INTO study_time(uid,day,ms,answer_ms,analysis_ms,review_ms)
+                                    VALUES(?,?,0,0,0,0)""", (uid, d))
+                    db().execute("""UPDATE study_time SET ms=ms+?, answer_ms=answer_ms+?,
+                                           analysis_ms=analysis_ms+?, review_ms=review_ms+?
+                                    WHERE uid=? AND day=?""",
+                                 (add, parts["answer"], parts["analysis"], parts["review"], uid, d))
+                    # 流水只留两周，表不会无限长（每天几十条，删除代价可忽略）
+                    db().execute("DELETE FROM study_credit WHERE day<?",
+                                 ((datetime.date.today() - datetime.timedelta(days=14)).isoformat(),))
                 db().commit()
+                if dup:
+                    add = 0
         cur = q_one("""SELECT ms, IFNULL(answer_ms,0) a, IFNULL(analysis_ms,0) an, IFNULL(review_ms,0) r
                        FROM study_time WHERE uid=? AND day=?""", (uid, d)) or {}
         tot = q_one("""SELECT SUM(ms) s, SUM(IFNULL(answer_ms,0)) a, SUM(IFNULL(analysis_ms,0)) an,
@@ -4126,15 +4400,27 @@ class Handler(BaseHTTPRequestHandler):
         with_note=True 时把每题在该账号下的笔记一起带回（陪伴者需要看到陪读的想法）。
         """
         gid = (gid or "").strip()
-        gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
-        if not gp:
-            return None
-        items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
-                                IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
-                                IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
-                                s.id, s.module, s.category, s.kadian, s.stem
-                         FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
-                         WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
+        # 组状态与逐题作答必须来自同一份快照：另一个人正在交卷时，两条独立 SELECT
+        # 会拼出「组已结束、逐题还是旧的」。这里圈一个读事务，几十毫秒的代价换自洽。
+        with read_tx():
+            gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+            if not gp:
+                return None
+            items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
+                                    IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
+                                    IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
+                                    s.id, s.module, s.category, s.kadian, s.stem
+                             FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
+                             WHERE it.gid=? AND it.uid=? ORDER BY it.pos, it.rowid""", (gid, uid))
+            if not items:
+                # 兜底：分组功能刚上线时个别行没写 uid，按 gid 再取一次。
+                # 安全前提仍是 practice_groups.gid 是主键（组已按 uid 校验过）。
+                items = q_all("""SELECT it.qid, it.pos, it.choice, IFNULL(it.answer, s.answer) answer,
+                                        IFNULL(it.correct,0) correct, IFNULL(it.timeout,0) timeout,
+                                        IFNULL(it.ms,0) ms, it.graded_at, IFNULL(it.dropped,0) dropped,
+                                        s.id, s.module, s.category, s.kadian, s.stem
+                                 FROM practice_items it LEFT JOIN qdb.questions s ON s.qid=it.qid
+                                 WHERE it.gid=? ORDER BY it.pos, it.rowid""", (gid,))
         qids = [x["qid"] for x in items if x.get("qid")] if with_note else []
         notes = {}
         if qids:
@@ -4160,22 +4446,36 @@ class Handler(BaseHTTPRequestHandler):
         if span < 0 or span > 31:          # 只开放最近 31 天，避免随意翻库
             d0 = datetime.date.today()
         day = d0.isoformat()
-        rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
-                                   gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
-                                   IFNULL(gp.state,'open') state,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN 1 ELSE 0 END) n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
-                                            THEN 1 ELSE 0 END) answered,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND IFNULL(it.correct,0)=1
-                                            THEN 1 ELSE 0 END) right_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
-                                             AND IFNULL(it.correct,0)=0 THEN 1 ELSE 0 END) wrong_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.timeout,0) ELSE 0 END) timeout_n,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.ms,0) ELSE 0 END) spent_ms,
-                                   SUM(CASE WHEN IFNULL(it.dropped,0)=1 THEN 1 ELSE 0 END) dropped_n
-                            FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
-                            WHERE gp.uid=? AND date(gp.started)=?
-                            GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
+        # 分组与「历史记录」取同一份快照：另一个人正在交卷的那一瞬，
+        # 两条独立查询会拼出「组已是 done、逐题还是旧的」这种半新半旧的分组。
+        with read_tx():
+            rows = q_all("""SELECT gp.gid, gp.mode, gp.answer_mode, gp.title, gp.scope, gp.size,
+                                       gp.started, gp.ended, IFNULL(gp.total_ms,0) total_ms,
+                                       IFNULL(gp.state,'open') state,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN 1 ELSE 0 END) n,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                                THEN 1 ELSE 0 END) answered,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND IFNULL(it.correct,0)=1
+                                                THEN 1 ELSE 0 END) right_n,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 AND it.graded_at IS NOT NULL
+                                                 AND IFNULL(it.correct,0)=0 THEN 1 ELSE 0 END) wrong_n,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.timeout,0) ELSE 0 END) timeout_n,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=0 THEN IFNULL(it.ms,0) ELSE 0 END) spent_ms,
+                                       SUM(CASE WHEN IFNULL(it.dropped,0)=1 THEN 1 ELSE 0 END) dropped_n
+                                FROM practice_groups gp LEFT JOIN practice_items it ON it.gid=gp.gid
+                                WHERE gp.uid=? AND date(gp.started)=?
+                                GROUP BY gp.gid ORDER BY gp.started DESC""", (uid, day))
+            # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
+            legacy = q_all("""SELECT r.qid, r.grade, r.ts, IFNULL(r.timeout,0) timeout,
+                                     s.id, s.module, s.category, s.stem, s.answer
+                              FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
+                              WHERE r.user_id=? AND date(r.ts)=?
+                                AND r.id=(SELECT MAX(r2.id) FROM reviews r2
+                                          WHERE r2.user_id=r.user_id AND r2.qid=r.qid AND date(r2.ts)=?)
+                                AND r.qid NOT IN (SELECT it.qid FROM practice_items it
+                                                  JOIN practice_groups gp ON gp.gid=it.gid
+                                                  WHERE gp.uid=? AND date(gp.started)=?)
+                              ORDER BY r.id""", (uid, day, day, uid, day))
         groups = []
         for r in rows:
             r["n"] = int(r["n"] or 0)
@@ -4188,17 +4488,6 @@ class Handler(BaseHTTPRequestHandler):
             r["dropped_n"] = int(r["dropped_n"] or 0)
             r["legacy"] = False
             groups.append(r)
-        # 今天之前上线、没有分组记录的旧作答：合成一个「历史记录」组，如实标注未保存选项
-        legacy = q_all("""SELECT r.qid, r.grade, r.ts, IFNULL(r.timeout,0) timeout,
-                                 s.id, s.module, s.category, s.stem, s.answer
-                          FROM reviews r JOIN qdb.questions s ON s.qid=r.qid
-                          WHERE r.user_id=? AND date(r.ts)=?
-                            AND r.id=(SELECT MAX(r2.id) FROM reviews r2
-                                      WHERE r2.user_id=r.user_id AND r2.qid=r.qid AND date(r2.ts)=?)
-                            AND r.qid NOT IN (SELECT it.qid FROM practice_items it
-                                              JOIN practice_groups gp ON gp.gid=it.gid
-                                              WHERE gp.uid=? AND date(gp.started)=?)
-                          ORDER BY r.id""", (uid, day, day, uid, day))
         if legacy:
             items = []
             for i, r in enumerate(legacy, 1):
@@ -4612,11 +4901,20 @@ def main():
     print(f"[INFO] userdb = {USERS_DB_PATH}")
     threading.Thread(target=_backup_loop, daemon=True).start()   # 每日 0 点自动快照用户库
     print(f"[INFO] 打开浏览器访问:  http://127.0.0.1:{PORT}")
-    srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+    srv = _Server(("0.0.0.0", PORT), Handler)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n[INFO] 已停止")
+
+
+class _Server(ThreadingHTTPServer):
+    """listen backlog 默认只有 5：几个标签页 + 陪伴者每 3 秒轮询同时到达时，
+    多出来的连接会在内核队列里排队，实测 12 并发出现过一次 500ms 长尾。
+    调到 64 后同一压测的 p95 稳定在 100ms 内，正常使用不会再有『偶尔卡一下』。"""
+    daemon_threads = True
+    request_queue_size = 64
+    allow_reuse_address = True
 
 
 if __name__ == "__main__":
