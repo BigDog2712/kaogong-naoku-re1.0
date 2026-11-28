@@ -8,7 +8,7 @@
    旧版页面被浏览器 / CDN 边缘节点用 max-age=86400 强缓存，导致"改了代码但打开还是旧界面"。
    这里让脚本核对页面里的版本标记：不一致就一次性跳到带版本号的新地址，
    绕过浏览器与边缘节点的两层缓存。kg_healed 防止极端情况下死循环。 */
-const APP_VER = '20261126c';
+const APP_VER = '20261128a';
 let HEALING = false;
 (function selfHeal() {
   try {
@@ -2432,6 +2432,7 @@ async function rateReportItem(r, g, box) {
     const d = await POST('/api/grade', {
       id: r.card.id, grade: g, choice: r.chosen || '',
       timeout: (S && S.timeouts && S.timeouts[r.card.id]) ? 1 : 0,
+      gid: (S && S.gid) || '',            // 记下这笔记分属于哪一组，删整组时才能精确撤回
     });
     r.rated = true;
     if (tip) tip.textContent = d && d.interval ? `已写入复习计划 · 下次 ${d.interval} 天后` : '已写入复习计划';
@@ -2449,7 +2450,8 @@ function flushReportGrades(useBeacon) {
   R.results.forEach(r => {
     if (r.rated) return;
     r.rated = true;
-    const body = { id: r.card.id, grade: r.grade || (r.right ? 4 : 1), choice: r.chosen || '', timeout: (S.timeouts && S.timeouts[r.card.id]) ? 1 : 0 };
+    const body = { id: r.card.id, grade: r.grade || (r.right ? 4 : 1), choice: r.chosen || '',
+                   timeout: (S.timeouts && S.timeouts[r.card.id]) ? 1 : 0, gid: S.gid || '' };
     if (useBeacon && navigator.sendBeacon) {
       try {
         const blob = new Blob([JSON.stringify(Object.assign({}, body, { token: tok() }))], { type: 'application/json' });
@@ -2858,7 +2860,7 @@ async function doGrade(g, opt) {
   let gr = null;
   try {
     gr = await POST('/api/grade', { id: c.id, grade: g, choice: S.chosen || '',
-                                    revise: (!first && rev) ? 1 : 0 });
+                                    gid: S.gid || '', revise: (!first && rev) ? 1 : 0 });
   } catch (e) { }
   if (gr && typeof gr.interval === 'number') S.lastInterval = gr.interval;
   // 回溯：边答边对记「看答案那一刻」的选择与客观正误；复习模式没有选项，用自评档位判对错
@@ -3368,7 +3370,7 @@ async function timeoutCurrent() {
   if (!S || !c) return;
   const dur = qElapsed(S);
   S.times.push(dur); stopLimitTimer();
-  try { await POST('/api/grade', { id: c.id, grade: 1, timeout: 1, choice: '' }); } catch (e) { }
+  try { await POST('/api/grade', { id: c.id, grade: 1, timeout: 1, choice: '', gid: S.gid || '' }); } catch (e) { }
   markPractice(S, [{ qid: c.qid, choice: '', correct: 0, timeout: 1, ms: dur, pos: S.idx + 1 }]);
   S._tallyId = c.id;                     // 超时已计入本组「已答」，再看解析不重复计数
   S.tally.done++; S.tally.wrong++; S.timeoutN = (S.timeoutN || 0) + 1;
@@ -4389,7 +4391,7 @@ function rvGroupCard(g) {
   const acc = answered ? Math.round((g.right_n || 0) / answered * 100) : 0;
   const done = g.state === 'done';
   const aborted = g.state === 'aborted';
-  const canDel = !done && !g.legacy;              // 没交卷的半截记录 / 已放弃的组都能删
+  const canDel = !g.legacy;                       // 交卷的组也能删：误触交卷、点错组都能撤回
   const stateTag = g.legacy ? '<span class="tag" style="color:var(--ink-3)">旧记录 · 未保存选项</span>'
     : (done ? '<span class="tag">已交卷</span>'
       : aborted ? '<span class="tag" style="color:var(--bad)">已放弃</span>'
@@ -4420,7 +4422,7 @@ function rvGroupCard(g) {
         <b style="color:${!answered ? 'var(--ink-3)' : acc >= 80 ? 'var(--ok)' : acc >= 60 ? 'var(--brand)' : 'var(--bad)'}">${answered ? acc + '%' : '—'}</b>
         <span>${g.right_n || 0}/${answered}</span>
       </div>
-      ${canDel ? `<button type="button" class="rv-del" data-gid="${esc(g.gid)}" title="删除这条未完成的记录"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9.5 7V5.5h5V7"/><path d="M6.5 7l.8 12.1a1.6 1.6 0 0 0 1.6 1.4h6.2a1.6 1.6 0 0 0 1.6-1.4L17.5 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>删除</button>` : ''}
+      ${canDel ? `<button type="button" class="rv-del" data-gid="${esc(g.gid)}" title="删除这组记录（删掉的题会回到未作答）"><svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M9.5 7V5.5h5V7"/><path d="M6.5 7l.8 12.1a1.6 1.6 0 0 0 1.6 1.4h6.2a1.6 1.6 0 0 0 1.6-1.4L17.5 7"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>删除</button>` : ''}
       <span class="rv-caret" aria-hidden="true">▾</span>
     </div>
     <div class="rv-g-body" hidden></div>
@@ -4469,7 +4471,7 @@ async function viewToday() {
   const isToday = d.date === rvDay(0);
   app.innerHTML = `
   <h1>${isToday ? '今日回溯' : rvDayLabel(d.date) + '回溯'}</h1>
-  <p class="sub">按组回看练过的每一道题：当时选了什么、对没对、用了多久。先答后对模式记录的是<b>交卷对答案那一刻</b>的状态。中途退出没交卷的组会标为「未完成」、放弃的组标「已放弃」，点组头右侧的 <b>删除</b> 可以清掉；丢弃的题会标「已丢弃」，不计入题数与正确率。</p>
+  <p class="sub">按组回看练过的每一道题：当时选了什么、对没对、用了多久。先答后对模式记录的是<b>交卷对答案那一刻</b>的状态。中途退出没交卷的组会标为「未完成」、放弃的组标「已放弃」，点组头右侧的 <b>删除</b> 可以清掉任意一组（含误触交卷的），删掉的题回到未作答、以后还能当新题抽到；丢弃的题会标「已丢弃」，不计入题数与正确率。</p>
   <div class="rv-days">${days.map((day, i) => `<a class="rv-day ${day === d.date ? 'on' : ''}" href="#/today${i === 0 ? '' : '?date=' + day}">${rvDayLabel(day)}</a>`).join('')}</div>
   <div class="grid g4 rv-sum">
     <div class="card kpi brand"><div class="n">${sum.groups || 0}</div><div class="l">练习组数</div></div>
@@ -4501,18 +4503,28 @@ async function viewToday() {
     const delB = box.querySelector('.rv-del');
     if (delB) delB.onclick = async ev => {
       ev.stopPropagation();
-      if (g.state === 'done' || g.legacy) return;      // 交卷 / 旧记录不提供删除
-      const tip = `删除这条未完成的练习记录？\n\n· ${g.title || RV_MODE[g.mode] || '练习'} · 共 ${g.n || 0} 题，已答 ${g.answered || 0} 题\n`
-        + '· 删除后本组不再出现在今日回溯，也没法继续做\n'
-        + '· 已经自评过的题仍按记忆曲线排复习，不受影响';
+      if (g.legacy) return;
+      const isReview = g.mode === 'review';
+      const tip = `删除这组练习记录？\n\n· ${g.title || RV_MODE[g.mode] || '练习'} · 共 ${g.n || 0} 题，已答 ${g.answered || 0} 题\n`
+        + '· 删除后本组不再出现在今日回溯，题数、正确率、答题用时也会从今日统计里一起扣掉\n'
+        + (isReview
+          ? '· 这是一组复习：这些题会重新回到待复习，记忆进度撤回到复习之前\n'
+          : '· 这些题回到「未作答」，以后会重新作为新题出现\n')
+        + '\n删除后不可恢复，确定继续？';
       if (!confirm(tip)) return;
       delB.disabled = true;
       try {
-        await POST('/api/practice/drop', { gid: g.gid });
+        const r = await POST('/api/practice/delete', { gid: g.gid });
+        // 本地「近期已做过」也要放掉这几道题，否则本机抽新题时仍把它们排除
+        const gone = new Set((r && r.qids) || []);
+        if (gone.size) {
+          try { localStorage.setItem('kg_seen', JSON.stringify(loadSeen().filter(q => !gone.has(String(q))))); } catch (e) { }
+          try { cloudSchedule(); } catch (e) { }
+        }
         viewToday();
       } catch (e) {
         delB.disabled = false;
-        alert(e && e.status === 409 ? '这组已经交卷了，记录不能删除。' : ('删除失败：' + (e.message || e)));
+        alert('删除失败：' + (e.message || e));
       }
     };
     head.onclick = async () => {

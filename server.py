@@ -1358,6 +1358,13 @@ def ensure_tables():
             db().commit()
         except Exception:
             pass
+    # 删整组用：评分时记下「这条 review 是哪一组写下的」，删组时才能精确撤回那一笔。
+    # 历史记录这一列为空，删组时退回按时间窗找，仍要过 grade_undo 的校验。
+    try:
+        db().execute("ALTER TABLE reviews ADD COLUMN gid TEXT DEFAULT ''")
+        db().commit()
+    except Exception:
+        pass
     # ---------- 云端账号体系（与本地纯昵称账号并存，互不影响） ----------
     db().executescript("""
     CREATE TABLE IF NOT EXISTS cloud_accounts(
@@ -1447,11 +1454,8 @@ def get_setting(key, default=None):
 
 APP_RELEASE_VERSION = app_ver()
 APP_RELEASE_NOTES = ("本次更新：\n"
-                     "新增：数据统计新增「首次正确率」曲线与按天模块矩阵，第一次做题的水平变化一眼可见；\n"
-                     "新增：陪伴者点开某个人就能进入他的视角，总览、数据统计、错题本、收藏、真题浏览都和他自己打开时一样，页顶保留他的实时答题状态；\n"
-                     "优化：各模块、大类正确率拆成「首次」与「复习」两个数字，复习成绩不再混进真实水平；\n"
-                     "优化：查看视角下答题与复习入口自动收起，不会误改对方记录，退出即回到陪伴者页；\n"
-                     "修复：网络不佳时学习时长可能被重复记录，以及交卷瞬间打开今日回溯会看到一半新一半旧的数据。\n"
+                     "新增：今日回溯里每一组练习都能删除，包括误触交卷的那组；删掉的题回到未作答，以后会重新作为新题出现，这组的题数、正确率、答题用时也一并从统计里扣掉；\n"
+                     "优化：删除复习组时，这些题会重新回到待复习，记忆进度撤回到这次复习之前。\n"
                      "刷新页面即可生效。")
 
 
@@ -2128,6 +2132,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/practice/abort": self.api_practice_abort,
             "/api/practice/swap": self.api_practice_swap,
             "/api/practice/drop": self.api_practice_drop,
+            "/api/practice/delete": self.api_practice_delete,
             "/api/note": self.api_note,
             "/api/fav": self.api_fav,
             "/api/discard": self.api_discard,
@@ -3314,10 +3319,11 @@ class Handler(BaseHTTPRequestHandler):
     _SRS_SNAP = ("status", "ease", "interval", "repetitions", "lapses", "due",
                  "last_review", "correct", "wrong", "wb_status", "wb_streak", "last_choice")
 
-    def _apply_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None):
+    def _apply_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None, gid=""):
         """写入一次评分。含错题本状态机：连续 2 次自评「一般/熟悉」自动移出错题本。
 
         评分前把这一题的 srs 状态整份存进 grade_undo，供复习里「改掌握程度」整份撤回。
+        gid 是这次评分所属的练习组：删整组时要靠它找到「这组写下的那一笔」，精确撤回。
         """
         st = q_one("SELECT * FROM srs WHERE qid=? AND user_id=?", (eqid, uid))
         if not st:
@@ -3344,9 +3350,10 @@ class Handler(BaseHTTPRequestHandler):
                         WHERE qid=? AND user_id=?""",
                      (new["status"], new["ease"], new["interval"], new["repetitions"], new["lapses"],
                       new["due"], now(), correct, 0 if correct else 1, wb, streak, choice, eqid, uid))
-        cur = db().execute("""INSERT INTO reviews(qid,user_id,grade,ts,interval_before,interval_after,ease,timeout)
-                        VALUES(?,?,?,?,?,?,?,?)""",
-                     (eqid, uid, grade, now(), before, new["interval"], new["ease"], 1 if timeout else 0))
+        cur = db().execute("""INSERT INTO reviews(qid,user_id,grade,ts,interval_before,interval_after,ease,timeout,gid)
+                        VALUES(?,?,?,?,?,?,?,?,?)""",
+                     (eqid, uid, grade, now(), before, new["interval"], new["ease"],
+                      1 if timeout else 0, (gid or "")[:40]))
         try:
             db().execute("""INSERT OR REPLACE INTO grade_undo(qid,user_id,prev_json,review_id,ts)
                             VALUES(?,?,?,?,?)""",
@@ -3355,7 +3362,7 @@ class Handler(BaseHTTPRequestHandler):
             print("[grade] 记录改评快照失败:", e)
         return new
 
-    def _revise_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None):
+    def _revise_grade(self, eqid, grade, uid=DEFAULT_UID, timeout=0, choice=None, gid=""):
         """改判：撤回这题最近一次评分（把 srs 整份还原到评分前），再按新档位重算一次。
 
         只有「grade_undo 记的那条 review 正好是这题最新一条评分」时才允许，避免误撤别人的历史。
@@ -3381,7 +3388,7 @@ class Handler(BaseHTTPRequestHandler):
         db().execute("DELETE FROM reviews WHERE id=?", (int(last["id"]),))
         db().execute("DELETE FROM grade_undo WHERE qid=? AND user_id=?", (eqid, uid))
         db().commit()
-        new = self._apply_grade(eqid, grade, uid, timeout, choice)
+        new = self._apply_grade(eqid, grade, uid, timeout, choice, gid)
         return dict(new or {}, revised=True) if new else None
 
     # ---------- 今日回溯：练习分组 / 逐题对答案状态 ----------
@@ -3479,6 +3486,118 @@ class Handler(BaseHTTPRequestHandler):
             db().commit()
         return self._send(200, {"ok": True, "gid": gid, "removed": int(del_n or 0)})
 
+    def _undo_group_grades(self, uid, gp, items):
+        """撤回一组练习交卷时写下的评分：srs 整份还原到评分前，删掉那条 review 与改评快照。
+
+        只撤「正好是这题最新一条评分」的那些。这题如果之后又复习 / 重练过，最新一条就不是
+        本组的，保留不动——宁可留一次成绩，也不能把后续的复习进度删掉。
+        返回撤掉的条数。
+        """
+        g_start = (gp["started"] or "").strip()
+        g_end = (gp["ended"] or "").strip() or now()
+        try:      # 历史记录没写 gid，按「组结束后半小时内」这个窗口找
+            late = (datetime.datetime.fromisoformat(g_end)
+                    + datetime.timedelta(minutes=30)).isoformat(timespec="seconds")
+        except Exception:
+            late = now()
+        done = 0
+        for it in items:
+            qid = it["qid"]
+            rev = q_one("""SELECT id FROM reviews WHERE qid=? AND user_id=? AND gid=?
+                            ORDER BY id DESC LIMIT 1""", (qid, uid, gp["gid"]))
+            if not rev and g_start:
+                rev = q_one("""SELECT id FROM reviews WHERE qid=? AND user_id=?
+                                 AND IFNULL(gid,'')='' AND ts>=? AND ts<=?
+                               ORDER BY id DESC LIMIT 1""", (qid, uid, g_start, late))
+            if not rev:
+                continue
+            last = q_one("SELECT id FROM reviews WHERE qid=? AND user_id=? ORDER BY id DESC LIMIT 1",
+                         (qid, uid))
+            undo = q_one("SELECT prev_json, review_id FROM grade_undo WHERE qid=? AND user_id=?",
+                         (qid, uid))
+            if (not last or not undo or int(last["id"] or 0) != int(rev["id"] or 0)
+                    or int(undo["review_id"] or 0) != int(rev["id"] or 0)):
+                continue
+            try:
+                prev = json.loads(undo["prev_json"] or "{}")
+            except Exception:
+                prev = {}
+            if not prev:
+                continue
+            db().execute("""UPDATE srs SET status=?,ease=?,interval=?,repetitions=?,lapses=?,due=?,
+                            last_review=?,correct=?,wrong=?,wb_status=?,wb_streak=?,last_choice=?
+                            WHERE qid=? AND user_id=?""",
+                         tuple(prev.get(k) for k in self._SRS_SNAP) + (qid, uid))
+            db().execute("DELETE FROM reviews WHERE id=?", (int(rev["id"]),))
+            db().execute("DELETE FROM grade_undo WHERE qid=? AND user_id=?", (qid, uid))
+            done += 1
+        return done
+
+    def _deduct_group_study(self, uid, day, ms, is_review):
+        """把这组的逐题用时从当天学习时长里扣掉（只扣这组，不重算整天）。
+
+        学习时长平时是「只补漏记、不改小」的，删除整组是唯一要往下走的场景：
+        这组既然当作没发生过，它占的那几分钟也得一并退掉，否则会出现「今天 0 题却学了半小时」。
+        """
+        ms = max(0, int(ms or 0))
+        if not ms or not day:
+            return False
+        cur = q_one("""SELECT ms, IFNULL(answer_ms,0) a, IFNULL(analysis_ms,0) an, IFNULL(review_ms,0) r
+                       FROM study_time WHERE uid=? AND day=?""", (uid, day))
+        if not cur:
+            return False
+        total = max(0, int(cur["ms"] or 0) - ms)
+        ans = max(0, int(cur["a"] or 0) - (0 if is_review else ms))
+        rev = max(0, int(cur["r"] or 0) - (ms if is_review else 0))
+        db().execute("""UPDATE study_time SET ms=?, answer_ms=?, review_ms=?
+                        WHERE uid=? AND day=?""", (total, ans, rev, uid, day))
+        return True
+
+    def api_practice_delete(self, p):
+        """删除一整组练习（已交卷的也能删）：当作这组没发生过。
+
+        与「放弃本组」的区别：放弃只停手，成绩还留在回溯里；删除会把组、逐题记录、
+        交卷时写下的记忆曲线评分一起清掉，题数与学习时长同步退回。
+        撤掉评分就等于这些题回到「未作答」，所以以后还能当新题抽到。
+        """
+        uid = need_uid(p.get("token"))
+        gid = (p.get("gid") or "").strip()[:40]
+        gp = q_one("SELECT * FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+        if not gp:
+            return self._send(404, {"error": "没有这组练习记录"})
+        items = q_all("""SELECT qid, IFNULL(ms,0) ms, IFNULL(dropped,0) dropped,
+                                IFNULL(graded_at,'') graded_at
+                           FROM practice_items WHERE gid=?""", (gid,))
+        qids = [x["qid"] for x in items if x.get("qid")]
+        group_ms = sum(int(x["ms"] or 0) for x in items
+                       if not int(x["dropped"] or 0) and x["graded_at"])
+        is_review = (gp["mode"] == "review")
+        undo_n = 0
+        with _LOCK:
+            undo_n = self._undo_group_grades(uid, gp, items)
+            db().execute("DELETE FROM practice_items WHERE gid=?", (gid,))
+            db().execute("DELETE FROM practice_groups WHERE gid=? AND uid=?", (gid, uid))
+            self._deduct_group_study(uid, (gp["started"] or "")[:10], group_ms, is_review)
+            # 「近期已做过」清单也要把这几道题拿掉，否则它们仍被排除在新题之外，
+            # 换了设备同步回来还会继续排除——用户在别处看到的就是「删了还是抽不到」。
+            if qids:
+                try:
+                    raw = get_user_setting(uid, "prefs")
+                    if raw:
+                        pf = json.loads(raw) or {}
+                        seen = [str(x) for x in (pf.get("seen") or [])]
+                        gone = set(qids)
+                        keep = [q for q in seen if q not in gone]
+                        if len(keep) != len(seen):
+                            pf["seen"] = keep
+                            set_user_setting(uid, "prefs", json.dumps(pf, ensure_ascii=False))
+                except Exception as e:
+                    print("[practice] 清理已做清单失败:", e)
+            db().commit()
+        return self._send(200, {"ok": True, "gid": gid,
+                                "questions": len(qids), "undo_grades": undo_n,
+                                "study_ms": group_ms, "qids": qids})
+
     def api_practice_abort(self, p):
         """放弃本组：结束、不再继续，但已经作答的记录留在今日回溯里（标「已放弃」）。
 
@@ -3574,6 +3693,8 @@ class Handler(BaseHTTPRequestHandler):
         uid = need_uid(p.get("token"))
         timeout = 1 if p.get("timeout") else 0
         choice = (p.get("choice") or "").strip()[:4] or None
+        # 这一笔评分属于哪一组（报告页自评 / 复习作答都会带）：删整组时靠它精确定位要撤哪一条
+        gid = (p.get("gid") or "").strip()[:40]
         eqid = resolve_qid(qid_int)
         if not eqid:
             return self._send(404, {"error": "no such question"})
@@ -3584,11 +3705,11 @@ class Handler(BaseHTTPRequestHandler):
         with _LOCK:
             if p.get("revise"):
                 # 复习里改掌握程度：先撤回上一次评分再按新档位重算，不能让 SM2 连推进两次
-                new = self._revise_grade(eqid, grade, uid, timeout, choice)
+                new = self._revise_grade(eqid, grade, uid, timeout, choice, gid)
                 if new is None:               # 没有可撤的记录：退化成一次普通评分
-                    new = self._apply_grade(eqid, grade, uid, timeout, choice)
+                    new = self._apply_grade(eqid, grade, uid, timeout, choice, gid)
             else:
-                new = self._apply_grade(eqid, grade, uid, timeout, choice)
+                new = self._apply_grade(eqid, grade, uid, timeout, choice, gid)
             db().commit()
         return self._send(200, {"ok": True, "eqid": eqid, **(new or {})})
 
